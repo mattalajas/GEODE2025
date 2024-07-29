@@ -15,12 +15,15 @@ from torch_geometric.nn.models.tgn import (
 )
 from torch.utils.tensorboard import SummaryWriter
 
+import StarDataset
 import pandas as pd
 import numpy as np
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.cuda.empty_cache()
-writer = SummaryWriter('runs/TGN_with_time_pred')
+verbose = False
+
+if verbose: writer = SummaryWriter('runs/TGN_with_time_pred')
 
 # Starboard data
 events = ['FISH', 'PORT', 'ECTR']
@@ -269,16 +272,17 @@ for epoch in range(1, 151):
     print(f'Val AP: {val_ap:.4f}, Val AUC: {val_auc:.4f}, Val RMSE: {val_rmse:.4f}')
     print(f'Test AP: {test_ap:.4f}, Test AUC: {test_auc:.4f}, Test RMSE: {test_rmse:.4f}')
 
-    writer.add_scalar('training_loss', loss, epoch)
-    writer.add_scalar('val_ap', val_ap, epoch)
-    writer.add_scalar('val_auc', val_auc, epoch)
-    writer.add_scalar('val_rmse', val_rmse, epoch)
-    writer.add_scalar('test_ap', test_ap, epoch)
-    writer.add_scalar('test_auc', test_auc, epoch)
-    writer.add_scalar('test_rmse', test_rmse, epoch)
+    if verbose:
+        writer.add_scalar('training_loss', loss, epoch)
+        writer.add_scalar('val_ap', val_ap, epoch)
+        writer.add_scalar('val_auc', val_auc, epoch)
+        writer.add_scalar('val_rmse', val_rmse, epoch)
+        writer.add_scalar('test_ap', test_ap, epoch)
+        writer.add_scalar('test_auc', test_auc, epoch)
+        writer.add_scalar('test_rmse', test_rmse, epoch)
 
-writer.close()
-raise
+if verbose: writer.close()
+
 ##############################################################
 # Get predictions
 ind_map = {vals[i]: i for i in range(len(vals))}

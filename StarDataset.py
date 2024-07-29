@@ -7,12 +7,11 @@ import networkx as nx
 import pandas as pd
 import numpy as np
 
-#TODO: Create this dataset 
+class StarDataset():
+    def __init__(self):
+        super().__init__(self)
 
-class StarDataset(TemporalData):
-    def __init__(self, src: torch.Tensor | None = None, dst: torch.Tensor | None = None, t: torch.Tensor | None = None, msg: torch.Tensor | None = None, **kwargs):
-        super().__init__(src, dst, t, msg, **kwargs)
-
+        # Starboard data
         events = ['FISH', 'PORT', 'ECTR']
         event_dict = dict(zip(events, range(len(events))))
         data_events = pd.read_csv('data/Starboard/events.csv')
@@ -24,7 +23,7 @@ class StarDataset(TemporalData):
         dst = np.zeros((len(data_events)))
         t = np.zeros((len(data_events)))
         # features = (lat_n,lat_s,lon_e,lon_w,ves1,ves2)
-        features = np.zeros((len(data_events), 4 + 2))
+        features = np.zeros((len(data_events), 4))
         y = np.zeros((len(data_events), len(events)))
 
         # convert timesteps
@@ -50,18 +49,24 @@ class StarDataset(TemporalData):
             t[ind] = timesteps[ind]
 
             # Features
+            features[ind] = np.array([data['lat_n'], data['lat_s'], data['lon_e'], data['lon_w']])
 
-
-            # Even types
+            # Event types
             event = data['event_type']
             y[ind][event_dict[event]] = 1
 
-        _, indexes = np.unique(np.concatenate((src, dst)), return_inverse=True)
+        vals, indexes = np.unique(np.concatenate((src, dst)), return_inverse=True)
         src, dst = np.split(indexes, 2)
+        features = np.nan_to_num(features)
 
         src = torch.Tensor(src).type(torch.long)
         dst = torch.Tensor(dst).type(torch.long)
         t = torch.Tensor(t).type(torch.long)
+        features = torch.Tensor(features)
         y = torch.Tensor(y)
 
-        data = TemporalData(src=src, dst=dst, t=t, y=y)
+        self.data = TemporalData(src=src, dst=dst, t=t, msg=features, y=y)
+
+    def get_data(self):
+        return self.data
+        

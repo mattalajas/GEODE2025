@@ -14,7 +14,7 @@
 import os.path as osp
 
 import torch
-from sklearn.metrics import average_precision_score, roc_auc_score, root_mean_squared_error
+from sklearn.metrics import roc_auc_score, recall_score, average_precision_score, root_mean_squared_error
 
 import torch_geometric.transforms as T
 from torch_geometric.nn import TransformerConv
@@ -29,7 +29,7 @@ import numpy as np
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.cuda.empty_cache()
-writer = SummaryWriter('runs/basic_link_pred')
+writer = SummaryWriter('runs/basic_link_pred_wout_fish')
 
 # Starboard data
 data_events = pd.read_csv('data/Starboard/events.csv')
@@ -45,8 +45,7 @@ feature_dict = {x['vessel_id']: x['label'] for _, x in data_vessels.iterrows()}
 node_att_map = {node: ind for ind, node in enumerate(set(data_vessels['label']))}
 node_att_map['Port'] = len(node_att_map)
 node_att_map['NA'] = len(node_att_map)
-node_att_map['Fish'] = len(node_att_map)
-edge_att_map = {'ECTR': 0, 'FISH': 1, 'DOCK': 2}
+edge_att_map = {'ECTR': 0, 'DOCK': 1}
 eye = np.eye(len(node_att_map))
 
 # Creating graph
@@ -77,12 +76,7 @@ for ind, data in data_events.iterrows():
                    one_hot = eye[node_att_map['Port']])
         G.add_edge(init_vessel, port, event = 'DOCK', color = 'red')
         n_colormap[port] = 'red'
-    
-    else:
-        G.add_edge(init_vessel, 0, event = event, color = 'green')
-        n_colormap[0] = 'green'
 
-G.nodes[0]['one_hot'] = eye[node_att_map['Fish']]
 
 # Create unique mapping
 mapping = {node: ind for ind, node in enumerate(G.nodes)}
@@ -201,11 +195,11 @@ def test(test_data):
 
     y_true = test_data.edge_label.cpu().numpy()
 
-    acc = root_mean_squared_error(y_true, y_pred)
+    accs = root_mean_squared_error(y_true, y_pred)
     aps = average_precision_score(y_true, y_pred)
     aucs = roc_auc_score(y_true, y_pred)
     
-    return acc, aps, aucs
+    return accs, aps, aucs
 
 for epoch in range(1, 151):
     loss = train(train_data)

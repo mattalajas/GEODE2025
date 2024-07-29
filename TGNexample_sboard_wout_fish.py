@@ -35,13 +35,14 @@ import numpy as np
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.cuda.empty_cache()
 verbose = True
-if verbose: writer = SummaryWriter('runs/TGN_without_time_pred')
+if verbose: writer = SummaryWriter('runs/TGN_wout_fish')
 
 # Starboard data
-events = ['FISH', 'PORT', 'ECTR']
+events = ['PORT', 'ECTR']
 event_dict = dict(zip(events, range(len(events))))
 rev_event_dict = dict(zip(range(len(events)), events))
 data_events = pd.read_csv('data/Starboard/events.csv')
+data_events = data_events[data_events.event_type != 'FISH']
 data_vessels = pd.read_csv('data/Starboard/vessels.csv')
 feature_dict = {x['vessel_id']: x['label'] for _, x in data_vessels.iterrows()}
 
@@ -69,8 +70,6 @@ for ind, data in data_events.iterrows():
         dst[ind] = data['vessel_id2']
     elif not np.isnan(data['port_id']):
         dst[ind] = data['port_id']
-    else:
-        dst[ind] = 0
 
     # Timestamp
     t[ind] = timesteps[ind]
@@ -139,35 +138,18 @@ class GraphAttentionEmbedding(torch.nn.Module):
         rel_t_enc = self.time_enc(rel_t.to(x.dtype))
         edge_attr = torch.cat([rel_t_enc, msg], dim=-1)
         return self.conv(x, edge_index, edge_attr)
-
-class TimeEncoder(torch.nn.Module):
-    def __init__(self, out_channels: int):
-        super().__init__()
-        self.out_channels = out_channels
-        self.lin = Linear(1, out_channels)
-
-    def reset_parameters(self):
-        self.lin.reset_parameters()
-
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        return self.lin(t.view(-1, 1)).cos()
-
+    
 class LinkPredictor(torch.nn.Module):
     def __init__(self, in_channels):
         super().__init__()
         self.lin_src = Linear(in_channels, in_channels)
         self.lin_dst = Linear(in_channels, in_channels)
-        self.lin_time = Linear(in_channels, in_channels)
-        self.time_enc = TimeEncoder(in_channels)
         self.lin_final = Linear(in_channels, 1)
 
-    def forward(self, z_src, z_dst, t):
-        time = self.time_enc(t)
-        time = self.lin_time(time).view(z_src.shape)
-        h = self.lin_src(z_src) + self.lin_dst(z_dst) + time
+    def forward(self, z_src, z_dst):
+        h = self.lin_src(z_src) + self.lin_dst(z_dst)
         h = h.relu()
         return self.lin_final(h)
-
 
 memory_dim = time_dim = embedding_dim = 100
 
@@ -218,9 +200,8 @@ def train():
         z, last_update = memory(n_id)
         z = gnn(z, last_update, edge_index, data.t[e_id].to(device),
                 data.msg[e_id].to(device))
-        time = batch.t.type(torch.cuda.FloatTensor)
-        pos_out = link_pred(z[assoc[batch.src]], z[assoc[batch.dst]], time)
-        neg_out = link_pred(z[assoc[batch.src]], z[assoc[batch.neg_dst]], time)
+        pos_out = link_pred(z[assoc[batch.src]], z[assoc[batch.dst]])
+        neg_out = link_pred(z[assoc[batch.src]], z[assoc[batch.neg_dst]])
 
         # y_true = torch.stack((torch.ones(len(batch)).to(device), batch.t), dim=1)
         # loss = criterion_c(pos_out, y_true)
@@ -261,9 +242,8 @@ def test(loader, test = False):
         z, last_update = memory(n_id)
         z = gnn(z, last_update, edge_index, data.t[e_id].to(device),
                 data.msg[e_id].to(device))
-        time = batch.t.type(torch.cuda.FloatTensor)
-        pos_out = link_pred(z[assoc[batch.src]], z[assoc[batch.dst]], time)
-        neg_out = link_pred(z[assoc[batch.src]], z[assoc[batch.neg_dst]], time)
+        pos_out = link_pred(z[assoc[batch.src]], z[assoc[batch.dst]])
+        neg_out = link_pred(z[assoc[batch.src]], z[assoc[batch.neg_dst]])
 
         y_pred = torch.cat([pos_out, neg_out], dim=0).sigmoid().cpu()
         y_pred = y_pred.view(-1)
@@ -312,8 +292,8 @@ def test(loader, test = False):
                           index = list(range(right_data.shape[0])),
                           columns = col_vals)
         
-        wrong_df.to_csv('res/wrong_data.csv')
-        right_df.to_csv('res/right_data.csv')
+        wrong_df.to_csv('res/wrong_data_fish.csv')
+        right_df.to_csv('res/right_data_fish.csv')
     
     return float(torch.tensor(accs).mean()), float(torch.tensor(aps).mean()), float(torch.tensor(aucs).mean())
 
