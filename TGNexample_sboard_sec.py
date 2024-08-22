@@ -23,13 +23,13 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.cuda.empty_cache()
 verbose = False
 
-if verbose: writer = SummaryWriter('runs/TGN_with_time_pred')
+if verbose: writer = SummaryWriter('GNNthesis/runs/TGN_with_time_pred')
 
 # Starboard data
 events = ['FISH', 'PORT', 'ECTR']
 event_dict = dict(zip(events, range(len(events))))
-data_events = pd.read_csv('data/Starboard/events.csv')
-data_vessels = pd.read_csv('data/Starboard/vessels.csv')
+data_events = pd.read_csv('GNNthesis/data/Starboard/events.csv')
+data_vessels = pd.read_csv('GNNthesis/data/Starboard/vessels.csv')
 feature_dict = {x['vessel_id']: x['label'] for _, x in data_vessels.iterrows()}
 
 # Initialise inputs 
@@ -344,5 +344,5 @@ with torch.no_grad():
 final_dataframe = pd.DataFrame(final_pred.detach().cpu().numpy())
 final_dataframe = final_dataframe.replace({1:rev_ind_map, 2:rev_ind_map})
 final_dataframe = final_dataframe.sort_values(by=[0], ascending=False)
-final_dataframe.to_csv('res/sec_csv.csv')
+final_dataframe.to_csv('GNNthesis/res/sec_csv.csv')
 

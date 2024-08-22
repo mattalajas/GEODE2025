@@ -29,11 +29,11 @@ import numpy as np
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.cuda.empty_cache()
-writer = SummaryWriter('runs/basic_link_pred_wout_fish')
+writer = SummaryWriter('GNNthesis/runs/basic_link_pred_wout_fish')
 
 # Starboard data
-data_events = pd.read_csv('data/Starboard/events.csv')
-data_vessels = pd.read_csv('data/Starboard/vessels.csv')
+data_events = pd.read_csv('GNNthesis/data/Starboard/events.csv')
+data_vessels = pd.read_csv('GNNthesis/data/Starboard/vessels.csv')
 
 # Initialise inputs 
 G = nx.Graph()

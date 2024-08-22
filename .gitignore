@@ -163,5 +163,6 @@ cython_debug/
 #.idea/
 
 data
-*/res 
-*/uns
+res 
+runs
+pipenv
