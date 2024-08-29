@@ -1,4 +1,18 @@
+# This code achieves a performance of around 96.60%. However, it is not
+# directly comparable to the results reported by the TGN paper since a
+# slightly different evaluation setup is used here.
+# In particular, predictions in the same batch are made in parallel, i.e.
+# predictions for interactions later in the batch have no access to any
+# information whatsoever about previous interactions in the same batch.
+# On the contrary, when sampling node neighborhoods for interactions later in
+# the batch, the TGN paper code has access to previous interactions in the
+# batch.
+# While both approaches are correct, together with the authors of the paper we
+# decided to present this version here as it is more realsitic and a better
+# test bed for future methods.
+
 import os.path as osp
+import os
 
 import torch
 from sklearn.metrics import average_precision_score, roc_auc_score, root_mean_squared_error
@@ -15,20 +29,21 @@ from torch_geometric.nn.models.tgn import (
 )
 from torch.utils.tensorboard import SummaryWriter
 
-import StarDataset
+import datetime
 import pandas as pd
 import numpy as np
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.cuda.empty_cache()
-verbose = False
-
-if verbose: writer = SummaryWriter('GNNthesis/runs/TGN_with_time_pred')
+verbose = True
+if verbose: writer = SummaryWriter('GNNthesis/runs/TGN_wout_fish')
 
 # Starboard data
-events = ['FISH', 'PORT', 'ECTR']
+events = ['PORT', 'ECTR']
 event_dict = dict(zip(events, range(len(events))))
+rev_event_dict = dict(zip(range(len(events)), events))
 data_events = pd.read_csv('GNNthesis/data/Starboard/events.csv')
+data_events = data_events[data_events.event_type != 'FISH']
 data_vessels = pd.read_csv('GNNthesis/data/Starboard/vessels.csv')
 feature_dict = {x['vessel_id']: x['label'] for _, x in data_vessels.iterrows()}
 
@@ -56,8 +71,6 @@ for ind, data in data_events.iterrows():
         dst[ind] = data['vessel_id2']
     elif not np.isnan(data['port_id']):
         dst[ind] = data['port_id']
-    else:
-        dst[ind] = 0
 
     # Timestamp
     t[ind] = timesteps[ind]
@@ -80,6 +93,8 @@ features = torch.Tensor(features)
 y = torch.Tensor(y)
 
 data = TemporalData(src=src, dst=dst, t=t, msg=features, y=y)
+ind_map = {vals[i]: i for i in range(len(vals))}
+rev_ind_map = {i: vals[i] for i in range(len(vals))}
 
 # path = osp.join(osp.dirname(osp.realpath(__file__)), 'data', 'JODIE')
 # dataset = JODIEDataset(path, name='wikipedia')
@@ -124,22 +139,18 @@ class GraphAttentionEmbedding(torch.nn.Module):
         rel_t_enc = self.time_enc(rel_t.to(x.dtype))
         edge_attr = torch.cat([rel_t_enc, msg], dim=-1)
         return self.conv(x, edge_index, edge_attr)
-
-
+    
 class LinkPredictor(torch.nn.Module):
     def __init__(self, in_channels):
         super().__init__()
         self.lin_src = Linear(in_channels, in_channels)
         self.lin_dst = Linear(in_channels, in_channels)
-        self.lin_final1 = Linear(in_channels, 128)
-        self.lin_final2 = Linear(128, 2)
+        self.lin_final = Linear(in_channels, 1)
 
     def forward(self, z_src, z_dst):
         h = self.lin_src(z_src) + self.lin_dst(z_dst)
         h = h.relu()
-        h = self.lin_final1(h).relu()
-        return self.lin_final2(h)
-
+        return self.lin_final(h)
 
 memory_dim = time_dim = embedding_dim = 100
 
@@ -164,10 +175,7 @@ link_pred = LinkPredictor(in_channels=embedding_dim).to(device)
 optimizer = torch.optim.Adam(
     set(memory.parameters()) | set(gnn.parameters())
     | set(link_pred.parameters()), lr=0.0001)
-
 criterion_c = torch.nn.BCEWithLogitsLoss()
-criterion_r = torch.nn.MSELoss()
-window = 366
 
 # Helper vector to map global node indices to local ones.
 assoc = torch.empty(data.num_nodes, dtype=torch.long, device=device)
@@ -193,22 +201,14 @@ def train():
         z, last_update = memory(n_id)
         z = gnn(z, last_update, edge_index, data.t[e_id].to(device),
                 data.msg[e_id].to(device))
-        pos_out_full = link_pred(z[assoc[batch.src]], z[assoc[batch.dst]])
-        neg_out_full = link_pred(z[assoc[batch.src]], z[assoc[batch.neg_dst]])
-
-        pos_out = pos_out_full[:, 0]
-        neg_out = neg_out_full[:, 0]
-
-        reg_out = pos_out_full[:, 1]
-        cur_t = batch.t.view(-1) / window
+        pos_out = link_pred(z[assoc[batch.src]], z[assoc[batch.dst]])
+        neg_out = link_pred(z[assoc[batch.src]], z[assoc[batch.neg_dst]])
 
         # y_true = torch.stack((torch.ones(len(batch)).to(device), batch.t), dim=1)
         # loss = criterion_c(pos_out, y_true)
 
-        c_loss = criterion_c(pos_out, torch.ones_like(pos_out))
-        c_loss += criterion_c(neg_out, torch.zeros_like(neg_out))
-        r_loss = criterion_r(reg_out, cur_t)
-        loss = c_loss + r_loss
+        loss = criterion_c(pos_out, torch.ones_like(pos_out))
+        loss += criterion_c(neg_out, torch.zeros_like(neg_out))
 
         # Update memory and neighbor loader with ground-truth state.
         memory.update_state(batch.src, batch.dst, batch.t, batch.msg)
@@ -223,14 +223,17 @@ def train():
 
 
 @torch.no_grad()
-def test(loader):
+def test(loader, test = False):
     memory.eval()
     gnn.eval()
     link_pred.eval()
 
     torch.manual_seed(12345)  # Ensure deterministic sampling across epochs.
 
-    aps, aucs, rmse = [], [], []
+    wrong_data = []
+    right_data = []
+
+    accs, aps, aucs = [], [], []
     for batch in loader:
         batch = batch.to(device)
 
@@ -240,63 +243,97 @@ def test(loader):
         z, last_update = memory(n_id)
         z = gnn(z, last_update, edge_index, data.t[e_id].to(device),
                 data.msg[e_id].to(device))
-        pos_out_full = link_pred(z[assoc[batch.src]], z[assoc[batch.dst]])
-        neg_out_full = link_pred(z[assoc[batch.src]], z[assoc[batch.neg_dst]])
-
-        pos_out = pos_out_full[:, 0]
-        neg_out = neg_out_full[:, 0]
-
-        reg_out = pos_out_full[:, 1].sigmoid().cpu()
-        cur_t = batch.t.view(-1) / window
-        cur_t = cur_t.sigmoid().cpu()
+        pos_out = link_pred(z[assoc[batch.src]], z[assoc[batch.dst]])
+        neg_out = link_pred(z[assoc[batch.src]], z[assoc[batch.neg_dst]])
 
         y_pred = torch.cat([pos_out, neg_out], dim=0).sigmoid().cpu()
+        y_pred = y_pred.view(-1)
         y_true = torch.cat(
             [torch.ones(pos_out.size(0)),
              torch.zeros(neg_out.size(0))], dim=0)
+        
+        if test:
+            def get_time(days, year = 2024):
+                return datetime.datetime(year, 1, 1) + datetime.timedelta(days - 1)
 
+            all_vals = abs(torch.subtract(pos_out.sigmoid().cpu().view(-1), torch.ones(pos_out.size(0))))
+            lindices = np.where(all_vals > 0.5)
+            windices = np.where(all_vals <= 0.5)
+
+            src = batch.src.cpu().numpy()
+            dst = batch.dst.cpu().numpy()
+            y = batch.y.cpu().numpy()
+            t = np.float64(batch.t.cpu().numpy())
+
+            src = np.vectorize(rev_ind_map.get)(src)
+            dst = np.vectorize(rev_ind_map.get)(dst)
+            y = np.vectorize(rev_event_dict.get)(np.where(y == 1)[1])
+            t = np.vectorize(get_time)(t)
+
+            new_arr = np.vstack((t, src, dst, y)).T
+            wrong_data.append(new_arr[lindices])
+            right_data.append(new_arr[windices])
+
+        accs.append(root_mean_squared_error(y_true, y_pred))
         aps.append(average_precision_score(y_true, y_pred))
         aucs.append(roc_auc_score(y_true, y_pred))
-        rmse.append(root_mean_squared_error(reg_out, cur_t))
 
         memory.update_state(batch.src, batch.dst, batch.t, batch.msg)
         neighbor_loader.insert(batch.src, batch.dst)
     
-    return float(torch.tensor(aps).mean()), float(torch.tensor(aucs).mean()), float(torch.tensor(rmse).mean())
+    if test:
+        col_vals = ['start_time','vessel_id1', 'vessel_id2', 'event_type']
+        wrong_data = np.concatenate(wrong_data)
+        right_data = np.concatenate(right_data)
+
+        wrong_df = pd.DataFrame(data = wrong_data,
+                          index = list(range(wrong_data.shape[0])),
+                          columns = col_vals)
+        right_df = pd.DataFrame(data = right_data,
+                          index = list(range(right_data.shape[0])),
+                          columns = col_vals)
+        
+        wrong_df.to_csv('GNNthesis/res/wrong_data_fish.csv')
+        right_df.to_csv('GNNthesis/res/right_data_fish.csv')
+    
+    return float(torch.tensor(accs).mean()), float(torch.tensor(aps).mean()), float(torch.tensor(aucs).mean())
 
 for epoch in range(1, 151):
     loss = train()
     print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}')
-    val_ap, val_auc, val_rmse = test(val_loader)
-    test_ap, test_auc, test_rmse = test(test_loader)
-    print(f'Val AP: {val_ap:.4f}, Val AUC: {val_auc:.4f}, Val RMSE: {val_rmse:.4f}')
-    print(f'Test AP: {test_ap:.4f}, Test AUC: {test_auc:.4f}, Test RMSE: {test_rmse:.4f}')
+    val_rmse, val_ap, val_auc = test(val_loader)
+    if epoch == 150:
+        test_rmse, test_ap, test_auc = test(test_loader, True)
+    else:
+        test_rmse, test_ap, test_auc = test(test_loader)
+    print(f'Val AP: {val_ap:.4f}, Val AUC: {val_auc:.4f}')
+    print(f'Test AP: {test_ap:.4f}, Test AUC: {test_auc:.4f}')
 
     if verbose:
         writer.add_scalar('training_loss', loss, epoch)
+        writer.add_scalar('val_rmse', val_rmse, epoch)
         writer.add_scalar('val_ap', val_ap, epoch)
         writer.add_scalar('val_auc', val_auc, epoch)
-        writer.add_scalar('val_rmse', val_rmse, epoch)
+        writer.add_scalar('test_rmse', test_rmse, epoch)
         writer.add_scalar('test_ap', test_ap, epoch)
         writer.add_scalar('test_auc', test_auc, epoch)
-        writer.add_scalar('test_rmse', test_rmse, epoch)
 
 if verbose: writer.close()
 
 ##############################################################
-# Get predictions
-ind_map = {vals[i]: i for i in range(len(vals))}
-rev_ind_map = {i: vals[i] for i in range(len(vals))}
+# Get some predictions to show
+raise
+time_vals = np.arange(max(t)+1, max(t)+25, 5)
 
-permut = np.array(np.meshgrid(vals, vals)).T.reshape(-1,2)
-pred_src, pred_dst = np.hsplit(permut, 2)
+permut = np.array(np.meshgrid(vals, vals, time_vals)).T.reshape(-1,3)
+pred_src, pred_dst, pred_t = np.hsplit(permut, 3)
 
 pred_src = np.vectorize(ind_map.get)(pred_src)
 pred_dst = np.vectorize(ind_map.get)(pred_dst)
 
 pred_src = torch.Tensor(pred_src).type(torch.long)
 pred_dst = torch.Tensor(pred_dst).type(torch.long)
-pred_t = torch.ones_like(pred_dst).type(torch.long)
+pred_t = torch.Tensor(pred_t).type(torch.long)
 
 pred_data = TemporalData(src=pred_src, dst=pred_dst, t=pred_t)
 
@@ -333,16 +370,13 @@ with torch.no_grad():
         z, last_update = memory(n_id)
         z = gnn(z, last_update, edge_index, data.t[e_id].to(device),
                 data.msg[e_id].to(device))
-        pos_out_full = link_pred(z[assoc[batch.src]], z[assoc[batch.dst]])
-        pos_out = pos_out_full[:, :, 0]
-
-        reg_out = pos_out_full[:, :, 1].sigmoid() * window
-
-        cur_pred = torch.stack((pos_out.sigmoid().view(-1, 1), batch.src, batch.dst, reg_out), axis = 1)
+        time = batch.t.type(torch.cuda.FloatTensor)
+        pos_out = link_pred(z[assoc[batch.src]], z[assoc[batch.dst]], time)
+        cur_pred = torch.stack((pos_out.sigmoid().view(-1, 1), batch.src, batch.dst, time), axis = 1)
         final_pred[batch_size*ind:batch_size*(ind+1)] = cur_pred[:,:,0]
 
 final_dataframe = pd.DataFrame(final_pred.detach().cpu().numpy())
 final_dataframe = final_dataframe.replace({1:rev_ind_map, 2:rev_ind_map})
 final_dataframe = final_dataframe.sort_values(by=[0], ascending=False)
-final_dataframe.to_csv('GNNthesis/res/sec_csv.csv')
+final_dataframe.to_csv('res/first_csv.csv')
 

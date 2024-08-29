@@ -35,14 +35,14 @@ import numpy as np
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.cuda.empty_cache()
 verbose = True
-if verbose: writer = SummaryWriter('runs/TGN_without_time_pred')
+if verbose: writer = SummaryWriter('GNNthesis/runs/TGN_without_time_pred')
 
 # Starboard data
 events = ['FISH', 'PORT', 'ECTR']
 event_dict = dict(zip(events, range(len(events))))
 rev_event_dict = dict(zip(range(len(events)), events))
-data_events = pd.read_csv('data/Starboard/events.csv')
-data_vessels = pd.read_csv('data/Starboard/vessels.csv')
+data_events = pd.read_csv('GNNthesis/data/Starboard/events.csv')
+data_vessels = pd.read_csv('GNNthesis/data/Starboard/vessels.csv')
 feature_dict = {x['vessel_id']: x['label'] for _, x in data_vessels.iterrows()}
 
 # Initialise inputs 
@@ -157,14 +157,10 @@ class LinkPredictor(torch.nn.Module):
         super().__init__()
         self.lin_src = Linear(in_channels, in_channels)
         self.lin_dst = Linear(in_channels, in_channels)
-        self.lin_time = Linear(in_channels, in_channels)
-        self.time_enc = TimeEncoder(in_channels)
         self.lin_final = Linear(in_channels, 1)
 
-    def forward(self, z_src, z_dst, t):
-        time = self.time_enc(t)
-        time = self.lin_time(time).view(z_src.shape)
-        h = self.lin_src(z_src) + self.lin_dst(z_dst) + time
+    def forward(self, z_src, z_dst):
+        h = self.lin_src(z_src) + self.lin_dst(z_dst)
         h = h.relu()
         return self.lin_final(h)
 
@@ -218,9 +214,8 @@ def train():
         z, last_update = memory(n_id)
         z = gnn(z, last_update, edge_index, data.t[e_id].to(device),
                 data.msg[e_id].to(device))
-        time = batch.t.type(torch.cuda.FloatTensor)
-        pos_out = link_pred(z[assoc[batch.src]], z[assoc[batch.dst]], time)
-        neg_out = link_pred(z[assoc[batch.src]], z[assoc[batch.neg_dst]], time)
+        pos_out = link_pred(z[assoc[batch.src]], z[assoc[batch.dst]])
+        neg_out = link_pred(z[assoc[batch.src]], z[assoc[batch.neg_dst]])
 
         # y_true = torch.stack((torch.ones(len(batch)).to(device), batch.t), dim=1)
         # loss = criterion_c(pos_out, y_true)
@@ -261,9 +256,8 @@ def test(loader, test = False):
         z, last_update = memory(n_id)
         z = gnn(z, last_update, edge_index, data.t[e_id].to(device),
                 data.msg[e_id].to(device))
-        time = batch.t.type(torch.cuda.FloatTensor)
-        pos_out = link_pred(z[assoc[batch.src]], z[assoc[batch.dst]], time)
-        neg_out = link_pred(z[assoc[batch.src]], z[assoc[batch.neg_dst]], time)
+        pos_out = link_pred(z[assoc[batch.src]], z[assoc[batch.dst]])
+        neg_out = link_pred(z[assoc[batch.src]], z[assoc[batch.neg_dst]])
 
         y_pred = torch.cat([pos_out, neg_out], dim=0).sigmoid().cpu()
         y_pred = y_pred.view(-1)
@@ -312,8 +306,8 @@ def test(loader, test = False):
                           index = list(range(right_data.shape[0])),
                           columns = col_vals)
         
-        wrong_df.to_csv('res/wrong_data.csv')
-        right_df.to_csv('res/right_data.csv')
+        wrong_df.to_csv('GNNthesis/res/wrong_data.csv')
+        right_df.to_csv('GNNthesis/res/right_data.csv')
     
     return float(torch.tensor(accs).mean()), float(torch.tensor(aps).mean()), float(torch.tensor(aucs).mean())
 
