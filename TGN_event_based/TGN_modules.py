@@ -46,3 +46,18 @@ class LinkPredictor(torch.nn.Module):
         h = self.lin_src(z_src) + self.lin_dst(z_dst)
         h = h.relu()
         return self.lin_final(h)
+    
+class BasicGAT(torch.nn.Module):
+    def __init__(self, in_channels, hid_channels, out_channels):
+        super().__init__()
+        self.conv1 = TransformerConv(in_channels, hid_channels // 2, heads=2,
+                                    dropout=0.1)
+        self.conv2 = TransformerConv(hid_channels, out_channels // 2, heads=2,
+                                    dropout=0.1)
+
+    def forward(self, x, edge_index):
+        x = self.conv1(x, edge_index).relu()
+        return self.conv2(x, edge_index)
+
+    def decode(self, z, edge_label_index):
+        return (z[edge_label_index[0]] * z[edge_label_index[1]]).sum(dim=-1)

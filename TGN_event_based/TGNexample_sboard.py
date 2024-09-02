@@ -53,11 +53,12 @@ torch.cuda.empty_cache()
 if verbose: writer = SummaryWriter(f'GNNthesis/runs/{summary_writer}')
 
 # Starboard data
+data_events = pd.read_parquet(event_path)
+data_vessels = pd.read_csv(data_path)
+
 events = ['FISH', 'PORT', 'ECTR']
 event_dict = dict(zip(events, range(len(events))))
 rev_event_dict = dict(zip(range(len(events)), events))
-data_events = pd.read_parquet(event_path)
-data_vessels = pd.read_csv(data_path)
 feature_dict = {x['vessel_id']: x['label'] for _, x in data_vessels.iterrows()}
 
 # Initialise inputs 

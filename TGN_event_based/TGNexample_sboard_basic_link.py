@@ -22,18 +22,33 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.data import Data
 from torch_geometric.utils import negative_sampling
 from torch.utils.tensorboard import SummaryWriter
+from TGN_modules import *
 
 import networkx as nx
 import pandas as pd
 import numpy as np
+import pyarrow
+import tqdm
+
+summary_writer = 'basic_link_pred_new'
+event_path = 'GNNthesis/data/Starboard/events.parquet'
+data_path = 'GNNthesis/data/Starboard/vessels.csv'
+batch_size = 100
+val_ratio = 0.1
+test_ratio = 0.1
+epochs = 50
+lr = 0.0001
+l1_reg = 0
+verbose = True
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.cuda.empty_cache()
-writer = SummaryWriter('GNNthesis/runs/basic_link_pred')
+
+if verbose: writer = SummaryWriter(f'GNNthesis/runs/{summary_writer}')
 
 # Starboard data
-data_events = pd.read_csv('GNNthesis/data/Starboard/events.csv')
-data_vessels = pd.read_csv('GNNthesis/data/Starboard/vessels.csv')
+data_events = pd.read_parquet(event_path)
+data_vessels = pd.read_csv(data_path)
 
 # Initialise inputs 
 G = nx.Graph()
@@ -103,48 +118,33 @@ edge_index = torch.Tensor(edge_index).type(torch.long)
 data = Data(x=x, edge_index=edge_index)
 data = data.to(device)
 
-transform = T.RandomLinkSplit(num_val=0.15, num_test=0.15, is_undirected=True)
+transform = T.RandomLinkSplit(num_val=val_ratio, num_test=test_ratio, is_undirected=True)
 train_data, val_data, test_data = transform(data)
 
 train_loader = DataLoader(
     train_data,
-    batch_size=50,
+    batch_size=batch_size,
 )
 val_loader = DataLoader(
     val_data,
-    batch_size=50,
+    batch_size=batch_size,
 )
 test_loader = DataLoader(
     test_data,
-    batch_size=50,
+    batch_size=batch_size,
 )
-
-class GraphAttentionEmbedding(torch.nn.Module):
-    def __init__(self, in_channels, hid_channels, out_channels):
-        super().__init__()
-        self.conv1 = TransformerConv(in_channels, hid_channels // 2, heads=2,
-                                    dropout=0.1)
-        self.conv2 = TransformerConv(hid_channels, out_channels // 2, heads=2,
-                                    dropout=0.1)
-
-    def forward(self, x, edge_index):
-        x = self.conv1(x, edge_index).relu()
-        return self.conv2(x, edge_index)
-
-    def decode(self, z, edge_label_index):
-        return (z[edge_label_index[0]] * z[edge_label_index[1]]).sum(dim=-1)
 
 memory_dim = data.num_features
 hid_channel = 128
 out_channel = 64
 
-gnn = GraphAttentionEmbedding(
+gnn = BasicGAT(
     in_channels=memory_dim,
     hid_channels=hid_channel,
     out_channels=out_channel
 ).to(device)
 
-optimizer = torch.optim.Adam(set(gnn.parameters()), lr=0.0001)
+optimizer = torch.optim.Adam(set(gnn.parameters()), lr=lr)
 criterion = torch.nn.BCEWithLogitsLoss()
 
 print(train_data)
@@ -209,9 +209,10 @@ def test(test_data):
 
 for epoch in range(1, 151):
     loss = train(train_data)
-    print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}')
+    print(f'Epoch: {epoch:02d}')
     val_acc, val_ap, val_auc = test(val_data)
     test_acc, test_ap, test_auc = test(test_data)
+    print(f'Loss: {loss:.4f}')
     print(f'Val AP: {val_ap:.4f}, Val AUC: {val_auc:.4f}')
     print(f'Test AP: {test_ap:.4f}, Test AUC: {test_auc:.4f}')
 
