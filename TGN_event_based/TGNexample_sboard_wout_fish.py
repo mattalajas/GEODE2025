@@ -12,7 +12,6 @@
 # test bed for future methods.
 
 import os.path as osp
-import os
 
 import torch
 from sklearn.metrics import average_precision_score, roc_auc_score, root_mean_squared_error
@@ -28,23 +27,40 @@ from torch_geometric.nn.models.tgn import (
     LastNeighborLoader,
 )
 from torch.utils.tensorboard import SummaryWriter
+from TGN_modules import *
 
 import datetime
 import pandas as pd
 import numpy as np
+import pyarrow
+import tqdm
+
+summary_writer = 'TGN_new_wout_fish'
+event_path = 'GNNthesis/data/Starboard/events.parquet'
+data_path = 'GNNthesis/data/Starboard/vessels.csv'
+batch_size = 5000
+val_ratio = 0.15
+test_ratio = 0.15
+memory_dim = time_dim = embedding_dim = 100
+epochs = 50
+lr = 0.0001
+l1_reg = 0
+verbose = True
+self_loop = True
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.cuda.empty_cache()
-verbose = True
-if verbose: writer = SummaryWriter('GNNthesis/runs/TGN_wout_fish')
+
+if verbose: writer = SummaryWriter(f'GNNthesis/runs/{summary_writer}_self_{self_loop}')
 
 # Starboard data
+data_events = pd.read_parquet(event_path)
+data_vessels = pd.read_csv(data_path)
+
 events = ['PORT', 'ECTR']
 event_dict = dict(zip(events, range(len(events))))
 rev_event_dict = dict(zip(range(len(events)), events))
-data_events = pd.read_csv('GNNthesis/data/Starboard/events.csv')
 data_events = data_events[data_events.event_type != 'FISH']
-data_vessels = pd.read_csv('GNNthesis/data/Starboard/vessels.csv')
 feature_dict = {x['vessel_id']: x['label'] for _, x in data_vessels.iterrows()}
 
 # Initialise inputs 
@@ -63,6 +79,7 @@ timesteps = data_events['start_time'].dt.dayofyear
 # add fish to events
 data_events['event_type'] = data_events['event_type'].fillna('PORT')
 
+prog_bar = tqdm.tqdm(range(len(data_events)))
 for ind, data in data_events.iterrows():
     # Define source and dest array
     src[ind] = data['vessel_id']
@@ -81,6 +98,9 @@ for ind, data in data_events.iterrows():
     # Event types
     event = data['event_type']
     y[ind][event_dict[event]] = 1
+    prog_bar.update(1)
+    
+prog_bar.close()
 
 vals, indexes = np.unique(np.concatenate((src, dst)), return_inverse=True)
 src, dst = np.split(indexes, 2)
@@ -105,54 +125,25 @@ rev_ind_map = {i: vals[i] for i in range(len(vals))}
 data = data.to(device)
 
 train_data, val_data, test_data = data.train_val_test_split(
-    val_ratio=0.15, test_ratio=0.15)
+    val_ratio=val_ratio, test_ratio=val_ratio)
 
 train_loader = TemporalDataLoader(
     train_data,
-    batch_size=100,
+    batch_size=batch_size,
     neg_sampling_ratio=1.0,
 )
 val_loader = TemporalDataLoader(
     val_data,
-    batch_size=100,
+    batch_size=batch_size,
     neg_sampling_ratio=1.0,
 )
 test_loader = TemporalDataLoader(
     test_data,
-    batch_size=100,
+    batch_size=batch_size,
     neg_sampling_ratio=1.0,
 )
 
 neighbor_loader = LastNeighborLoader(data.num_nodes, size=10, device=device)
-
-
-class GraphAttentionEmbedding(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, msg_dim, time_enc):
-        super().__init__()
-        self.time_enc = time_enc
-        edge_dim = msg_dim + time_enc.out_channels
-        self.conv = TransformerConv(in_channels, out_channels // 2, heads=2,
-                                    dropout=0.1, edge_dim=edge_dim)
-
-    def forward(self, x, last_update, edge_index, t, msg):
-        rel_t = last_update[edge_index[0]] - t
-        rel_t_enc = self.time_enc(rel_t.to(x.dtype))
-        edge_attr = torch.cat([rel_t_enc, msg], dim=-1)
-        return self.conv(x, edge_index, edge_attr)
-    
-class LinkPredictor(torch.nn.Module):
-    def __init__(self, in_channels):
-        super().__init__()
-        self.lin_src = Linear(in_channels, in_channels)
-        self.lin_dst = Linear(in_channels, in_channels)
-        self.lin_final = Linear(in_channels, 1)
-
-    def forward(self, z_src, z_dst):
-        h = self.lin_src(z_src) + self.lin_dst(z_dst)
-        h = h.relu()
-        return self.lin_final(h)
-
-memory_dim = time_dim = embedding_dim = 100
 
 memory = TGNMemory(
     data.num_nodes,
@@ -174,14 +165,13 @@ link_pred = LinkPredictor(in_channels=embedding_dim).to(device)
 
 optimizer = torch.optim.Adam(
     set(memory.parameters()) | set(gnn.parameters())
-    | set(link_pred.parameters()), lr=0.0001)
+    | set(link_pred.parameters()), lr=lr, weight_decay=l1_reg)
 criterion_c = torch.nn.BCEWithLogitsLoss()
 
 # Helper vector to map global node indices to local ones.
 assoc = torch.empty(data.num_nodes, dtype=torch.long, device=device)
 
-
-def train():
+def train(train_loader):
     memory.train()
     gnn.train()
     link_pred.train()
@@ -190,6 +180,7 @@ def train():
     neighbor_loader.reset_state()  # Start with an empty graph.
 
     total_loss = 0
+    prog_bar = tqdm.tqdm(range(len(train_loader)))
     for batch in train_loader:
         optimizer.zero_grad()
         batch = batch.to(device)
@@ -219,6 +210,8 @@ def train():
         memory.detach()
         total_loss += float(loss) * batch.num_events
 
+        prog_bar.update(1)
+    prog_bar.close()
     return total_loss / train_data.num_events
 
 
@@ -234,6 +227,7 @@ def test(loader, test = False):
     right_data = []
 
     accs, aps, aucs = [], [], []
+    prog_bar = tqdm.tqdm(range(len(loader)))
     for batch in loader:
         batch = batch.to(device)
 
@@ -280,7 +274,9 @@ def test(loader, test = False):
 
         memory.update_state(batch.src, batch.dst, batch.t, batch.msg)
         neighbor_loader.insert(batch.src, batch.dst)
-    
+        prog_bar.update(1)
+    prog_bar.close()
+
     if test:
         col_vals = ['start_time','vessel_id1', 'vessel_id2', 'event_type']
         wrong_data = np.concatenate(wrong_data)
@@ -298,14 +294,17 @@ def test(loader, test = False):
     
     return float(torch.tensor(accs).mean()), float(torch.tensor(aps).mean()), float(torch.tensor(aucs).mean())
 
-for epoch in range(1, 151):
-    loss = train()
-    print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}')
+for epoch in range(1, epochs+1):
+    print(f'Epoch: {epoch:02d}')
+    
+    loss = train(train_loader)
     val_rmse, val_ap, val_auc = test(val_loader)
     if epoch == 150:
         test_rmse, test_ap, test_auc = test(test_loader, True)
     else:
         test_rmse, test_ap, test_auc = test(test_loader)
+    
+    print(f'Train Loss: {loss:.4f}')
     print(f'Val AP: {val_ap:.4f}, Val AUC: {val_auc:.4f}')
     print(f'Test AP: {test_ap:.4f}, Test AUC: {test_auc:.4f}')
 

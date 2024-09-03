@@ -39,18 +39,19 @@ summary_writer = 'TGN_new'
 event_path = 'GNNthesis/data/Starboard/events.parquet'
 data_path = 'GNNthesis/data/Starboard/vessels.csv'
 batch_size = 5000
-val_ratio = 0.1
-test_ratio = 0.1
+val_ratio = 0.15
+test_ratio = 0.15
 memory_dim = time_dim = embedding_dim = 100
 epochs = 50
 lr = 0.0001
 l1_reg = 0
 verbose = True
+self_loop = True
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.cuda.empty_cache()
 
-if verbose: writer = SummaryWriter(f'GNNthesis/runs/{summary_writer}')
+if verbose: writer = SummaryWriter(f'GNNthesis/runs/{summary_writer}_self_{self_loop}')
 
 # Starboard data
 data_events = pd.read_parquet(event_path)
@@ -87,7 +88,10 @@ for ind, data in data_events.iterrows():
     elif not np.isnan(data['port_id']):
         dst[ind] = data['port_id']
     else:
-        dst[ind] = 0
+        if self_loop:
+            dst[ind] = data['vessel_id']
+        else:
+            dst[ind] = 0
 
     # Timestamp
     t[ind] = timesteps[ind]

@@ -40,11 +40,12 @@ epochs = 50
 lr = 0.0001
 l1_reg = 0
 verbose = True
+self_loop = True
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.cuda.empty_cache()
 
-if verbose: writer = SummaryWriter(f'GNNthesis/runs/{summary_writer}')
+if verbose: writer = SummaryWriter(f'GNNthesis/runs/{summary_writer}_self_{self_loop}')
 
 # Starboard data
 data_events = pd.read_parquet(event_path)
@@ -57,6 +58,7 @@ G = nx.Graph()
 num_vessels = 0
 n_colormap = {}
 feature_dict = {x['vessel_id']: x['label'] for _, x in data_vessels.iterrows()}
+
 node_att_map = {node: ind for ind, node in enumerate(set(data_vessels['label']))}
 node_att_map['Port'] = len(node_att_map)
 node_att_map['NA'] = len(node_att_map)
@@ -65,19 +67,22 @@ edge_att_map = {'ECTR': 0, 'FISH': 1, 'DOCK': 2}
 eye = np.eye(len(node_att_map))
 
 # Creating graph
+prog_bar = tqdm.tqdm(range(len(data_events)))
 for ind, data in data_events.iterrows():
     init_vessel = data['vessel_id']
     sec_vessel = data['vessel_id2']
     port = data['port_id']
     event = data['event_type']
 
-    G.add_node(init_vessel, name = 'vessel', label = feature_dict[init_vessel])
+    # G.add_node(init_vessel, name = 'vessel', label = feature_dict[init_vessel])
+    G.add_node(init_vessel, name = 'vessel')
     n_colormap[init_vessel] = 'blue'
     
     # if not np.isnan(sec_vessel):
     if not np.isnan(sec_vessel):# and sec_vessel in feature_dict:
         if sec_vessel in feature_dict:
-            label = feature_dict[sec_vessel]
+            # label = feature_dict[sec_vessel]
+            label = 'NA'
             G.add_node(sec_vessel, name = 'vessel', label = label,
                        one_hot = eye[node_att_map[label]])
         else:
@@ -88,14 +93,22 @@ for ind, data in data_events.iterrows():
         n_colormap[sec_vessel] = 'blue'
 
     elif not np.isnan(port):
-        G.add_node(port, name = 'port', label = 'Port',
-                   one_hot = eye[node_att_map['Port']])
+        # G.add_node(port, name = 'port', label = 'Port',
+        #            one_hot = eye[node_att_map['Port']])
+        G.add_node(port, name = 'port')
         G.add_edge(init_vessel, port, event = 'DOCK', color = 'red')
         n_colormap[port] = 'red'
     
     else:
-        G.add_edge(init_vessel, 0, event = event, color = 'green')
-        n_colormap[0] = 'green'
+        if self_loop:
+            G.add_edge(init_vessel, init_vessel, event = event, color = 'green')
+            n_colormap[0] = 'green'
+        else:
+            G.add_edge(init_vessel, 0, event = event, color = 'green')
+            n_colormap[0] = 'green'
+    prog_bar.update(1)
+    
+prog_bar.close()
 
 G.nodes[0]['one_hot'] = eye[node_att_map['Fish']]
 
@@ -216,12 +229,13 @@ for epoch in range(1, 151):
     print(f'Val AP: {val_ap:.4f}, Val AUC: {val_auc:.4f}')
     print(f'Test AP: {test_ap:.4f}, Test AUC: {test_auc:.4f}')
 
-    writer.add_scalar('training_loss', loss, epoch)
-    writer.add_scalar('val_rmse', val_acc, epoch)
-    writer.add_scalar('val_ap', val_ap, epoch)
-    writer.add_scalar('val_auc', val_auc, epoch)
-    writer.add_scalar('test_rmse', test_acc, epoch)
-    writer.add_scalar('test_ap', test_ap, epoch)
-    writer.add_scalar('test_auc', test_auc, epoch)
+    if verbose:
+        writer.add_scalar('training_loss', loss, epoch)
+        writer.add_scalar('val_rmse', val_acc, epoch)
+        writer.add_scalar('val_ap', val_ap, epoch)
+        writer.add_scalar('val_auc', val_auc, epoch)
+        writer.add_scalar('test_rmse', test_acc, epoch)
+        writer.add_scalar('test_ap', test_ap, epoch)
+        writer.add_scalar('test_auc', test_auc, epoch)
 
 writer.close()
