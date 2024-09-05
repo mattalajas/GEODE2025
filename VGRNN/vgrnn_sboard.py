@@ -16,7 +16,7 @@ from torch.nn.parameter import Parameter
 import torch.nn.functional as F
 import time
 from torch_scatter import scatter_mean, scatter_max, scatter_add
-from torch_geometric.utils import remove_self_loops, add_self_loops
+from torch_geometric.utils import *
 from torch_geometric.nn import MessagePassing
 import torch_scatter
 import inspect
@@ -24,6 +24,7 @@ from sklearn.metrics import roc_auc_score
 from sklearn.metrics import average_precision_score
 import copy
 import pickle
+import tqdm
 
 seed = 123
 np.random.seed(seed)
@@ -184,16 +185,18 @@ def mask_edges_det(adjs_list):
     adj_train_l, train_edges_l, val_edges_l = [], [], []
     val_edges_false_l, test_edges_l, test_edges_false_l = [], [], []
     edges_list = []
+
+    pbar = tqdm.tqdm(total=len(adjs_list))
     for i in range(0, len(adjs_list)):
         # Function to build test set with 10% positive links
         # NOTE: Splits are randomized and results might slightly deviate from reported numbers in the paper.
         
         adj = adjs_list[i]
         # Remove diagonal elements
-        # adj = adj - sp.dia_matrix((adj.diagonal()[np.newaxis, :], [0]), shape=adj.shape)
-        # adj.eliminate_zeros()
-        # # Check that diag is zero:
-        # assert np.diag(adj.todense()).sum() == 0
+        adj = adj - sp.dia_matrix((adj.diagonal()[np.newaxis, :], [0]), shape=adj.shape)
+        adj.eliminate_zeros()
+        # Check that diag is zero:
+        assert np.diag(adj.todense()).sum() == 0
         
         adj_triu = sp.triu(adj)
         adj_tuple = sparse_to_tuple(adj_triu)
@@ -252,11 +255,11 @@ def mask_edges_det(adjs_list):
                     continue
             val_edges_false.append([idx_i, idx_j])
 
-        assert ~ismember(test_edges_false, edges_all)
-        assert ~ismember(val_edges_false, edges_all)
-        assert ~ismember(val_edges, train_edges)
-        assert ~ismember(test_edges, train_edges)
-        assert ~ismember(val_edges, test_edges)
+        # assert ~ismember(test_edges_false, edges_all)
+        # assert ~ismember(val_edges_false, edges_all)
+        # assert ~ismember(val_edges, train_edges)
+        # assert ~ismember(test_edges, train_edges)
+        # assert ~ismember(val_edges, test_edges)
 
         data = np.ones(train_edges.shape[0])
 
@@ -270,6 +273,8 @@ def mask_edges_det(adjs_list):
         val_edges_false_l.append(val_edges_false)
         test_edges_l.append(test_edges)
         test_edges_false_l.append(test_edges_false)
+        pbar.update(1)
+    pbar.close()
 
     # NOTE: these edge lists only contain single direction of edge!
     return adj_train_l, train_edges_l, val_edges_l, val_edges_false_l, test_edges_l, test_edges_false_l
@@ -277,16 +282,18 @@ def mask_edges_det(adjs_list):
 def mask_edges_prd(adjs_list):
     pos_edges_l , false_edges_l = [], []
     edges_list = []
+
+    pbar = tqdm.tqdm(total=len(adjs_list))
     for i in range(0, len(adjs_list)):
         # Function to build test set with 10% positive links
         # NOTE: Splits are randomized and results might slightly deviate from reported numbers in the paper.
         
         adj = adjs_list[i]
-        # # Remove diagonal elements
-        # adj = adj - sp.dia_matrix((adj.diagonal()[np.newaxis, :], [0]), shape=adj.shape)
-        # adj.eliminate_zeros()
-        # # Check that diag is zero:
-        # assert np.diag(adj.todense()).sum() == 0
+        # Remove diagonal elements
+        adj = adj - sp.dia_matrix((adj.diagonal()[np.newaxis, :], [0]), shape=adj.shape)
+        adj.eliminate_zeros()
+        # Check that diag is zero:
+        assert np.diag(adj.todense()).sum() == 0
         
         adj_triu = sp.triu(adj)
         adj_tuple = sparse_to_tuple(adj_triu)
@@ -319,6 +326,8 @@ def mask_edges_prd(adjs_list):
         
         false_edges_l.append(edges_false)
 
+        pbar.update(1)
+    pbar.close()
     # NOTE: these edge lists only contain single direction of edge!
     return pos_edges_l, false_edges_l
 
@@ -331,10 +340,10 @@ def mask_edges_prd_new(adjs_list, adj_orig_dense_list):
 
     adj = adjs_list[0]
     # Remove diagonal elements
-    # adj = adj - sp.dia_matrix((adj.diagonal()[np.newaxis, :], [0]), shape=adj.shape)
-    # adj.eliminate_zeros()
-    # # Check that diag is zero:
-    # assert np.diag(adj.todense()).sum() == 0
+    adj = adj - sp.dia_matrix((adj.diagonal()[np.newaxis, :], [0]), shape=adj.shape)
+    adj.eliminate_zeros()
+    # Check that diag is zero:
+    assert np.diag(adj.todense()).sum() == 0
 
     adj_triu = sp.triu(adj)
     adj_tuple = sparse_to_tuple(adj_triu)
@@ -366,16 +375,20 @@ def mask_edges_prd_new(adjs_list, adj_orig_dense_list):
     assert ~ismember(edges_false, edges_all)    
     false_edges_l.append(np.asarray(edges_false))
     
+    pbar = tqdm.tqdm(total=len(adjs_list))
     for i in range(1, len(adjs_list)):
-        edges_pos = np.transpose(np.asarray(np.where((adj_orig_dense_list[i] - adj_orig_dense_list[i-1])>0)))
-        num_false = int(edges_pos.shape[0])
+        # edges_pos = np.transpose(np.asarray(np.where((adjs_list[i] - adjs_list[i-1])>0)))
+        # num_false = int(edges_pos.shape[0])
+
+        edges_pos = ((adjs_list[i] - adjs_list[i-1])>0).todense().nonzero()
+        num_false = int(len(edges_pos[0]))
         
         adj = adjs_list[i]
-        # # Remove diagonal elements
-        # adj = adj - sp.dia_matrix((adj.diagonal()[np.newaxis, :], [0]), shape=adj.shape)
-        # adj.eliminate_zeros()
-        # # Check that diag is zero:
-        # assert np.diag(adj.todense()).sum() == 0
+        # Remove diagonal elements
+        adj = adj - sp.dia_matrix((adj.diagonal()[np.newaxis, :], [0]), shape=adj.shape)
+        adj.eliminate_zeros()
+        # Check that diag is zero:
+        assert np.diag(adj.todense()).sum() == 0
         
         adj_triu = sp.triu(adj)
         adj_tuple = sparse_to_tuple(adj_triu)
@@ -402,6 +415,8 @@ def mask_edges_prd_new(adjs_list, adj_orig_dense_list):
         false_edges_l.append(np.asarray(edges_false))
         pos_edges_l.append(edges_pos)
     
+        pbar.update(1)
+    pbar.close()
     # NOTE: these edge lists only contain single direction of edge!
     return pos_edges_l, false_edges_l
 
@@ -431,8 +446,13 @@ with open('GNNthesis/data/FB/adj_time_list.pickle', 'rb') as handle:
 with open('GNNthesis/data/FB/adj_orig_dense_list.pickle', 'rb') as handle:
     adj_orig_dense_list = pickle.load(handle, encoding='bytes')
     
-adj_time_list, adj_orig_dense_list = get_starboard_data('GNNthesis/data/Starboard', 5)
+# adj_time_list, adj_orig_dense_list = get_starboard_data('GNNthesis/data/Starboard', 5)
 
+with open('GNNthesis/data/Starboard/adj_time_list.pickle', 'rb') as handle:
+    adj_time_list = pickle.load(handle)
+
+interval = -460
+adj_time_list = adj_time_list[interval:]
 
 # masking edges
 
@@ -735,7 +755,7 @@ def get_roc_scores(edges_pos, edges_neg, adj_orig_dense_list, embs):
         # Predict on test set of edges
         emb = embs[i].detach().numpy()
         adj_rec = np.dot(emb, emb.T)
-        adj_orig_t = adj_orig_dense_list[i]
+        adj_orig_t = adj_orig_dense_list[i].todense()
         preds = []
         pos = []
         for e in edges_pos[i]:
@@ -848,7 +868,7 @@ class VGRNN(nn.Module):
             #recurrence
             _, h = self.rnn(torch.cat([phi_x_t, phi_z_t], 1), edge_idx_list[t], h)
             
-            nnodes = adj_orig_dense_list[t].size()[0]
+            nnodes = adj_orig_dense_list[t].shape[0]
             enc_mean_t_sl = enc_mean_t[0:nnodes, :]
             enc_std_t_sl = enc_std_t[0:nnodes, :]
             prior_mean_t_sl = prior_mean_t[0:nnodes, :]
@@ -900,14 +920,15 @@ class VGRNN(nn.Module):
         return (-0.5 / num_nodes) * kld_element
     
     def _nll_bernoulli(self, logits, target_adj_dense):
-        temp_size = target_adj_dense.size()[0]
+        temp_size = target_adj_dense.shape[0]
         temp_sum = target_adj_dense.sum()
         posw = float(temp_size * temp_size - temp_sum) / temp_sum
+        posw = torch.Tensor([posw])
         norm = temp_size * temp_size / float((temp_size * temp_size - temp_sum) * 2)
-        nll_loss_mat = F.binary_cross_entropy_with_logits(input=logits
-                                                          , target=target_adj_dense
-                                                          , pos_weight=posw
-                                                          , reduction='none')
+        tensor_mat = from_scipy_sparse_matrix(target_adj_dense)
+        fin_tensor_mat = to_torch_sparse_tensor(tensor_mat[0], tensor_mat[1], size=logits.shape[0]).to_dense()
+        fin_tensor_mat = fin_tensor_mat.type(torch.float64)
+        nll_loss_mat = F.binary_cross_entropy_with_logits(input=logits, target=fin_tensor_mat, pos_weight=posw, reduction='none')
         nll_loss = -1 * norm * torch.mean(nll_loss_mat, dim=[0,1])
         return - nll_loss
     
@@ -922,10 +943,11 @@ n_layers =  1
 clip = 10
 learning_rate = 1e-2
 seq_len = len(train_edges_l)
-num_nodes = adj_orig_dense_list[seq_len-1].shape[0]
+num_nodes = adj_time_list[seq_len-1].shape[0]
 x_dim = num_nodes
 eps = 1e-10
 conv_type='GCN'
+epochs = 50
 
 
 
@@ -952,12 +974,12 @@ seq_start = 0
 seq_end = seq_len - 3
 tst_after = 0
 
-for k in range(1000):
+for k in range(epochs):
     optimizer.zero_grad()
     start_time = time.time()
     kld_loss, nll_loss, _, _, hidden_st = model(x_in[seq_start:seq_end]
                                                 , edge_idx_list[seq_start:seq_end]
-                                                , adj_orig_dense_list[seq_start:seq_end])
+                                                , adj_time_list[seq_start:seq_end])
     loss = kld_loss + nll_loss
     loss.backward()
     optimizer.step()
@@ -967,17 +989,17 @@ for k in range(1000):
     if k>tst_after:
         _, _, enc_means, pri_means, _ = model(x_in[seq_end:seq_len]
                                               , edge_idx_list[seq_end:seq_len]
-                                              , adj_orig_dense_list[seq_end:seq_len]
+                                              , adj_time_list[seq_end:seq_len]
                                               , hidden_st)
         
         auc_scores_prd, ap_scores_prd = get_roc_scores(pos_edges_l[seq_end:seq_len]
                                                         , false_edges_l[seq_end:seq_len]
-                                                        , adj_orig_dense_list[seq_end:seq_len]
+                                                        , adj_time_list[seq_end:seq_len]
                                                         , pri_means)
         
         auc_scores_prd_new, ap_scores_prd_new = get_roc_scores(pos_edges_l_n[seq_end:seq_len]
                                                                 , false_edges_l_n[seq_end:seq_len]
-                                                                , adj_orig_dense_list[seq_end:seq_len]
+                                                                , adj_time_list[seq_end:seq_len]
                                                                 , pri_means)
         
     

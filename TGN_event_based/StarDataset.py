@@ -6,17 +6,36 @@ import torch
 import networkx as nx
 import pandas as pd
 import numpy as np
+import pyarrow
+import tqdm
 
 class StarDataset():
-    def __init__(self):
-        super().__init__(self)
+    def __init__(self, event_path, data_path, date_range, with_fish, self_loop):
+        data_events = pd.read_parquet(event_path)
+        data_vessels = pd.read_csv(data_path)
 
-        # Starboard data
-        events = ['FISH', 'PORT', 'ECTR']
+        if with_fish:
+            events = ['FISH', 'PORT', 'ECTR']
+        else:
+            events = ['PORT', 'ECTR']
+            data_events = data_events[data_events.event_type != 'FISH']
+            
         event_dict = dict(zip(events, range(len(events))))
-        data_events = pd.read_csv('data/Starboard/events.csv')
-        data_vessels = pd.read_csv('data/Starboard/vessels.csv')
+        self.rev_event_dict = dict(zip(range(len(events)), events))
         feature_dict = {x['vessel_id']: x['label'] for _, x in data_vessels.iterrows()}
+
+        # convert timesteps
+        data_events['start_time'] = pd.to_datetime(data_events['start_time'], format='%d/%m/%Y %H:%M')
+        data_events = data_events.sort_values(by='start_time').reset_index(drop=True)
+
+        # Filter dates
+        if date_range == 'all':
+            pass
+        else:
+            mask = (data_events['start_time'] >= date_range[0]) & (data_events['start_time'] <= date_range[1])
+            data_events = data_events.loc[mask].reset_index(drop=True)
+        
+        timesteps = (data_events['start_time'] - data_events['start_time'][0]).dt.days
 
         # Initialise inputs 
         src = np.zeros((len(data_events)))
@@ -26,14 +45,10 @@ class StarDataset():
         features = np.zeros((len(data_events), 4))
         y = np.zeros((len(data_events), len(events)))
 
-        # convert timesteps
-        data_events['start_time'] = pd.to_datetime(data_events['start_time'], format='%d/%m/%Y %H:%M')
-        data_events = data_events.sort_values(by='start_time').reset_index(drop=True)
-        timesteps = data_events['start_time'].dt.dayofyear
-
         # add fish to events
         data_events['event_type'] = data_events['event_type'].fillna('PORT')
 
+        prog_bar = tqdm.tqdm(range(len(data_events)))
         for ind, data in data_events.iterrows():
             # Define source and dest array
             src[ind] = data['vessel_id']
@@ -43,7 +58,11 @@ class StarDataset():
             elif not np.isnan(data['port_id']):
                 dst[ind] = data['port_id']
             else:
-                dst[ind] = 0
+                if with_fish:
+                    if self_loop:
+                        dst[ind] = data['vessel_id']
+                    else:
+                        dst[ind] = 0
 
             # Timestamp
             t[ind] = timesteps[ind]
@@ -54,6 +73,10 @@ class StarDataset():
             # Event types
             event = data['event_type']
             y[ind][event_dict[event]] = 1
+            prog_bar.update(1)
+            
+        prog_bar.close()
+
 
         vals, indexes = np.unique(np.concatenate((src, dst)), return_inverse=True)
         src, dst = np.split(indexes, 2)
@@ -66,7 +89,18 @@ class StarDataset():
         y = torch.Tensor(y)
 
         self.data = TemporalData(src=src, dst=dst, t=t, msg=features, y=y)
+        self.ind_map = {vals[i]: i for i in range(len(vals))}
+        self.rev_ind_map = {i: vals[i] for i in range(len(vals))}
 
     def get_data(self):
         return self.data
+    
+    def get_ind_map(self):
+        return self.ind_map
+    
+    def get_rev_ind_map(self):
+        return self.rev_ind_map
+    
+    def get_rev_event_dict(self):
+        return self.rev_event_dict
         

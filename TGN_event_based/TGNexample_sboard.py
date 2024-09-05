@@ -28,6 +28,7 @@ from torch_geometric.nn.models.tgn import (
 )
 from torch.utils.tensorboard import SummaryWriter
 from TGN_modules import *
+from StarDataset import StarDataset
 
 import datetime
 import pandas as pd
@@ -36,90 +37,33 @@ import pyarrow
 import tqdm
 
 summary_writer = 'TGN_new'
+csv_name = 'tgn_new'
 event_path = 'GNNthesis/data/Starboard/events.parquet'
 data_path = 'GNNthesis/data/Starboard/vessels.csv'
 batch_size = 5000
 val_ratio = 0.15
 test_ratio = 0.15
 memory_dim = time_dim = embedding_dim = 100
-epochs = 50
+epochs = 20
 lr = 0.0001
 l1_reg = 0
 verbose = True
 self_loop = True
+with_fish = True
+date_range = ['2011-08-11', '2012-11-13']
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.cuda.empty_cache()
 
-if verbose: writer = SummaryWriter(f'GNNthesis/runs/{summary_writer}_self_{self_loop}')
+if verbose: writer = SummaryWriter(f'GNNthesis/runs/{summary_writer}_self_{self_loop}_dates_{date_range}')
 
-# Starboard data
-data_events = pd.read_parquet(event_path)
-data_vessels = pd.read_csv(data_path)
+# Get dataset
+sb_data = StarDataset(event_path, data_path, date_range, with_fish, self_loop)
 
-events = ['FISH', 'PORT', 'ECTR']
-event_dict = dict(zip(events, range(len(events))))
-rev_event_dict = dict(zip(range(len(events)), events))
-feature_dict = {x['vessel_id']: x['label'] for _, x in data_vessels.iterrows()}
-
-# Initialise inputs 
-src = np.zeros((len(data_events)))
-dst = np.zeros((len(data_events)))
-t = np.zeros((len(data_events)))
-# features = (lat_n,lat_s,lon_e,lon_w,ves1,ves2)
-features = np.zeros((len(data_events), 4))
-y = np.zeros((len(data_events), len(events)))
-
-# convert timesteps
-data_events['start_time'] = pd.to_datetime(data_events['start_time'], format='%d/%m/%Y %H:%M')
-data_events = data_events.sort_values(by='start_time').reset_index(drop=True)
-timesteps = data_events['start_time'].dt.dayofyear
-
-# add fish to events
-data_events['event_type'] = data_events['event_type'].fillna('PORT')
-
-prog_bar = tqdm.tqdm(range(len(data_events)))
-for ind, data in data_events.iterrows():
-    # Define source and dest array
-    src[ind] = data['vessel_id']
-
-    if not np.isnan(data['vessel_id2']):
-        dst[ind] = data['vessel_id2']
-    elif not np.isnan(data['port_id']):
-        dst[ind] = data['port_id']
-    else:
-        if self_loop:
-            dst[ind] = data['vessel_id']
-        else:
-            dst[ind] = 0
-
-    # Timestamp
-    t[ind] = timesteps[ind]
-
-    # Features
-    features[ind] = np.array([data['lat_n'], data['lat_s'], data['lon_e'], data['lon_w']])
-
-    # Event types
-    event = data['event_type']
-    y[ind][event_dict[event]] = 1
-    prog_bar.update(1)
-    
-prog_bar.close()
-
-
-vals, indexes = np.unique(np.concatenate((src, dst)), return_inverse=True)
-src, dst = np.split(indexes, 2)
-features = np.nan_to_num(features)
-
-src = torch.Tensor(src).type(torch.long)
-dst = torch.Tensor(dst).type(torch.long)
-t = torch.Tensor(t).type(torch.long)
-features = torch.Tensor(features)
-y = torch.Tensor(y)
-
-data = TemporalData(src=src, dst=dst, t=t, msg=features, y=y)
-ind_map = {vals[i]: i for i in range(len(vals))}
-rev_ind_map = {i: vals[i] for i in range(len(vals))}
+data = sb_data.get_data().to(device)
+ind_map = sb_data.get_ind_map()
+rev_ind_map = sb_data.get_rev_ind_map()
+rev_event_dict = sb_data.get_rev_event_dict()
 
 # path = osp.join(osp.dirname(osp.realpath(__file__)), 'data', 'JODIE')
 # dataset = JODIEDataset(path, name='wikipedia')
@@ -127,7 +71,6 @@ rev_ind_map = {i: vals[i] for i in range(len(vals))}
 
 # For small datasets, we can put the whole dataset on GPU and thus avoid
 # expensive memory transfer costs for mini-batches:
-data = data.to(device)
 
 train_data, val_data, test_data = data.train_val_test_split(
     val_ratio=val_ratio, test_ratio=test_ratio)
@@ -252,8 +195,8 @@ def test(loader, test = False):
              torch.zeros(neg_out.size(0))], dim=0)
         
         if test:
-            def get_time(days, year = 2024):
-                return datetime.datetime(year, 1, 1) + datetime.timedelta(days - 1)
+            def get_time(days, start_date):
+                return datetime.datetime.strptime(start_date, '%Y-%m-%d') + datetime.timedelta(days - 1)
 
             all_vals = abs(torch.subtract(pos_out.sigmoid().cpu().view(-1), torch.ones(pos_out.size(0))))
             lindices = np.where(all_vals > 0.5)
@@ -267,7 +210,7 @@ def test(loader, test = False):
             src = np.vectorize(rev_ind_map.get)(src)
             dst = np.vectorize(rev_ind_map.get)(dst)
             y = np.vectorize(rev_event_dict.get)(np.where(y == 1)[1])
-            t = np.vectorize(get_time)(t)
+            t = np.vectorize(get_time)(t, date_range[0])
 
             new_arr = np.vstack((t, src, dst, y)).T
             wrong_data.append(new_arr[lindices])
@@ -294,8 +237,8 @@ def test(loader, test = False):
                           index = list(range(right_data.shape[0])),
                           columns = col_vals)
         
-        wrong_df.to_csv('GNNthesis/res/wrong_data.csv')
-        right_df.to_csv('GNNthesis/res/right_data.csv')
+        wrong_df.to_csv(f'GNNthesis/res/wrong_data_{csv_name}.csv')
+        right_df.to_csv(f'GNNthesis/res/right_data_{csv_name}.csv')
     
 
     return float(torch.tensor(accs).mean()), float(torch.tensor(aps).mean()), float(torch.tensor(aucs).mean())
@@ -305,7 +248,7 @@ for epoch in range(1, epochs+1):
     
     loss = train(train_loader)
     val_rmse, val_ap, val_auc = test(val_loader)
-    if epoch == 150:
+    if epoch == epochs:
         test_rmse, test_ap, test_auc = test(test_loader, True)
     else:
         test_rmse, test_ap, test_auc = test(test_loader)
