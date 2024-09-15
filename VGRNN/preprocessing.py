@@ -1,23 +1,7 @@
 import numpy as np
 import scipy.sparse as sp
 
-import os.path as osp
-
 import torch
-from sklearn.metrics import average_precision_score, roc_auc_score
-from torch.nn import Linear
-
-from torch_geometric.data.temporal import TemporalData
-from torch_geometric.datasets import JODIEDataset
-from torch_geometric.loader import TemporalDataLoader
-from torch_geometric.nn import TGNMemory, TransformerConv
-from torch_geometric.nn.models.tgn import (
-    IdentityMessage,
-    LastAggregator,
-    LastNeighborLoader,
-)
-
-import networkx as nx
 import pandas as pd
 import numpy as np
 import copy
