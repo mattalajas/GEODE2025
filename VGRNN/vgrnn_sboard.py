@@ -32,6 +32,9 @@ from utils import *
 seed = 123
 np.random.seed(seed)
 
+cuda_num = 5
+device = torch.device('mps' if torch.backends.mps.is_available() else f'cuda:{cuda_num}' if torch.cuda.is_available() else 'cpu')
+
 # loading data
 
 # # Enron dataset
@@ -51,36 +54,40 @@ np.random.seed(seed)
 
 
 # Facebook dataset
-with open('GNNthesis/data/FB/adj_time_list.pickle', 'rb') as handle:
-    adj_time_list = pickle.load(handle, encoding='latin1')
+# with open('GNNthesis/data/FB/adj_time_list.pickle', 'rb') as handle:
+#     adj_time_list = pickle.load(handle, encoding='latin1')
 
-with open('GNNthesis/data/FB/adj_orig_dense_list.pickle', 'rb') as handle:
-    adj_orig_dense_list = pickle.load(handle, encoding='bytes')
+# with open('GNNthesis/data/FB/adj_orig_dense_list.pickle', 'rb') as handle:
+#     adj_orig_dense_list = pickle.load(handle, encoding='bytes')
     
 # adj_time_list, adj_orig_dense_list = get_starboard_data('GNNthesis/data/Starboard', 5)
 
+# Coo matrix format
 with open('GNNthesis/data/Starboard/adj_time_list.pickle', 'rb') as handle:
     adj_time_list = pickle.load(handle)
 
 interval = -460
+interval = -5
 adj_time_list = adj_time_list[interval:]
+
+adj_time_list_t = torch.stack(adj_time_list).to(device)
 
 # masking edges
 
-outs = mask_edges_det(adj_time_list)
-train_edges_l = outs[1]
+# Retrieves train_edges adjacency list
+outs = mask_edges_det(adj_time_list_t, device)
+train_edges_l = outs[0]
 
-pos_edges_l, false_edges_l = mask_edges_prd(adj_time_list)
+# Get negative and positive edges of adjacency list and returns a bidirectional adjacecny list
+pos_edges_l, false_edges_l = mask_edges_prd(adj_time_list_t, device)
 
-pos_edges_l_n, false_edges_l_n = mask_edges_prd_new(adj_time_list, adj_orig_dense_list)
+# Get negative and positive edges that are newly generated (i has no edge but i+1 has one)
+pos_edges_l_n, false_edges_l_n = mask_edges_prd_new(adj_time_list_t, device)
 
 
 # creating edge list
 
-edge_idx_list = []
-
-for i in range(len(train_edges_l)):
-    edge_idx_list.append(torch.tensor(np.transpose(train_edges_l[i]), dtype=torch.long))
+edge_idx_list = train_edges_l
 
 # hyperparameters
 
@@ -96,22 +103,18 @@ eps = 1e-10
 conv_type='GCN'
 epochs = 50
 
-
-
-# creating input tensors
+# creating input tensors per sequence length
 
 x_in_list = []
-for i in range(0, seq_len):
-    x_temp = torch.tensor(np.eye(num_nodes).astype(np.float32))
-    x_in_list.append(torch.tensor(x_temp))
 
-x_in = Variable(torch.stack(x_in_list))
-
+x_temp = torch.eye(num_nodes).to(device)
+x_temp = x_temp.expand(1, num_nodes, num_nodes)
+x_in = Variable(x_temp)
 
 
 # building model
 
-model = VGRNN(x_dim, h_dim, z_dim, n_layers, eps, conv=conv_type, bias=True)
+model = VGRNN(x_dim, h_dim, z_dim, n_layers, eps, device, conv=conv_type, bias=True).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
 
@@ -134,7 +137,7 @@ for k in range(epochs):
     nn.utils.clip_grad_norm(model.parameters(), clip)
     
     if k>tst_after:
-        _, _, enc_means, pri_means, _ = model(x_in[seq_end:seq_len]
+        _, _, enc_means, pri_means, _ = model(x_in[seq_start:seq_end]
                                               , edge_idx_list[seq_end:seq_len]
                                               , adj_time_list[seq_end:seq_len]
                                               , hidden_st)

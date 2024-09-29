@@ -368,9 +368,10 @@ class InnerProductDecoder(nn.Module):
 
 # VGRNN model
 class VGRNN(nn.Module):
-    def __init__(self, x_dim, h_dim, z_dim, n_layers, eps, conv='GCN', bias=False):
+    def __init__(self, x_dim, h_dim, z_dim, n_layers, eps, device = 'cpu', conv='GCN', bias=False):
         super(VGRNN, self).__init__()
         
+        self.device = device
         self.x_dim = x_dim
         self.eps = eps
         self.h_dim = h_dim
@@ -429,14 +430,14 @@ class VGRNN(nn.Module):
         all_dec_t, all_z_t = [], []
         
         if hidden_in is None:
-            h = Variable(torch.zeros(self.n_layers, x.size(1), self.h_dim))
+            h = Variable(torch.zeros(self.n_layers, x.size(1), self.h_dim)).to(self.device)
         else:
-            h = Variable(hidden_in)
+            h = Variable(hidden_in).to(self.device)
         
         for t in range(x.size(0)):
             phi_x_t = self.phi_x(x[t])
             
-            #encoder GCN
+            #encoder GCN (for each node)
             enc_t = self.enc(torch.cat([phi_x_t, h[-1]], 1), edge_idx_list[t])
             enc_mean_t = self.enc_mean(enc_t, edge_idx_list[t])
             enc_std_t = self.enc_std(enc_t, edge_idx_list[t])

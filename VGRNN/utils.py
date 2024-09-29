@@ -98,7 +98,7 @@ def tuple_to_array(lot):
 
 # masking functions
 
-def mask_edges_det(adjs_list):
+def mask_edges_det(adjs_list, device):
     adj_train_l, train_edges_l, val_edges_l = [], [], []
     val_edges_false_l, test_edges_l, test_edges_false_l = [], [], []
     edges_list = []
@@ -107,84 +107,86 @@ def mask_edges_det(adjs_list):
     for i in range(0, len(adjs_list)):
         # Function to build test set with 10% positive links
         # NOTE: Splits are randomized and results might slightly deviate from reported numbers in the paper.
-        
-        adj = adjs_list[i]
+
+        adj = adjs_list[i].to(device)
         # Remove diagonal elements
-        adj = adj - sp.dia_matrix((adj.diagonal()[np.newaxis, :], [0]), shape=adj.shape)
-        adj.eliminate_zeros()
+        adj = torch.abs(torch.eye(adj.shape[0]).to(device)*adj - adj)
+        adj_all = adj + adj.T
         # Check that diag is zero:
-        assert np.diag(adj.todense()).sum() == 0
+        assert torch.diag(adj.to_dense()).sum() == 0
         
-        adj_triu = sp.triu(adj)
-        adj_tuple = sparse_to_tuple(adj_triu)
-        edges = adj_tuple[0]
-        edges_all = sparse_to_tuple(adj)[0]
+        # Return upper triangle part of array (assumes bidirectional)
+        edges = torch.nonzero(adj.to_dense())
+
+        # All edges
+        edges_all = torch.nonzero(adj_all.to_dense())
         num_test = int(np.ceil(edges.shape[0]*.10))
         num_val = int(np.ceil(edges.shape[0]*.20))
-        
-        all_edge_idx = np.arange(edges.shape[0])
-        np.random.shuffle(all_edge_idx)
+
+        # Splits all edges to test val train
+        all_edge_idx = torch.randperm(edges.shape[0])
         val_edge_idx = all_edge_idx[:num_val]
         test_edge_idx = all_edge_idx[num_val:(num_val + num_test)]
         test_edges = edges[test_edge_idx]
         val_edges = edges[val_edge_idx]
-        train_edges = np.delete(edges, np.hstack([test_edge_idx, val_edge_idx]), axis=0)
+        train_edges = edges[~(torch.hstack([test_edge_idx, val_edge_idx]))]
         
         edges_list.append(edges)
         
-        def ismember(a, b, tol=5):
-            rows_close = np.all(np.round(a - b[:, None], tol) == 0, axis=-1)
-            return np.any(rows_close)
+        def ismember(a, b):
+            rows_close = torch.all(torch.round(a - b[:, None]) == 0, dim = 1)
+            return torch.any(rows_close)
 
-        test_edges_false = []
+        test_edges_false = torch.empty(0).to(device)
+        # Get false test edges 1:1 ratio
         while len(test_edges_false) < len(test_edges):
             idx_i = np.random.randint(0, adj.shape[0])
             idx_j = np.random.randint(0, adj.shape[0])
+            coord1 = torch.Tensor([idx_i, idx_j]).to(device)
+            coord2 = torch.Tensor([idx_j, idx_i]).to(device)
             if idx_i == idx_j:
                 continue
-            if ismember([idx_i, idx_j], edges_all):
+            if ismember(coord1, edges_all):
                 continue
-            if test_edges_false:
-                if ismember([idx_j, idx_i], np.array(test_edges_false)):
+            if test_edges_false.shape[0] > 0:
+                if ismember(coord1, test_edges_false):
                     continue
-                if ismember([idx_i, idx_j], np.array(test_edges_false)):
+                if ismember(coord2, test_edges_false):
                     continue
-            test_edges_false.append([idx_i, idx_j])
+            test_edges_false = torch.cat((test_edges_false, coord1), 0)
+        test_edges_false = test_edges_false.reshape(-1, 2)
 
-        val_edges_false = []
+        val_edges_false = torch.empty(0).to(device)
+        # Get val edges 1:1 ratio
         while len(val_edges_false) < len(val_edges):
             idx_i = np.random.randint(0, adj.shape[0])
             idx_j = np.random.randint(0, adj.shape[0])
+            coord1 = torch.Tensor([idx_i, idx_j]).to(device)
+            coord2 = torch.Tensor([idx_j, idx_i]).to(device)
             if idx_i == idx_j:
                 continue
-            if ismember([idx_i, idx_j], train_edges):
+            if ismember(coord1, train_edges):
                 continue
-            if ismember([idx_j, idx_i], train_edges):
+            if ismember(coord2, train_edges):
                 continue
-            if ismember([idx_i, idx_j], val_edges):
+            if ismember(coord1, val_edges):
                 continue
-            if ismember([idx_j, idx_i], val_edges):
+            if ismember(coord2, val_edges):
                 continue
-            if val_edges_false:
-                if ismember([idx_j, idx_i], np.array(val_edges_false)):
+            if val_edges_false.shape[0] > 0:
+                if ismember(coord1, val_edges_false):
                     continue
-                if ismember([idx_i, idx_j], np.array(val_edges_false)):
+                if ismember(coord2, val_edges_false):
                     continue
-            val_edges_false.append([idx_i, idx_j])
+            val_edges_false = torch.cat((val_edges_false, coord1), 0)
+        val_edges_false = val_edges_false.reshape(-1, 2)
 
-        # assert ~ismember(test_edges_false, edges_all)
-        # assert ~ismember(val_edges_false, edges_all)
-        # assert ~ismember(val_edges, train_edges)
-        # assert ~ismember(test_edges, train_edges)
-        # assert ~ismember(val_edges, test_edges)
+        assert ~ismember(test_edges_false, edges_all)
+        assert ~ismember(val_edges_false, edges_all)
+        assert ~ismember(val_edges, train_edges)
+        assert ~ismember(test_edges, train_edges)
+        assert ~ismember(val_edges, test_edges)
 
-        data = np.ones(train_edges.shape[0])
-
-        # Re-build adj matrix
-        adj_train = sp.csr_matrix((data, (train_edges[:, 0], train_edges[:, 1])), shape=adj.shape)
-        adj_train = adj_train + adj_train.T
-
-        adj_train_l.append(adj_train)
         train_edges_l.append(train_edges)
         val_edges_l.append(val_edges)
         val_edges_false_l.append(val_edges_false)
@@ -194,9 +196,9 @@ def mask_edges_det(adjs_list):
     pbar.close()
 
     # NOTE: these edge lists only contain single direction of edge!
-    return adj_train_l, train_edges_l, val_edges_l, val_edges_false_l, test_edges_l, test_edges_false_l
+    return train_edges_l, val_edges_l, val_edges_false_l, test_edges_l, test_edges_false_l
 
-def mask_edges_prd(adjs_list):
+def mask_edges_prd(adjs_list, device):
     pos_edges_l , false_edges_l = [], []
     edges_list = []
 
@@ -205,39 +207,45 @@ def mask_edges_prd(adjs_list):
         # Function to build test set with 10% positive links
         # NOTE: Splits are randomized and results might slightly deviate from reported numbers in the paper.
         
-        adj = adjs_list[i]
+        adj = adjs_list[i].to(device)
         # Remove diagonal elements
-        adj = adj - sp.dia_matrix((adj.diagonal()[np.newaxis, :], [0]), shape=adj.shape)
-        adj.eliminate_zeros()
+        adj = torch.abs(torch.eye(adj.shape[0]).to(device)*adj - adj)
+        adj_all = adj + adj.T
         # Check that diag is zero:
-        assert np.diag(adj.todense()).sum() == 0
+        assert torch.diag(adj.to_dense()).sum() == 0
         
-        adj_triu = sp.triu(adj)
-        adj_tuple = sparse_to_tuple(adj_triu)
-        edges = adj_tuple[0]
-        edges_all = sparse_to_tuple(adj)[0]
+        # Return upper triangle part of array (assumes bidirectional)
+        edges = torch.nonzero(adj.to_dense())
+
+        # All edges
+        edges_all = torch.nonzero(adj_all.to_dense())
         num_false = int(edges.shape[0])
         
+        # Positive edges
         pos_edges_l.append(edges)
         
-        def ismember(a, b, tol=5):
-            rows_close = np.all(np.round(a - b[:, None], tol) == 0, axis=-1)
-            return np.any(rows_close)
+        def ismember(a, b):
+            rows_close = torch.all(torch.round(a - b[:, None]) == 0, dim = 1)
+            return torch.any(rows_close)
         
-        edges_false = []
+        # Retrieve negative edges
+        edges_false = torch.empty(0).to(device)
         while len(edges_false) < num_false:
             idx_i = np.random.randint(0, adj.shape[0])
             idx_j = np.random.randint(0, adj.shape[0])
+            coord1 = torch.Tensor([idx_i, idx_j]).to(device)
+            coord2 = torch.Tensor([idx_j, idx_i]).to(device)
             if idx_i == idx_j:
                 continue
-            if ismember([idx_i, idx_j], edges_all):
+            if ismember(coord1, edges_all):
                 continue
-            if edges_false:
-                if ismember([idx_j, idx_i], np.array(edges_false)):
+            if edges_false.shape[0] > 0:
+                if ismember(coord1, edges_false):
                     continue
-                if ismember([idx_i, idx_j], np.array(edges_false)):
+                if ismember(coord2, edges_false):
                     continue
-            edges_false.append([idx_i, idx_j])
+            edges_false = torch.cat((edges_false, coord1), 0)
+        edges_false = edges_false.reshape(-1, 2)
 
         assert ~ismember(edges_false, edges_all)
         
@@ -248,88 +256,98 @@ def mask_edges_prd(adjs_list):
     # NOTE: these edge lists only contain single direction of edge!
     return pos_edges_l, false_edges_l
 
-def mask_edges_prd_new(adjs_list, adj_orig_dense_list):
+def mask_edges_prd_new(adjs_list, device):
     pos_edges_l , false_edges_l = [], []
     edges_list = []
     
     # Function to build test set with 10% positive links
     # NOTE: Splits are randomized and results might slightly deviate from reported numbers in the paper.
 
-    adj = adjs_list[0]
+    adj = adjs_list[0].to(device)
     # Remove diagonal elements
-    adj = adj - sp.dia_matrix((adj.diagonal()[np.newaxis, :], [0]), shape=adj.shape)
-    adj.eliminate_zeros()
+    adj = torch.abs(torch.eye(adj.shape[0]).to(device)*adj - adj)
+    adj_all = adj + adj.T
     # Check that diag is zero:
-    assert np.diag(adj.todense()).sum() == 0
+    assert torch.diag(adj.to_dense()).sum() == 0
 
-    adj_triu = sp.triu(adj)
-    adj_tuple = sparse_to_tuple(adj_triu)
-    edges = adj_tuple[0]
-    edges_all = sparse_to_tuple(adj)[0]
+    # Return upper triangle part of array (assumes bidirectional)
+    edges = torch.nonzero(adj.to_dense())
+
+    # All edges
+    edges_all = torch.nonzero(adj_all.to_dense())
     num_false = int(edges.shape[0])
 
+    # Positive edges
     pos_edges_l.append(edges)
 
-    def ismember(a, b, tol=5):
-        rows_close = np.all(np.round(a - b[:, None], tol) == 0, axis=-1)
-        return np.any(rows_close)
+    def ismember(a, b):
+        rows_close = torch.all(torch.round(a - b[:, None]) == 0, dim = 1)
+        return torch.any(rows_close)
 
-    edges_false = []
+    # Generate negative edges
+    edges_false = torch.empty(0).to(device)
     while len(edges_false) < num_false:
         idx_i = np.random.randint(0, adj.shape[0])
         idx_j = np.random.randint(0, adj.shape[0])
+        coord1 = torch.Tensor([idx_i, idx_j]).to(device)
+        coord2 = torch.Tensor([idx_j, idx_i]).to(device)
         if idx_i == idx_j:
             continue
-        if ismember([idx_i, idx_j], edges_all):
+        if ismember(coord1, edges_all):
             continue
-        if edges_false:
-            if ismember([idx_j, idx_i], np.array(edges_false)):
+        if edges_false.shape[0] > 0:
+            if ismember(coord1, edges_false):
                 continue
-            if ismember([idx_i, idx_j], np.array(edges_false)):
+            if ismember(coord2, edges_false):
                 continue
-        edges_false.append([idx_i, idx_j])
+        edges_false = torch.cat((edges_false, coord1), 0)
+    edges_false = edges_false.reshape(-1, 2)
 
     assert ~ismember(edges_false, edges_all)    
-    false_edges_l.append(np.asarray(edges_false))
+    false_edges_l.append(edges_false)
     
     pbar = tqdm.tqdm(total=len(adjs_list))
     for i in range(1, len(adjs_list)):
-        # edges_pos = np.transpose(np.asarray(np.where((adjs_list[i] - adjs_list[i-1])>0)))
-        # num_false = int(edges_pos.shape[0])
-
-        edges_pos = ((adjs_list[i] - adjs_list[i-1])>0).todense().nonzero()
-        num_false = int(len(edges_pos[0]))
+        # Get newly generated edges 
+        cur = adjs_list[i].to(device).to_dense()
+        prev = adjs_list[i-1].to(device).to_dense()
+        edges_pos = torch.nonzero((cur - prev) > 0)
+        num_false = int(edges_pos.shape[0])
         
-        adj = adjs_list[i]
+        adj = adjs_list[i].to(device)
         # Remove diagonal elements
-        adj = adj - sp.dia_matrix((adj.diagonal()[np.newaxis, :], [0]), shape=adj.shape)
-        adj.eliminate_zeros()
+        adj = torch.abs(torch.eye(adj.shape[0]).to(device)*adj - adj)
+        adj_all = adj + adj.T
         # Check that diag is zero:
-        assert np.diag(adj.todense()).sum() == 0
+        assert torch.diag(adj.to_dense()).sum() == 0
         
-        adj_triu = sp.triu(adj)
-        adj_tuple = sparse_to_tuple(adj_triu)
-        edges = adj_tuple[0]
-        edges_all = sparse_to_tuple(adj)[0]
+        # Get upper triangle part of array (assumes bidirectional)
+        edges = torch.nonzero(adj.to_dense())
+
+        edges_all = torch.nonzero(adj_all.to_dense())
         
-        edges_false = []
+        # Get negative edges for each newly generated edge
+        edges_false = torch.empty(0).to(device)
         while len(edges_false) < num_false:
             idx_i = np.random.randint(0, adj.shape[0])
             idx_j = np.random.randint(0, adj.shape[0])
+            coord1 = torch.Tensor([idx_i, idx_j]).to(device)
+            coord2 = torch.Tensor([idx_j, idx_i]).to(device)
             if idx_i == idx_j:
                 continue
-            if ismember([idx_i, idx_j], edges_all):
+            if ismember(coord1, edges_all):
                 continue
-            if edges_false:
-                if ismember([idx_j, idx_i], np.array(edges_false)):
+            if edges_false.shape[0] > 0:
+                if ismember(coord1, edges_false):
                     continue
-                if ismember([idx_i, idx_j], np.array(edges_false)):
+                if ismember(coord2, edges_false):
                     continue
-            edges_false.append([idx_i, idx_j])
+            edges_false = torch.cat((edges_false, coord1), 0)
+        edges_false = edges_false.reshape(-1, 2)
         
         assert ~ismember(edges_false, edges_all)
         
-        false_edges_l.append(np.asarray(edges_false))
+        false_edges_l.append(edges_false)
         pos_edges_l.append(edges_pos)
     
         pbar.update(1)
