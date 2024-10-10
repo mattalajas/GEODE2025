@@ -40,19 +40,20 @@ summary_writer = 'TGN_new'
 csv_name = 'tgn_new'
 event_path = 'GNNthesis/data/Starboard/events.parquet'
 data_path = 'GNNthesis/data/Starboard/vessels.csv'
-batch_size = 5000
+batch_size = 500
 val_ratio = 0.15
 test_ratio = 0.15
 memory_dim = time_dim = embedding_dim = 100
 epochs = 20
 lr = 0.0001
 l1_reg = 0
-verbose = True
+verbose = False
 self_loop = True
 with_fish = True
-date_range = ['2011-08-11', '2012-11-13']
+date_range = ['2010-11-15', '2010-11-25']
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+cuda_ind = 4
+device = torch.device(f'cuda:{cuda_ind}' if torch.cuda.is_available() else 'cpu')
 torch.cuda.empty_cache()
 
 if verbose: writer = SummaryWriter(f'GNNthesis/runs/{summary_writer}_self_{self_loop}_dates_{date_range}')
