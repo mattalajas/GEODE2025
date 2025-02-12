@@ -1,0 +1,1 @@
+python3 AirQuality/main.py --data_dir '../../AirData/AQI/Stations/merged_full.csv' --temp_data_dir 'AirQuality/beijingdata.pickle' --dataset "beijing" --cuda 3 --epochs 200  --time_range "2013-02-01,2018-01-01" --aggregate "mean" --features "0,1,11" --batch_size 32 --verbose True

@@ -167,3 +167,6 @@ res
 runs
 pipenv
 modules
+save_data
+models
+plots
