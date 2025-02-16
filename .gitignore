@@ -170,3 +170,5 @@ modules
 save_data
 models
 plots
+logs
+lightning_logs

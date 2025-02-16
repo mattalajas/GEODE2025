@@ -1,0 +1,74 @@
+defaults:
+  - _self_
+  - logger: tensorboard
+  - dataset: air_auckland
+  - model: grin
+
+#### Experiment params ########################################################
+hydra:
+  run:
+    dir: logs/${model.name}/${dataset.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: logs/${now:%Y-%m-%d-%H-%M-%S}
+    subdir: ${model.name}/${dataset.name}/${hydra.job.num}
+
+seed: 42  # automatically set everywhere the seed
+tags:
+  - 'air_auckland'
+  - ${model.name}
+  - ${dataset.name}
+
+workers: 0
+num_threads: 1  # limit the number of pytorch threads spawn
+
+logger: null
+
+#### Windowing params #########################################################
+window: 12
+horizon: 12
+stride: 1
+
+#### Training params ##########################################################
+epochs: 250
+patience: 50
+batch_size: 128
+grad_clip_val: 5
+scale_target: False
+whiten_prob: 0.05
+prediction_loss_weight: 1
+impute_only_missing: False
+warm_up_steps: 0
+
+optimizer:
+  name: Adam
+  hparams:
+    lr: 0.01
+    weight_decay: 0
+
+lr_scheduler: null
+
+model:
+  name: grin
+  hparams:
+    hidden_size: 64
+    ff_size: 64
+    embedding_size: 8
+    n_layers: 1
+    kernel_size: 2
+    decoder_order: 1
+    layer_norm: False
+    dropout: 0
+    ff_dropout: 0
+    merge_mode: 'mlp'
+
+#### Dataset params ###########################################################
+dataset:
+  name: air_auckland
+  masked_sensors: [4]
+  splitting:
+    val_len: 0.1
+    test_len: 0.2
+  connectivity:
+    method: distance
+    threshold: 1e-4
+    include_self: False
