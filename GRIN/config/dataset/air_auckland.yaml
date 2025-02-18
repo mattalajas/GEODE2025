@@ -1,11 +1,10 @@
 #### Dataset params ###########################################################
-dataset:
-  name: air_auckland
-  masked_sensors: [4]
-  splitting:
-    val_len: 0.1
-    test_len: 0.2
-  connectivity:
-    method: distance
-    threshold: 1e-4
-    include_self: False
+name: air_auckland
+masked_sensors: [4, 0]
+splitting:
+  val_len: 0.1
+  test_len: 0.2
+connectivity:
+  method: distance
+  threshold: 1e-4
+  include_self: False

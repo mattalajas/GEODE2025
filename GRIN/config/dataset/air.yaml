@@ -1,10 +1,9 @@
 #### Dataset params ###########################################################
-dataset:
-  name: air
-  masked_sensors: None
-  splitting:
-    val_len: 0.1
-    test_len: 0.2
-  connectivity:
-    method: distance
-    include_self: False
+name: air
+masked_sensors: None
+splitting:
+  val_len: 0.1
+  test_len: 0.2
+connectivity:
+  method: distance
+  include_self: False

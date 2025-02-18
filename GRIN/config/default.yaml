@@ -2,7 +2,7 @@ defaults:
   - _self_
   - logger: tensorboard
   - dataset: air_auckland
-  - model: grin
+  - model: kits
 
 #### Experiment params ########################################################
 hydra:
@@ -29,7 +29,7 @@ horizon: 12
 stride: 1
 
 #### Training params ##########################################################
-epochs: 250
+epochs: 300
 patience: 50
 batch_size: 128
 grad_clip_val: 5
@@ -38,6 +38,12 @@ whiten_prob: 0.05
 prediction_loss_weight: 1
 impute_only_missing: False
 warm_up_steps: 0
+
+scaled_target: True
+detrend: False
+scale: True
+scaling_axis: 'global'  # ['channels', 'global']
+
 
 optimizer:
   name: Adam
@@ -48,27 +54,8 @@ optimizer:
 lr_scheduler: null
 
 model:
-  name: grin
-  hparams:
-    hidden_size: 64
-    ff_size: 64
-    embedding_size: 8
-    n_layers: 1
-    kernel_size: 2
-    decoder_order: 1
-    layer_norm: False
-    dropout: 0
-    ff_dropout: 0
-    merge_mode: 'mlp'
+  name: kits
 
 #### Dataset params ###########################################################
 dataset:
   name: air_auckland
-  masked_sensors: [4]
-  splitting:
-    val_len: 0.1
-    test_len: 0.2
-  connectivity:
-    method: distance
-    threshold: 1e-4
-    include_self: False

@@ -1,0 +1,7 @@
+name: 'kits'
+hparams:
+  d_hidden: 64
+
+use_adj_drop: False
+use_init: False
+

@@ -21,6 +21,8 @@ from tsl.transforms import MaskInput
 from tsl.utils.casting import torch_to_numpy
 
 from my_datasets import AirQualitySmaller, AirQualityAuckland
+from KITS import KITS
+from KITS_filler import GCNCycVirtualFiller
 
 
 def get_model_class(model_str):
@@ -34,6 +36,8 @@ def get_model_class(model_str):
         model = SPINModel
     elif model_str == 'spin-h':
         model = SPINHierarchicalModel
+    elif model_str == 'kits':
+        model = KITS
     else:
         raise NotImplementedError(f'Model "{model_str}" not available.')
     return model
@@ -82,7 +86,10 @@ def run_imputation(cfg: DictConfig):
     covariates = {'u': dataset.datetime_encoded('day').values}
 
     # get adjacency matrix
-    adj = dataset.get_connectivity(**cfg.dataset.connectivity)
+    if cfg.model.name == 'grin':
+        adj = dataset.get_connectivity(**cfg.dataset.connectivity)
+    if cfg.model.name == 'kits':
+        adj = dataset.get_connectivity(**cfg.dataset.connectivity, layout='dense')
     # u = np.expand_dims(covariates['u'], axis=1)
     # covariates['u'] = np.repeat(u, max(adj[0]), axis=1)
     # print(covariates['u'].shape)
@@ -117,12 +124,16 @@ def run_imputation(cfg: DictConfig):
     ########################################
 
     model_cls = get_model_class(cfg.model.name)
-
-    model_kwargs = dict(n_nodes=torch_dataset.n_nodes,
-                        input_size=torch_dataset.n_channels,
-                        exog_size=torch_dataset.input_map.u.shape[-1])
+    
+    if cfg.model.name == 'grin':
+        model_kwargs = dict(n_nodes=torch_dataset.n_nodes,
+                            input_size=torch_dataset.n_channels,
+                            exog_size=torch_dataset.input_map.u.shape[-1])
+    elif cfg.model.name == 'kits':
+        model_kwargs = dict(adj=adj, d_in=dm.n_channels, n_nodes=dm.n_nodes, args=cfg.model)
 
     model_cls.filter_model_args_(model_kwargs)
+
     model_kwargs.update(cfg.model.hparams)
 
     loss_fn = torch_metrics.MaskedMAE()
@@ -142,19 +153,33 @@ def run_imputation(cfg: DictConfig):
         scheduler_class = scheduler_kwargs = None
 
     # setup imputer
-    imputer = Imputer(model_class=model_cls,
-                      model_kwargs=model_kwargs,
-                      optim_class=getattr(torch.optim, cfg.optimizer.name),
-                      optim_kwargs=dict(cfg.optimizer.hparams),
-                      loss_fn=loss_fn,
-                      metrics=log_metrics,
-                      scheduler_class=scheduler_class,
-                      scheduler_kwargs=scheduler_kwargs,
-                      scale_target=cfg.scale_target,
-                      whiten_prob=cfg.whiten_prob,
-                      prediction_loss_weight=cfg.prediction_loss_weight,
-                      impute_only_missing=cfg.impute_only_missing,
-                      warm_up_steps=cfg.warm_up_steps)
+    if cfg.model.name == 'grin':
+        imputer = Imputer(model_class=model_cls,
+                        model_kwargs=model_kwargs,
+                        optim_class=getattr(torch.optim, cfg.optimizer.name),
+                        optim_kwargs=dict(cfg.optimizer.hparams),
+                        loss_fn=loss_fn,
+                        metrics=log_metrics,
+                        scheduler_class=scheduler_class,
+                        scheduler_kwargs=scheduler_kwargs,
+                        scale_target=cfg.scale_target,
+                        whiten_prob=cfg.whiten_prob,
+                        prediction_loss_weight=cfg.prediction_loss_weight,
+                        impute_only_missing=cfg.impute_only_missing,
+                        warm_up_steps=cfg.warm_up_steps)
+    elif cfg.model.name =='kits':
+        imputer = GCNCycVirtualFiller(model_class=model_cls,
+                                    model_kwargs=model_kwargs,
+                                    optim_class=getattr(torch.optim, cfg.optimizer.name),
+                                    optim_kwargs=dict(cfg.optimizer.hparams),
+                                    loss_fn=loss_fn,
+                                    scaled_target=cfg.scale_target,
+                                    whiten_prob=cfg.whiten_prob,
+                                    pred_loss_weight=cfg.prediction_loss_weight,
+                                    warm_up=cfg.warm_up_steps,
+                                    metrics=log_metrics,
+                                    scheduler_class=scheduler_class,
+                                    scheduler_kwargs=scheduler_kwargs)
 
     ########################################
     # logging options                      #
