@@ -354,7 +354,7 @@ class GCNCycVirtualFiller(Filler):
                  model_kwargs,
                  optim_class,
                  optim_kwargs,
-                 loss_fn,
+                 loss_fn=None,
                  scaled_target=False,
                  whiten_prob=0.05,
                  pred_loss_weight=1.,
@@ -460,7 +460,7 @@ class GCNCycVirtualFiller(Filler):
 
         dynamic_ratio = self.ratio + 0.2 * np.random.random()  # ratio + 0.1
         cur_entry_num = n  # n1
-        aug_entry_num = int(np.ceil(cur_entry_num / dynamic_ratio))
+        aug_entry_num = max(int(cur_entry_num / dynamic_ratio), cur_entry_num + 1)
         sub_entry_num = aug_entry_num - cur_entry_num  # n2 - n1
         assert sub_entry_num > 0, "The augmented data should have more entries than original data."
         self.sub_entry_num = sub_entry_num

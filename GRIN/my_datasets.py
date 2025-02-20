@@ -120,7 +120,10 @@ class AirQualitySmaller(DatetimeDataset, MissingValuesMixin):
                          name='AQI12')
         
         self.add_covariate('dist', dist, pattern='n n')
-        self.set_eval_mask(eval_mask)
+
+        eval_mask = self._parse_target(eval_mask)
+        eval_mask = framearray_to_numpy(eval_mask).astype(bool)
+        self.add_covariate('eval_mask', eval_mask, 't n f')
 
         # self.df = df
         # self.masks = mask
@@ -165,13 +168,13 @@ class AirQualitySmaller(DatetimeDataset, MissingValuesMixin):
         # compute the masks:
         mask = (~np.isnan(df.values)).astype('uint8')  # 1 if value is valid
         if eval_mask is None:
-            eval_mask = infer_mask(df, infer_from=self.infer_eval_from)
+            eval_mask = np.zeros((mask.shape))
         # 1 if value is ground-truth for imputation
-        eval_mask = eval_mask.values.astype('uint8')
         if len(self.masked_sensors):
             eval_mask[:, self.masked_sensors] = mask[:, self.masked_sensors]
             mask[:, self.masked_sensors] = 0
         # eventually replace nans with weekly mean by hour
+        # print(np.sum(eval_mask, axis=0))
         if impute_nans:
             from tsl.ops.framearray import temporal_mean
             df = df.fillna(temporal_mean(df))
@@ -291,7 +294,7 @@ class AirQualityAuckland(DatetimeDataset, MissingValuesMixin):
         eval_mask = framearray_to_numpy(eval_mask).astype(bool)
         self.add_covariate('eval_mask', eval_mask, 't n f')
 
-        # self.df = df
+        self.df = df
         # self.masks = mask
         # self.eval_masks = eval_mask
         # self.distance = dist

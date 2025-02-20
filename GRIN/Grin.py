@@ -190,9 +190,11 @@ def run_imputation(cfg: DictConfig):
                                  save_dir=cfg.run.dir,
                                  offline=cfg.wandb.offline,
                                  project=cfg.wandb.project)
-    else:
+    elif cfg.logger == 'tensorboard':
         exp_logger = TensorBoardLogger(save_dir=cfg.run.dir,
                                        name='tensorboard')
+    else: 
+        exp_logger = None
 
     ########################################
     # training                             #
@@ -214,7 +216,7 @@ def run_imputation(cfg: DictConfig):
         default_root_dir=cfg.run.dir,
         logger=exp_logger,
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
-        devices=[0],
+        devices=cfg.device,
         gradient_clip_val=cfg.grad_clip_val,
         callbacks=[early_stop_callback, checkpoint_callback])
 
