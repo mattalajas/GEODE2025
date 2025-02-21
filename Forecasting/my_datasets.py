@@ -90,7 +90,7 @@ class AirQualitySplitter(Splitter):
         self.set_indices(train_idxs, val_idxs, test_idxs)
 
 
-class AirQualitySmaller(DatetimeDataset, MissingValuesMixin):
+class AirQualitySmallerFore(DatetimeDataset, MissingValuesMixin):
     similarity_options = {'distance'}
 
     def __init__(self,
@@ -206,11 +206,12 @@ AUCKLAND = {
                 'locationLongitude': [174.762123, 174.761371, 174.740808, 174.591428, 174.633079, 174.703081]}), 
     'timezone': 'Pacific/Auckland'}
 
-def AirQualityCreate(path, features=None, t_range=None):
+def AirQualityCreate(path, agg_func = 'mean', features=None, t_range=None):
     for feat in features:
         assert feat in COLS
-    
-    features = {feat:'mean' for feat in features}
+
+    assert agg_func in ['mean', 'max', 'min']
+    features = {feat:agg_func for feat in features}
 
     lat_long_vals = AUCKLAND["df"]
 
@@ -255,7 +256,7 @@ def AirQualityCreate(path, features=None, t_range=None):
 
 # niwa_df = AirQualityCreate('../../../AirData/Niwa/allNIWA_clarity.csv', ['pm2_5ConcNumIndividual.value', 'relHumidInternalIndividual.value'], ['2022-04-01', '2022-12-01'])
 
-class AirQualityAuckland(DatetimeDataset, MissingValuesMixin):
+class AirQualityAucklandFore(DatetimeDataset, MissingValuesMixin):
     similarity_options = {'distance'}
 
     def __init__(self,
@@ -264,6 +265,7 @@ class AirQualityAuckland(DatetimeDataset, MissingValuesMixin):
                  test_months: Sequence = (7, 8),
                  infer_eval_from: str = 'next',
                  features: list = ['pm2_5ConcNumIndividual.value'],
+                 agg_func: str = 'mean',
                  t_range: Optional[list] = None,
                  freq: Optional[str] = None,
                  masked_sensors: Optional[Sequence] = None):
@@ -272,6 +274,7 @@ class AirQualityAuckland(DatetimeDataset, MissingValuesMixin):
         self.infer_eval_from = infer_eval_from  # [next, previous]
         self.features = features
         self.t_range = t_range
+        self.agg_func = agg_func
 
         if masked_sensors is None:
             self.masked_sensors = []
@@ -310,7 +313,7 @@ class AirQualityAuckland(DatetimeDataset, MissingValuesMixin):
     def build(self):
         # compute distances from latitude and longitude degrees
         path = os.path.join(self.root_dir, 'allNIWA_clarity.csv')
-        stations = AirQualityCreate(path, self.features, self.t_range)
+        stations = AirQualityCreate(path, self.agg_func, self.features, self.t_range)
         stations = stations.drop_duplicates(subset=["station"])[["station", "locationLatitude", "locationLongitude"]]
         st_coord = stations.loc[:, ['locationLatitude', 'locationLongitude']]
         from tsl.ops.similarities import geographical_distance
@@ -322,7 +325,7 @@ class AirQualityAuckland(DatetimeDataset, MissingValuesMixin):
         dist = np.load(os.path.join(self.root_dir, 'auck_aqi_dist.npy'))
         path = os.path.join(self.root_dir, 'allNIWA_clarity.csv')
         eval_mask = None
-        df = AirQualityCreate(path, self.features, self.t_range)
+        df = AirQualityCreate(path, self.agg_func, self.features, self.t_range)
 
         df_pivot = df.pivot(index="datetime", columns="station", values=self.features)
         df_pivot.columns.names = ["channels", "nodes"]

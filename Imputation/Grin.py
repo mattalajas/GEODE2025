@@ -43,13 +43,14 @@ def get_model_class(model_str):
     return model
 
 
-def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None):
+def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, agg_func = 'mean'):
     if dataset_name == 'air':
         return AirQuality(impute_nans=True, small=True, masked_sensors=masked_s)
     if dataset_name == 'air_smaller':
         return AirQualitySmaller('../../AirData/AQI/Stations', impute_nans=True, masked_sensors=masked_s)
     if dataset_name == 'air_auckland':
-        return AirQualityAuckland('../../AirData/Niwa', t_range=['2022-04-01', '2022-12-01'], masked_sensors=masked_s)
+        return AirQualityAuckland('../../AirData/Niwa', t_range=['2022-04-01', '2022-12-01'], 
+                                  masked_sensors=masked_s, agg_func=agg_func)
     if dataset_name.endswith('_point'):
         p_fault, p_noise = 0., 0.25
         dataset_name = dataset_name[:-6]
@@ -77,10 +78,17 @@ def run_imputation(cfg: DictConfig):
     ########################################
     # data module                          #
     ########################################
-    dataset = get_dataset(cfg.dataset.name,
-                          p_fault=cfg.get('p_fault'),
-                          p_noise=cfg.get('p_noise'),
-                          masked_s = cfg.dataset.masked_sensors)
+    try:
+        dataset = get_dataset(cfg.dataset.name,
+                            p_fault=cfg.get('p_fault'),
+                            p_noise=cfg.get('p_noise'),
+                            masked_s=cfg.dataset.masked_sensors,
+                            agg_func=cfg.dataset.agg_func)
+    except:
+        dataset = get_dataset(cfg.dataset.name,
+                    p_fault=cfg.get('p_fault'),
+                    p_noise=cfg.get('p_noise'),
+                    masked_s=cfg.dataset.masked_sensors)
 
     # encode time of the day and use it as exogenous variable
     covariates = {'u': dataset.datetime_encoded('day').values}

@@ -102,6 +102,8 @@ def train_LSTM(model, loss_fn, optimizer, epochs, device, train_loader, test_loa
     for epoch in tbar:
         loss_list = []
         for encoder_inputs, o_labels in train_loader:
+            print(o_labels)
+            raise
             encoder_inputs = torch.flatten(encoder_inputs, start_dim=1, end_dim=2).permute(0, 2, 1) # (B, T, N*F)
             labels = torch.flatten(o_labels, start_dim=1, end_dim=2).permute(0, 2, 1) # (B, T, N*F)
 

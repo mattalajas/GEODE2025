@@ -1,8 +1,8 @@
 defaults:
   - _self_
-  - logger: tensorboard
+  - logger: null
   - dataset: air_auckland
-  - model: kits
+  - model: birnni
 
 #### Experiment params ########################################################
 hydra:
@@ -14,19 +14,17 @@ hydra:
 
 seed: 42  # automatically set everywhere the seed
 tags:
-  - 'air_auckland'
   - ${model.name}
   - ${dataset.name}
 
 workers: 0
 num_threads: 1  # limit the number of pytorch threads spawn
 
-logger: null
+logger: tensorboard
 
 #### Windowing params #########################################################
 window: 12
-horizon: 12
-stride: 1
+stride: 12
 
 #### Training params ##########################################################
 epochs: 300
@@ -38,6 +36,7 @@ whiten_prob: 0.05
 prediction_loss_weight: 1
 impute_only_missing: False
 warm_up_steps: 0
+device: [2]
 
 scaled_target: True
 detrend: False
@@ -52,10 +51,3 @@ optimizer:
     weight_decay: 0
 
 lr_scheduler: null
-
-model:
-  name: kits
-
-#### Dataset params ###########################################################
-dataset:
-  name: air_auckland

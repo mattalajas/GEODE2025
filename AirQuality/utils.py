@@ -222,15 +222,13 @@ def plot_features(features, y_hat, y_true, feat, save_name):
 
     for i, ax in enumerate(axs.flatten()):
         p_mean_val = np.mean(preds[:, i, :], axis=0)
-        p_std_val = np.mean(preds[:, i, :], axis=0)
+        p_std_val = np.std(preds[:, i, :], axis=0)
 
         t_mean_val = np.mean(labs[:, i, :], axis=0)
-        t_std_val = np.mean(labs[:, i, :], axis=0)
-
-        ax.fill_between(range(12), p_mean_val - p_std_val, p_mean_val + p_std_val,
-                        color='b', alpha=0.2, label='Prediction')
-        ax.fill_between(range(12), t_mean_val - t_std_val, t_mean_val + t_std_val,
-                        color='r', alpha=0.2, label='True Label')
+        t_std_val = np.std(labs[:, i, :], axis=0)
+        
+        ax.plot(p_mean_val, label='Prediction')
+        ax.plot(t_mean_val, label='True Label')
 
         ax.set_xlabel('Hours')
         ax.legend()
