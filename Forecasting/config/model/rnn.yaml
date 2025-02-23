@@ -4,8 +4,8 @@
 model:
   name: rnn
   hparams:
-    hidden_size: 32
-    ff_size: 64
+    hidden_size: 512
+    ff_size: 128
     rec_layers: 2
     ff_layers: 1
     rec_dropout: 0.1

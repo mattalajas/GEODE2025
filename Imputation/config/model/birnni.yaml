@@ -1,6 +1,6 @@
 name: birnni
 hparams:
-  hidden_size: 64
+  hidden_size: 128
   cell: 'gru'
   concat_mask: True
   detach_input: False

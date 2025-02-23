@@ -96,7 +96,7 @@ class AirQualitySmaller(DatetimeDataset, MissingValuesMixin):
     def __init__(self,
                  root: str = None,
                  impute_nans: bool = True,
-                 test_months: Sequence = (3, 6, 9, 12),
+                 test_months: Sequence = (3, 6, 9),
                  infer_eval_from: str = 'next',
                  features: list = ['PM2.5'],
                  freq: Optional[str] = None,
@@ -315,6 +315,8 @@ class AirQualityAuckland(DatetimeDataset, MissingValuesMixin):
         path = os.path.join(self.root_dir, 'allNIWA_clarity.csv')
         stations = AirQualityCreate(path, self.agg_func, self.features, self.t_range)
         stations = stations.drop_duplicates(subset=["station"])[["station", "locationLatitude", "locationLongitude"]]
+        self.stations = stations
+
         st_coord = stations.loc[:, ['locationLatitude', 'locationLongitude']]
         from tsl.ops.similarities import geographical_distance
         dist = geographical_distance(st_coord, to_rad=True).values
@@ -326,6 +328,8 @@ class AirQualityAuckland(DatetimeDataset, MissingValuesMixin):
         path = os.path.join(self.root_dir, 'allNIWA_clarity.csv')
         eval_mask = None
         df = AirQualityCreate(path, self.agg_func, self.features, self.t_range)
+        stations = df.drop_duplicates(subset=["station"])[["station", "locationLatitude", "locationLongitude"]]
+        self.stations = stations
 
         df_pivot = df.pivot(index="datetime", columns="station", values=self.features)
         df_pivot.columns.names = ["channels", "nodes"]

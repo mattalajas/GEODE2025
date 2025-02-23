@@ -1,7 +1,7 @@
 defaults:
   - _self_
   - logger: null
-  - dataset: air_auckland
+  - dataset: air
   - model: birnni
 
 #### Experiment params ########################################################
@@ -23,8 +23,8 @@ num_threads: 1  # limit the number of pytorch threads spawn
 logger: tensorboard
 
 #### Windowing params #########################################################
-window: 12
-stride: 12
+window: 24
+stride: 1
 
 #### Training params ##########################################################
 epochs: 300

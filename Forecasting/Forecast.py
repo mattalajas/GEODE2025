@@ -54,14 +54,14 @@ def get_model_class(model_str):
     return model
 
 
-def get_dataset(dataset_name: str, agg_func = 'mean'):
+def get_dataset(dataset_name: str, agg_func = 'mean', test_month=[5]):
     if dataset_name == 'air':
         return AirQuality(impute_nans=True, small=True)
     elif dataset_name == 'air_smaller':
         return AirQualitySmallerFore('../../AirData/AQI/Stations', impute_nans=True)
     elif dataset_name == 'air_auckland':
         return AirQualityAucklandFore('../../AirData/Niwa', t_range=['2022-04-01', '2022-12-01'], 
-                                   agg_func=agg_func)
+                                   agg_func=agg_func, test_months=test_month)
     elif dataset_name == 'la':
         dataset = MetrLA(impute_zeros=True)  # From Li et al. (ICLR 2018)
     elif dataset_name == 'bay':
@@ -85,7 +85,8 @@ def run_traffic(cfg: DictConfig):
     ########################################
     try:
         dataset = get_dataset(cfg.dataset.name,
-                            agg_func=cfg.dataset.agg_func)
+                            agg_func=cfg.dataset.agg_func,
+                            test_month=cfg.dataset.test_month)
     except:
         dataset = get_dataset(cfg.dataset.name)
 
@@ -193,7 +194,7 @@ def run_traffic(cfg: DictConfig):
         default_root_dir=cfg.run.dir,
         logger=exp_logger,
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
-        devices=1,
+        devices=cfg.device,
         gradient_clip_val=cfg.grad_clip_val,
         callbacks=[early_stop_callback, checkpoint_callback],
     )
@@ -215,8 +216,10 @@ def run_traffic(cfg: DictConfig):
     y_hat, y_true, mask = (output['y_hat'], output['y'],
                            output.get('mask', None))
     res = dict(test_mae=numpy_metrics.mae(y_hat, y_true, mask),
+               test_mre=numpy_metrics.mre(y_hat, y_true, mask),
                test_rmse=numpy_metrics.rmse(y_hat, y_true, mask),
-               test_mape=numpy_metrics.mape(y_hat, y_true, mask))
+               test_mape=numpy_metrics.mape(y_hat, y_true, mask),
+               test_mse=numpy_metrics.mse(y_hat, y_true, mask))
 
     output = trainer.predict(predictor, dataloaders=dm.val_dataloader())
     output = predictor.collate_prediction_outputs(output)
@@ -226,7 +229,8 @@ def run_traffic(cfg: DictConfig):
     res.update(
         dict(val_mae=numpy_metrics.mae(y_hat, y_true, mask),
              val_rmse=numpy_metrics.rmse(y_hat, y_true, mask),
-             val_mape=numpy_metrics.mape(y_hat, y_true, mask)))
+             val_mape=numpy_metrics.mape(y_hat, y_true, mask),
+             val_mse=numpy_metrics.mse(y_hat, y_true, mask)))
 
     return res
 

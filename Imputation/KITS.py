@@ -175,7 +175,6 @@ class KITS(BaseModel):
     def forward(self, x, mask=None, known_set=None, sub_entry_num=None, reset=False, training=False, 
                 edge_weight = None, edge_index = None, u = None, transform=None):
         test = (torch.sum(x, dim=(0, 1)))
-        print(test)
         adj = self.adj.clone()  # adjacency matrix
 
         if training:

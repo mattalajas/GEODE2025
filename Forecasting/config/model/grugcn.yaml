@@ -4,7 +4,7 @@
 model:
   name: grugcn
   hparams:
-    hidden_size: 32
+    hidden_size: 512
     enc_layers: 1
     gcn_layers: 2
     norm: mean

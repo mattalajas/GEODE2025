@@ -270,7 +270,7 @@ class AirQualityAucklandFore(DatetimeDataset, MissingValuesMixin):
                  freq: Optional[str] = None,
                  masked_sensors: Optional[Sequence] = None):
         self.root = root
-        self.test_months = test_months
+        self.test_months = test_months  
         self.infer_eval_from = infer_eval_from  # [next, previous]
         self.features = features
         self.t_range = t_range
@@ -315,6 +315,8 @@ class AirQualityAucklandFore(DatetimeDataset, MissingValuesMixin):
         path = os.path.join(self.root_dir, 'allNIWA_clarity.csv')
         stations = AirQualityCreate(path, self.agg_func, self.features, self.t_range)
         stations = stations.drop_duplicates(subset=["station"])[["station", "locationLatitude", "locationLongitude"]]
+        self.stations = stations
+
         st_coord = stations.loc[:, ['locationLatitude', 'locationLongitude']]
         from tsl.ops.similarities import geographical_distance
         dist = geographical_distance(st_coord, to_rad=True).values
@@ -326,6 +328,8 @@ class AirQualityAucklandFore(DatetimeDataset, MissingValuesMixin):
         path = os.path.join(self.root_dir, 'allNIWA_clarity.csv')
         eval_mask = None
         df = AirQualityCreate(path, self.agg_func, self.features, self.t_range)
+        stations = df.drop_duplicates(subset=["station"])[["station", "locationLatitude", "locationLongitude"]]
+        self.stations = stations
 
         df_pivot = df.pivot(index="datetime", columns="station", values=self.features)
         df_pivot.columns.names = ["channels", "nodes"]
@@ -349,7 +353,8 @@ class AirQualityAucklandFore(DatetimeDataset, MissingValuesMixin):
         # eventually replace nans with weekly mean by hour
         if impute_nans:
             from tsl.ops.framearray import temporal_mean
-            df = df.fillna(temporal_mean(df))
+            df = df.fillna(0)
+            # df = df.fillna(temporal_mean(df))
         return df, mask, eval_mask, dist
 
     def get_splitter(self, method: Optional[str] = None, **kwargs):

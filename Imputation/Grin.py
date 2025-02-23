@@ -43,14 +43,14 @@ def get_model_class(model_str):
     return model
 
 
-def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, agg_func = 'mean'):
+def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, agg_func = 'mean', test_month=[5]):
     if dataset_name == 'air':
         return AirQuality(impute_nans=True, small=True, masked_sensors=masked_s)
     if dataset_name == 'air_smaller':
         return AirQualitySmaller('../../AirData/AQI/Stations', impute_nans=True, masked_sensors=masked_s)
     if dataset_name == 'air_auckland':
         return AirQualityAuckland('../../AirData/Niwa', t_range=['2022-04-01', '2022-12-01'], 
-                                  masked_sensors=masked_s, agg_func=agg_func)
+                                  masked_sensors=masked_s, agg_func=agg_func, test_months=test_month)
     if dataset_name.endswith('_point'):
         p_fault, p_noise = 0., 0.25
         dataset_name = dataset_name[:-6]
@@ -83,7 +83,8 @@ def run_imputation(cfg: DictConfig):
                             p_fault=cfg.get('p_fault'),
                             p_noise=cfg.get('p_noise'),
                             masked_s=cfg.dataset.masked_sensors,
-                            agg_func=cfg.dataset.agg_func)
+                            agg_func=cfg.dataset.agg_func,
+                            test_month=cfg.dataset.test_month)
     except:
         dataset = get_dataset(cfg.dataset.name,
                     p_fault=cfg.get('p_fault'),
@@ -94,16 +95,15 @@ def run_imputation(cfg: DictConfig):
     covariates = {'u': dataset.datetime_encoded('day').values}
 
     # get adjacency matrix
-    if cfg.model.name == 'grin':
-        adj = dataset.get_connectivity(**cfg.dataset.connectivity)
     if cfg.model.name == 'kits':
         adj = dataset.get_connectivity(**cfg.dataset.connectivity, layout='dense')
+    else:
+        adj = dataset.get_connectivity(**cfg.dataset.connectivity)
     # u = np.expand_dims(covariates['u'], axis=1)
     # covariates['u'] = np.repeat(u, max(adj[0]), axis=1)
     # print(covariates['u'].shape)
 
     # instantiate dataset
-
 
     torch_dataset = ImputationDataset(target=dataset.dataframe(),
                                       mask=dataset.training_mask,
@@ -133,12 +133,12 @@ def run_imputation(cfg: DictConfig):
 
     model_cls = get_model_class(cfg.model.name)
     
-    if cfg.model.name == 'grin':
+    if cfg.model.name == 'kits':
+        model_kwargs = dict(adj=adj, d_in=dm.n_channels, n_nodes=dm.n_nodes, args=cfg.model)
+    else:
         model_kwargs = dict(n_nodes=torch_dataset.n_nodes,
                             input_size=torch_dataset.n_channels,
                             exog_size=torch_dataset.input_map.u.shape[-1])
-    elif cfg.model.name == 'kits':
-        model_kwargs = dict(adj=adj, d_in=dm.n_channels, n_nodes=dm.n_nodes, args=cfg.model)
 
     model_cls.filter_model_args_(model_kwargs)
 
@@ -161,7 +161,20 @@ def run_imputation(cfg: DictConfig):
         scheduler_class = scheduler_kwargs = None
 
     # setup imputer
-    if cfg.model.name == 'grin':
+    if cfg.model.name =='kits':
+        imputer = GCNCycVirtualFiller(model_class=model_cls,
+                                    model_kwargs=model_kwargs,
+                                    optim_class=getattr(torch.optim, cfg.optimizer.name),
+                                    optim_kwargs=dict(cfg.optimizer.hparams),
+                                    loss_fn=loss_fn,
+                                    scaled_target=cfg.scale_target,
+                                    whiten_prob=cfg.whiten_prob,
+                                    pred_loss_weight=cfg.prediction_loss_weight,
+                                    warm_up=cfg.warm_up_steps,
+                                    metrics=log_metrics,
+                                    scheduler_class=scheduler_class,
+                                    scheduler_kwargs=scheduler_kwargs)
+    else:
         imputer = Imputer(model_class=model_cls,
                         model_kwargs=model_kwargs,
                         optim_class=getattr(torch.optim, cfg.optimizer.name),
@@ -175,19 +188,6 @@ def run_imputation(cfg: DictConfig):
                         prediction_loss_weight=cfg.prediction_loss_weight,
                         impute_only_missing=cfg.impute_only_missing,
                         warm_up_steps=cfg.warm_up_steps)
-    elif cfg.model.name =='kits':
-        imputer = GCNCycVirtualFiller(model_class=model_cls,
-                                    model_kwargs=model_kwargs,
-                                    optim_class=getattr(torch.optim, cfg.optimizer.name),
-                                    optim_kwargs=dict(cfg.optimizer.hparams),
-                                    loss_fn=loss_fn,
-                                    scaled_target=cfg.scale_target,
-                                    whiten_prob=cfg.whiten_prob,
-                                    pred_loss_weight=cfg.prediction_loss_weight,
-                                    warm_up=cfg.warm_up_steps,
-                                    metrics=log_metrics,
-                                    scheduler_class=scheduler_class,
-                                    scheduler_kwargs=scheduler_kwargs)
 
     ########################################
     # logging options                      #
@@ -246,7 +246,9 @@ def run_imputation(cfg: DictConfig):
                            output.get('eval_mask', None))
     res = dict(test_mae=numpy_metrics.mae(y_hat, y_true, mask),
                test_mre=numpy_metrics.mre(y_hat, y_true, mask),
-               test_mape=numpy_metrics.mape(y_hat, y_true, mask))
+               test_mape=numpy_metrics.mape(y_hat, y_true, mask),
+               test_mse=numpy_metrics.mse(y_hat, y_true, mask),
+               test_rmse=numpy_metrics.rmse(y_hat, y_true, mask))
 
     output = trainer.predict(imputer, dataloaders=dm.val_dataloader())
     output = imputer.collate_prediction_outputs(output)
@@ -256,7 +258,8 @@ def run_imputation(cfg: DictConfig):
     res.update(
         dict(val_mae=numpy_metrics.mae(y_hat, y_true, mask),
              val_rmse=numpy_metrics.rmse(y_hat, y_true, mask),
-             val_mape=numpy_metrics.mape(y_hat, y_true, mask)))
+             val_mape=numpy_metrics.mape(y_hat, y_true, mask),
+             val_mse=numpy_metrics.mse(y_hat, y_true, mask)))
 
     return res
 

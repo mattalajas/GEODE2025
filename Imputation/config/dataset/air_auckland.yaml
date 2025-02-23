@@ -1,6 +1,8 @@
 #### Dataset params ###########################################################
 name: air_auckland
 masked_sensors: [5]
+test_month: [6]
+agg_func: 'mean'
 splitting:
   val_len: 0.1
   test_len: 0.2

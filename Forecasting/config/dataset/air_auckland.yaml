@@ -1,5 +1,7 @@
 #### Dataset params ###########################################################
 name: air_auckland
+test_month: [5]
+agg_func: 'mean'
 splitting:
   val_len: 0.1
   test_len: 0.2

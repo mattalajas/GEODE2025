@@ -1,7 +1,7 @@
 defaults:
   - _self_
   - logger: null
-  - dataset: air_auckland
+  - dataset: air_smaller
   - model: dcrnn
 
 #### Experiment params ########################################################
@@ -25,7 +25,7 @@ logger: tensorboard
 #### Windowing params #########################################################
 window: 12
 horizon: 12
-stride: 12
+stride: 1
 
 #### Training params ##########################################################
 epochs: 500
