@@ -2,6 +2,7 @@ name: 'kits'
 hparams:
   d_hidden: 64
 
+inductive: False
 use_adj_drop: False
 use_init: False
 

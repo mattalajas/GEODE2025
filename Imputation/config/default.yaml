@@ -1,8 +1,8 @@
 defaults:
   - _self_
   - logger: null
-  - dataset: air
-  - model: birnni
+  - dataset: air_invercargill1
+  - model: grin
 
 #### Experiment params ########################################################
 hydra:
@@ -29,16 +29,16 @@ stride: 1
 #### Training params ##########################################################
 epochs: 300
 patience: 50
-batch_size: 128
-grad_clip_val: 5
-scale_target: False
+batch_size: 32
+grad_clip_val: 1
+grad_clip_alg: 'norm'
+scale_target: True
 whiten_prob: 0.05
 prediction_loss_weight: 1
 impute_only_missing: False
 warm_up_steps: 0
-device: [2]
+device: [3]
 
-scaled_target: True
 detrend: False
 scale: True
 scaling_axis: 'global'  # ['channels', 'global']
@@ -47,7 +47,11 @@ scaling_axis: 'global'  # ['channels', 'global']
 optimizer:
   name: Adam
   hparams:
-    lr: 0.01
+    lr: 0.0002
     weight_decay: 0
 
-lr_scheduler: null
+lr_scheduler:
+  name: CosineAnnealingLR
+  hparams:
+      eta_min: 0.0001
+      T_max: ${ epochs }
