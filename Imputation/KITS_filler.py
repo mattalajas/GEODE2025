@@ -361,7 +361,8 @@ class GCNCycVirtualFiller(Filler):
                  warm_up=0,
                  metrics=None,
                  scheduler_class=None,
-                 scheduler_kwargs=None):
+                 scheduler_kwargs=None,
+                 inductive=True):
         super(GCNCycVirtualFiller, self).__init__(model_class=model_class,
                                                   model_kwargs=model_kwargs,
                                                   optim_class=optim_class,
@@ -377,6 +378,7 @@ class GCNCycVirtualFiller(Filler):
         self.trimming = (warm_up, warm_up)
 
         self.known_set = None
+        self.inductive = inductive
 
     def trim_seq(self, *seq):
         seq = [s[:, self.trimming[0]:s.size(1) - self.trimming[1]] for s in seq]
@@ -436,12 +438,15 @@ class GCNCycVirtualFiller(Filler):
         # => remove unobserved entries from input data and adjacency matrix
         if self.known_set is None:
             # Get observed entries (nonzero masks across time)
-            mask = batch_data["mask"]
-            mask = rearrange(mask, "b s n 1 -> (b s) n")
-            mask_sum = mask.sum(0)  # n
-            known_set = torch.where(mask_sum > 0)[0].detach().cpu().numpy().tolist()
-            ratio = float(len(known_set) / mask_sum.shape[0])
-            self.ratio = ratio
+            if self.inductive:
+                mask = batch_data["mask"]
+                mask = rearrange(mask, "b s n 1 -> (b s) n")
+                mask_sum = mask.sum(0)  # n
+                known_set = torch.where(mask_sum > 0)[0].detach().cpu().numpy().tolist()
+                ratio = float(len(known_set) / mask_sum.shape[0])
+                self.ratio = ratio
+            else:
+                known_set = list(range(batch_data['mask'].shape[2]))
         else:
             known_set = self.known_set
 
@@ -451,25 +456,29 @@ class GCNCycVirtualFiller(Filler):
         mask = batch_data["mask"]
         y = batch_data.pop("y")
         _ = batch_data.pop("eval_mask")  # drop this, we will re-create a new eval_mask (=mask during training)
+        test = torch.sum(x, dim=(0, 1))
 
         x = x[:, :, known_set, :]  # b s n1 d, n1 = num of observed entries
         mask = mask[:, :, known_set, :]  # b s n1 d
         y = y[:, :, known_set, :]  # b s n1 d
+        test1 = torch.sum(x, dim=(0, 1))
 
-        b, s, n, d = mask.size()
+        sub_entry_num = 0
+        if self.inductive:
+            b, s, n, d = mask.size()
 
-        dynamic_ratio = self.ratio + 0.2 * np.random.random()  # ratio + 0.1
-        cur_entry_num = n  # n1
-        aug_entry_num = max(int(cur_entry_num / dynamic_ratio), cur_entry_num + 1)
-        sub_entry_num = aug_entry_num - cur_entry_num  # n2 - n1
-        assert sub_entry_num > 0, "The augmented data should have more entries than original data."
-        self.sub_entry_num = sub_entry_num
-        batch_data["reset"] = True
+            dynamic_ratio = self.ratio + 0.2 * np.random.random()  # ratio + 0.1
+            cur_entry_num = n  # n1
+            aug_entry_num = max(int(cur_entry_num / dynamic_ratio), cur_entry_num + 1)
+            sub_entry_num = aug_entry_num - cur_entry_num  # n2 - n1
+            assert sub_entry_num > 0, "The augmented data should have more entries than original data."
+            self.sub_entry_num = sub_entry_num
 
-        sub_entry = torch.zeros(b, s, sub_entry_num, d).to(x.device)
-        x = torch.cat([x, sub_entry], dim=2)  # b s n2 d
-        mask = torch.cat([mask, sub_entry], dim=2).byte()  # b s n2 d
-        y = torch.cat([y, sub_entry], dim=2)  # b s n2 d
+            sub_entry = torch.zeros(b, s, sub_entry_num, d).to(x.device)
+            x = torch.cat([x, sub_entry], dim=2)  # b s n2 d
+            mask = torch.cat([mask, sub_entry], dim=2).byte()  # b s n2 d
+            y = torch.cat([y, sub_entry], dim=2)  # b s n2 d
+            test2 = torch.sum(x, dim=(0, 1))
 
         eval_mask = mask  # eval_mask = mask, during training
 
@@ -477,6 +486,7 @@ class GCNCycVirtualFiller(Filler):
         batch_data["mask"] = mask  # b s n' 1
         batch_data["sub_entry_num"] = sub_entry_num  # number
         batch_data["training"] = True
+        batch_data["reset"] = self.inductive
 
         # Compute predictions and compute loss
         res = self.predict_batch(batch, preprocess=False, postprocess=False)
@@ -487,7 +497,7 @@ class GCNCycVirtualFiller(Filler):
         imputation_cyc, target_cyc = self.trim_seq(imputation_cyc, target_cyc)
 
         if self.scaled_target:
-            target = self._preprocess(y, batch_preprocessing)
+            target = batch.transform['y'].transform(y)
         else:
             target = y
             imputation = self._postprocess(imputation, batch_preprocessing)
@@ -518,6 +528,8 @@ class GCNCycVirtualFiller(Filler):
         # Extract mask and target
         mask = batch_data.get('mask')
         eval_mask = batch_data.pop('eval_mask', None)
+        # test = torch.sum(eval_mask, dim=(0, 1))
+        # inds = torch.where(test > 0)
         y = batch_data.pop('y')
 
         # Compute predictions and compute loss
@@ -527,7 +539,7 @@ class GCNCycVirtualFiller(Filler):
         imputation, mask, eval_mask, y = self.trim_seq(imputation, mask, eval_mask, y)
 
         if self.scaled_target:
-            target = self._preprocess(y, batch_preprocessing)
+            target = batch.transform['y'].transform(y)
         else:
             target = y
             imputation = self._postprocess(imputation, batch_preprocessing)

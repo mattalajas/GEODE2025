@@ -131,6 +131,7 @@ class KITS(BaseModel):
         self.relu = nn.ReLU(inplace=True)
         self.supp = None
         self.adj_aug = None
+
         self.obs_neighbors = None
 
         if args.use_adj_drop:
@@ -174,6 +175,7 @@ class KITS(BaseModel):
 
     def forward(self, x, mask=None, known_set=None, sub_entry_num=None, reset=False, training=False, 
                 edge_weight = None, edge_index = None, u = None, transform=None):
+        test1 = (torch.sum(mask, dim=(0, 1)))
         test = (torch.sum(x, dim=(0, 1)))
         adj = self.adj.clone()  # adjacency matrix
 
@@ -255,7 +257,7 @@ class KITS(BaseModel):
 
                 self.adj_aug = adj_aug
             else:
-                adj_aug = self.adj_aug
+                adj_aug = adj
             adj = adj_aug.detach()
 
         supp = SpatialConvOrderK.compute_support(adj)

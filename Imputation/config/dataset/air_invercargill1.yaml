@@ -1,10 +1,10 @@
 #### Dataset params ###########################################################
-name: air_auckland
-masked_sensors: [5]
-test_month: [6]
+name: air_invercargill1
+masked_sensors: [36, 39, 38, 21, 12, 22, 27,  0,  4, 37, 25, 40, 14, 10, 2, 32,  5, 17,  7, 15]
+test_month: [8]
 agg_func: 'mean'
-location: 'Auckland'
-t_range: ['2022-04-01', '2022-12-01']
+location: 'Invercargill1'
+t_range: ['2023-07-01', '2023-09-01']
 splitting:
   val_len: 0.1
   test_len: 0.2

@@ -12,45 +12,6 @@ from tsl.utils import download_url, extract_zip
 from tsl.ops.framearray import framearray_shape, framearray_to_numpy
 
 
-def infer_mask(df, infer_from='next'):
-    """Infer evaluation mask from DataFrame. In the evaluation mask a value is 1
-    if it is present in the DataFrame and absent in the :obj:`infer_from` month.
-
-    Args:
-        df (pd.Dataframe): The DataFrame.
-        infer_from (str): Denotes from which month the evaluation value must be
-            inferred. Can be either :obj:`previous` or :obj:`next`.
-
-    Returns:
-        pd.DataFrame: The evaluation mask for the DataFrame.
-    """
-    mask = (~df.isna()).astype('uint8')
-    eval_mask = pd.DataFrame(index=mask.index, columns=mask.columns,
-                             data=0).astype('uint8')
-    if infer_from == 'previous':
-        offset = -1
-    elif infer_from == 'next':
-        offset = 1
-    else:
-        raise ValueError('`infer_from` can only be one of {}'.format(
-            ['previous', 'next']))
-    months = sorted(set(zip(mask.index.year, mask.index.month)))
-    length = len(months)
-    for i in range(length):
-        j = (i + offset) % length
-        year_i, month_i = months[i]
-        year_j, month_j = months[j]
-        cond_j = (mask.index.year == year_j) & (mask.index.month == month_j)
-        mask_j = mask[cond_j]
-        offset_i = 12 * (year_i - year_j) + (month_i - month_j)
-        mask_i = mask_j.shift(1, pd.DateOffset(months=offset_i))
-        mask_i = mask_i[~mask_i.index.duplicated(keep='first')]
-        mask_i = mask_i[np.in1d(mask_i.index, mask.index)]
-        i_idx = mask_i.index
-        eval_mask.loc[i_idx] = ~mask_i.loc[i_idx] & mask.loc[i_idx]
-    return eval_mask
-
-
 class AirQualitySplitter(Splitter):
 
     def __init__(self,
@@ -89,6 +50,147 @@ class AirQualitySplitter(Splitter):
         train_idxs = nontest_idxs[~ovl_idxs]
         self.set_indices(train_idxs, val_idxs, test_idxs)
 
+def sample_mask(shape, p=0.002, p_noise=0., mode="random"):
+    assert mode in ["random", "road", "mix"], "The missing mode must be 'random' or 'road' or 'mix'."
+    rand = np.random.random
+    mask = np.zeros(shape).astype(bool)
+    if mode == "random" or mode == "mix":
+        mask = mask | (rand(mask.shape) < p)
+    if mode == "road" or mode == "mix":
+        road_shape = mask.shape[1]
+        rand_mask = rand(road_shape) < p_noise
+        road_mask = np.zeros(shape).astype(bool)
+        road_mask[:, rand_mask] = True
+        mask |= road_mask
+    return mask.astype('uint8')
+
+class AirQualityKrig(DatetimeDataset, MissingValuesMixin):
+    r"""Measurements of pollutant :math:`PM2.5` collected by 437 air quality
+    monitoring stations spread across 43 Chinese cities from May 2014 to April
+    2015.
+
+    The dataset contains also a smaller version :obj:`AirQuality(small=True)`
+    with only the subset of nodes containing the 36 sensors in Beijing.
+
+    Data collected inside the `Urban Air
+    <https://www.microsoft.com/en-us/research/project/urban-air/>`_ project.
+
+    Dataset size:
+        + Time steps: 8760
+        + Nodes: 437
+        + Channels: 1
+        + Sampling rate: 1 hour
+        + Missing values: 25.67%
+
+    Static attributes:
+        + :obj:`dist`: :math:`N \times N` matrix of node pairwise distances.
+    """
+    url = "https://drive.switch.ch/index.php/s/W0fRqotjHxIndPj/download"
+
+    similarity_options = {'distance'}
+
+    def __init__(self,
+                 root: str = None,
+                 impute_nans: bool = True,
+                 small: bool = False,
+                 test_months: Sequence = (3, 6, 9, 12),
+                 freq: Optional[str] = None,
+                 masked_sensors: Optional[Sequence] = None,
+                 p: Optional[float] = 1.):
+        self.root = root
+        self.small = small
+        self.test_months = test_months
+        if masked_sensors is None:
+            self.masked_sensors = []
+        else:
+            self.masked_sensors = list(masked_sensors)
+
+        df, mask, eval_mask, dist = self.load(impute_nans=impute_nans, p=p)
+        super().__init__(target=df,
+                         mask=mask,
+                         freq=freq,
+                         similarity_score='distance',
+                         temporal_aggregation='mean',
+                         spatial_aggregation='mean',
+                         default_splitting_method='air_quality',
+                         name='AQI36' if self.small else 'AQI')
+        self.add_covariate('dist', dist, pattern='n n')
+        self.set_eval_mask(eval_mask)
+
+    @property
+    def raw_file_names(self) -> List[str]:
+        return ['full437.h5', 'small36.h5']
+
+    @property
+    def required_file_names(self) -> List[str]:
+        return self.raw_file_names + ['aqi_dist.npy']
+
+    def download(self):
+        path = download_url(self.url, self.root_dir, 'data.zip')
+        extract_zip(path, self.root_dir)
+        os.unlink(path)
+
+    def build(self):
+        self.maybe_download()
+        # compute distances from latitude and longitude degrees
+        path = os.path.join(self.root_dir, 'full437.h5')
+        stations = pd.DataFrame(pd.read_hdf(path, 'stations'))
+        st_coord = stations.loc[:, ['latitude', 'longitude']]
+        from tsl.ops.similarities import geographical_distance
+        dist = geographical_distance(st_coord, to_rad=True).values
+        np.save(os.path.join(self.root_dir, 'aqi_dist.npy'), dist)
+
+    def load_raw(self):
+        self.maybe_build()
+        dist = np.load(os.path.join(self.root_dir, 'aqi_dist.npy'))
+        if self.small:
+            path = os.path.join(self.root_dir, 'small36.h5')
+            eval_mask = pd.read_hdf(path, 'eval_mask')
+            dist = dist[:36, :36]
+        else:
+            path = os.path.join(self.root_dir, 'full437.h5')
+            eval_mask = None
+        df = pd.read_hdf(path, 'pm25')
+        return pd.DataFrame(df), dist, eval_mask
+
+    def load(self, impute_nans=True, p=1.):
+        # load readings and stations metadata
+        df, dist, eval_mask = self.load_raw()
+        # compute the masks:
+        mask = (~np.isnan(df.values)).astype('uint8')  # 1 if value is valid
+        test = np.sum(eval_mask, axis=(0))
+
+        if len(self.masked_sensors):
+            eval_mask = np.zeros(mask.shape)
+            eval_mask[:, self.masked_sensors] = mask[:, self.masked_sensors]
+        else:
+            eval_mask = sample_mask(mask.shape,
+                                    p=0.,
+                                    p_noise=p,
+                                    mode="road")
+        # eventually replace nans with weekly mean by hour
+        
+        if impute_nans:
+            from tsl.ops.framearray import temporal_mean
+            df = df.fillna(temporal_mean(df))
+        
+        test2 = np.sum(mask, axis=(0))
+        test1 = np.sum(eval_mask, axis=(0))
+        return df, mask, eval_mask, dist
+
+    def get_splitter(self, method: Optional[str] = None, **kwargs):
+        if method == 'air_quality':
+            val_len = kwargs.get('val_len')
+            return AirQualitySplitter(test_months=self.test_months,
+                                      val_len=val_len)
+
+    def compute_similarity(self, method: str, **kwargs):
+        if method == "distance":
+            from tsl.ops.similarities import gaussian_kernel
+
+            # use same theta for both air and air36
+            theta = np.std(self.dist[:36, :36])
+            return gaussian_kernel(self.dist, theta=theta)
 
 class AirQualitySmaller(DatetimeDataset, MissingValuesMixin):
     similarity_options = {'distance'}
@@ -206,14 +308,56 @@ AUCKLAND = {
                 'locationLongitude': [174.762123, 174.761371, 174.740808, 174.591428, 174.633079, 174.703081]}), 
     'timezone': 'Pacific/Auckland'}
 
-def AirQualityCreate(path, agg_func = 'mean', features=None, t_range=None):
+INVERCARGILL2 = {
+    'df' :      pd.DataFrame({
+                'locationLongitude': [168.354731, 168.350339, 168.350151, 168.374574, 168.387039, 168.350258, 168.381864,
+                                     168.375167, 168.350805, 168.377209, 168.382873, 168.384734, 168.361357, 168.375977,
+                                     168.35045, 168.349358, 168.346235, 168.361723, 168.386655, 168.366703, 168.361048, 
+                                     168.374085, 168.350047, 168.370799, 168.353385, 168.366792, 168.361174, 168.383326,
+                                     168.369778, 168.360898, 168.360781, 168.38856, 168.360558, 168.369855, 168.36128,
+                                     168.355503, 168.379932, 168.375381, 168.366307, 168.377629, 168.354625, 168.374201],
+
+                'locationLatitude': [-46.423463, -46.391143, -46.404305, -46.403735, -46.435166, -46.391083, -46.402722,
+                                     -46.396632, -46.395459, -46.423565, -46.385037, -46.391359, -46.38417, -46.416871,
+                                     -46.384261, -46.378189, -46.379938, -46.396574, -46.423486, -46.423553, -46.410818,
+                                     -46.403778, -46.404272, -46.410898, -46.41079, -46.430023, -46.390393, -46.397899,
+                                     -46.430981, -46.442108, -46.43678, -46.417054, -46.375673, -46.431264, -46.404628, 
+                                     -46.416806, -46.409627, -46.396528, -46.417347, -46.430643, -46.429926, -46.390498]}), 
+    'timezone': 'Pacific/Auckland'}
+
+INVERCARGILL1 = {
+    'df' :      pd.DataFrame({
+                'locationLongitude': [168.382115, 168.354731, 168.367298, 168.387039, 168.372177, 168.382602, 168.354712,
+                                      168.359962, 168.377209, 168.359915, 168.375977, 168.38748, 168.386655, 168.366703,
+                                      168.360128, 168.377406, 168.382387, 168.354391, 168.376304, 168.371295, 168.372183,
+                                      168.366792, 168.35456, 168.371516, 168.366803, 168.371293, 168.387123, 168.382709,
+                                      168.38856, 168.387645, 168.377232, 168.360316, 168.355503, 168.381202, 168.359866,
+                                      168.359854, 168.377629, 168.354625, 168.366307, 168.382259, 168.371009],
+
+                'locationLatitude': [-46.42718, -46.423463, -46.433992, -46.435166, -46.430401, -46.420204, -46.420094,
+                                     -46.426834, -46.423565, -46.420217, -46.416871, -46.430598, -46.423486, -46.423553,
+                                     -46.430016, -46.419827, -46.429942, -46.426854, -46.434382, -46.420081, -46.427286,
+                                     -46.430023, -46.434065, -46.43433, -46.427105, -46.42341, -46.420234, -46.416867,
+                                     -46.417054, -46.426916, -46.426421, -46.434034, -46.416806, -46.43481, -46.416669,
+                                     -46.423492, -46.430643, -46.429926, -46.417347, -46.423572, -46.417033]}), 
+    'timezone': 'Pacific/Auckland'}
+
+LOCATIONS = ['Auckland', 'Invercargill1', 'Invercargill2']
+
+def AirQualityCreate(path, agg_func = 'mean', features=None, t_range=None, location='Auckland'):
     for feat in features:
         assert feat in COLS
 
     assert agg_func in ['mean', 'max', 'min']
     features = {feat:agg_func for feat in features}
 
-    lat_long_vals = AUCKLAND["df"]
+    assert location in LOCATIONS, f'Locations must be {LOCATIONS}'
+    if location == 'Auckland':
+        lat_long_vals = AUCKLAND["df"]
+    elif location == 'Invercargill1':
+        lat_long_vals = INVERCARGILL1['df']
+    elif location == 'Invercargill2':
+        lat_long_vals = INVERCARGILL2['df']
 
     df = pd.read_csv(path)
     df['datetime'] = pd.to_datetime(df['time'], utc=True)
@@ -266,22 +410,32 @@ class AirQualityAuckland(DatetimeDataset, MissingValuesMixin):
                  infer_eval_from: str = 'next',
                  features: list = ['pm2_5ConcNumIndividual.value'],
                  agg_func: str = 'mean',
+                 location: str = 'Auckland',
                  t_range: Optional[list] = None,
                  freq: Optional[str] = None,
-                 masked_sensors: Optional[Sequence] = None):
+                 masked_sensors: Optional[Sequence] = None,
+                 p: Optional[float] = 1.):
         self.root = root
         self.test_months = test_months
         self.infer_eval_from = infer_eval_from  # [next, previous]
         self.features = features
         self.t_range = t_range
         self.agg_func = agg_func
+        self.location = location
 
         if masked_sensors is None:
             self.masked_sensors = []
         else:
             self.masked_sensors = list(masked_sensors)
+
+        if location == 'Auckland':
+            self.save_p = 'auck_aqi_dist'
+        elif location == 'Invercargill1':
+            self.save_p = 'invg1_aqi_dist'
+        elif location == 'Invercargill2':
+            self.save_p = 'invg2_aqi_dist'
         
-        df, mask, eval_mask, dist = self.load(impute_nans=impute_nans)
+        df, mask, eval_mask, dist = self.load(impute_nans=impute_nans, p=p)
         super().__init__(target=df,
                          mask=mask,
                          freq=freq,
@@ -292,10 +446,7 @@ class AirQualityAuckland(DatetimeDataset, MissingValuesMixin):
                          name='AQI12')
         
         self.add_covariate('dist', dist, pattern='n n')
-
-        eval_mask = self._parse_target(eval_mask)
-        eval_mask = framearray_to_numpy(eval_mask).astype(bool)
-        self.add_covariate('eval_mask', eval_mask, 't n f')
+        self.set_eval_mask(eval_mask)
 
         self.df = df
         # self.masks = mask
@@ -308,26 +459,26 @@ class AirQualityAuckland(DatetimeDataset, MissingValuesMixin):
 
     @property
     def required_file_names(self) -> List[str]:
-        return self.raw_file_names + ['auck_aqi_dist.npy']
+        return self.raw_file_names + [f'{self.save_p}.npy']
 
     def build(self):
         # compute distances from latitude and longitude degrees
         path = os.path.join(self.root_dir, 'allNIWA_clarity.csv')
-        stations = AirQualityCreate(path, self.agg_func, self.features, self.t_range)
+        stations = AirQualityCreate(path, self.agg_func, self.features, self.t_range, self.location)
         stations = stations.drop_duplicates(subset=["station"])[["station", "locationLatitude", "locationLongitude"]]
         self.stations = stations
 
         st_coord = stations.loc[:, ['locationLatitude', 'locationLongitude']]
         from tsl.ops.similarities import geographical_distance
         dist = geographical_distance(st_coord, to_rad=True).values
-        np.save(os.path.join(self.root_dir, 'auck_aqi_dist.npy'), dist)
+        np.save(os.path.join(self.root_dir, f'{self.save_p}.npy'), dist)
 
     def load_raw(self):
         self.maybe_build()
-        dist = np.load(os.path.join(self.root_dir, 'auck_aqi_dist.npy'))
+        dist = np.load(os.path.join(self.root_dir, f'{self.save_p}.npy'))
         path = os.path.join(self.root_dir, 'allNIWA_clarity.csv')
         eval_mask = None
-        df = AirQualityCreate(path, self.agg_func, self.features, self.t_range)
+        df = AirQualityCreate(path, self.agg_func, self.features, self.t_range, self.location)
         stations = df.drop_duplicates(subset=["station"])[["station", "locationLatitude", "locationLongitude"]]
         self.stations = stations
 
@@ -339,17 +490,22 @@ class AirQualityAuckland(DatetimeDataset, MissingValuesMixin):
         
         return pd.DataFrame(df_pivot), dist, eval_mask
 
-    def load(self, impute_nans=True):
+    def load(self, impute_nans=True, p=1.):
         # load readings and stations metadata
         df, dist, eval_mask = self.load_raw()
         # compute the masks:
-        mask = (~np.isnan(df.values)).astype('uint8')  # 1 if value is valid
+        mask = ((~np.isnan(df.values)) & (df.values != 0)).astype('uint8')  # 1 if value is valid
         if eval_mask is None:
             eval_mask = np.zeros((mask.shape))
         # 1 if value is ground-truth for imputation
         if len(self.masked_sensors):
             eval_mask[:, self.masked_sensors] = mask[:, self.masked_sensors]
-            mask[:, self.masked_sensors] = 0
+        else:
+            eval_mask = sample_mask(mask.shape,
+                                    p=0.,
+                                    p_noise=p,
+                                    mode="road")
+            
         # eventually replace nans with weekly mean by hour
         if impute_nans:
             from tsl.ops.framearray import temporal_mean

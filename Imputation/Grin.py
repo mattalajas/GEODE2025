@@ -20,7 +20,7 @@ from tsl.ops.imputation import add_missing_values
 from tsl.transforms import MaskInput
 from tsl.utils.casting import torch_to_numpy
 
-from my_datasets import AirQualitySmaller, AirQualityAuckland
+from my_datasets import AirQualitySmaller, AirQualityAuckland, AirQualityKrig
 from KITS import KITS
 from KITS_filler import GCNCycVirtualFiller
 
@@ -43,14 +43,16 @@ def get_model_class(model_str):
     return model
 
 
-def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, agg_func = 'mean', test_month=[5]):
+def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-01', '2022-12-01'],
+                masked_s=None, agg_func = 'mean', test_month=[5], location='Auckland'):
     if dataset_name == 'air':
-        return AirQuality(impute_nans=True, small=True, masked_sensors=masked_s)
+        return AirQualityKrig(impute_nans=True, small=True, masked_sensors=masked_s, p=p_noise)
     if dataset_name == 'air_smaller':
         return AirQualitySmaller('../../AirData/AQI/Stations', impute_nans=True, masked_sensors=masked_s)
-    if dataset_name == 'air_auckland':
-        return AirQualityAuckland('../../AirData/Niwa', t_range=['2022-04-01', '2022-12-01'], 
-                                  masked_sensors=masked_s, agg_func=agg_func, test_months=test_month)
+    if dataset_name == 'air_auckland' or dataset_name == 'air_invercargill1' or dataset_name == 'air_invercargill2':
+        return AirQualityAuckland('../../AirData/Niwa', t_range=t_range, masked_sensors=masked_s, 
+                                  agg_func=agg_func, test_months=test_month,
+                                  location=location, p=p_noise)
     if dataset_name.endswith('_point'):
         p_fault, p_noise = 0., 0.25
         dataset_name = dataset_name[:-6]
@@ -78,21 +80,19 @@ def run_imputation(cfg: DictConfig):
     ########################################
     # data module                          #
     ########################################
-    try:
-        dataset = get_dataset(cfg.dataset.name,
-                            p_fault=cfg.get('p_fault'),
-                            p_noise=cfg.get('p_noise'),
-                            masked_s=cfg.dataset.masked_sensors,
-                            agg_func=cfg.dataset.agg_func,
-                            test_month=cfg.dataset.test_month)
-    except:
-        dataset = get_dataset(cfg.dataset.name,
-                    p_fault=cfg.get('p_fault'),
-                    p_noise=cfg.get('p_noise'),
-                    masked_s=cfg.dataset.masked_sensors)
+    torch.set_float32_matmul_precision('high')
+
+    dataset = get_dataset(cfg.dataset.name,
+                        p_fault=cfg.get('p_fault'),
+                        p_noise=cfg.get('p_noise'),
+                        t_range=cfg.dataset.get('t_range'),
+                        masked_s=cfg.dataset.get('masked_sensors'),
+                        agg_func=cfg.dataset.get('agg_func'),
+                        test_month=cfg.dataset.get('test_month'),
+                        location=cfg.dataset.get('location'))
 
     # encode time of the day and use it as exogenous variable
-    covariates = {'u': dataset.datetime_encoded('day').values}
+    # covariates = {'u': dataset.datetime_encoded('day').values}
 
     # get adjacency matrix
     if cfg.model.name == 'kits':
@@ -108,7 +108,7 @@ def run_imputation(cfg: DictConfig):
     torch_dataset = ImputationDataset(target=dataset.dataframe(),
                                       mask=dataset.training_mask,
                                       eval_mask=dataset.eval_mask,
-                                      covariates=covariates,
+                                    #   covariates=covariates,
                                       transform=MaskInput(),
                                       connectivity=adj,
                                       window=cfg.window,
@@ -137,8 +137,8 @@ def run_imputation(cfg: DictConfig):
         model_kwargs = dict(adj=adj, d_in=dm.n_channels, n_nodes=dm.n_nodes, args=cfg.model)
     else:
         model_kwargs = dict(n_nodes=torch_dataset.n_nodes,
-                            input_size=torch_dataset.n_channels,
-                            exog_size=torch_dataset.input_map.u.shape[-1])
+                            input_size=torch_dataset.n_channels)
+                            # ,exog_size=torch_dataset.input_map.u.shape[-1])
 
     model_cls.filter_model_args_(model_kwargs)
 
@@ -173,7 +173,8 @@ def run_imputation(cfg: DictConfig):
                                     warm_up=cfg.warm_up_steps,
                                     metrics=log_metrics,
                                     scheduler_class=scheduler_class,
-                                    scheduler_kwargs=scheduler_kwargs)
+                                    scheduler_kwargs=scheduler_kwargs,
+                                    inductive=cfg.model.inductive)
     else:
         imputer = Imputer(model_class=model_cls,
                         model_kwargs=model_kwargs,
@@ -226,6 +227,7 @@ def run_imputation(cfg: DictConfig):
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
         devices=cfg.device,
         gradient_clip_val=cfg.grad_clip_val,
+        gradient_clip_algorithm=cfg.grad_clip_alg,
         callbacks=[early_stop_callback, checkpoint_callback])
 
     trainer.fit(imputer, datamodule=dm)
