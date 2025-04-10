@@ -118,7 +118,8 @@ class KITS(BaseModel):
         self.dataset_name = args.name
 
         self.t_dim = 3
-        self.register_buffer('adj', torch.tensor(adj).float())
+        # self.register_buffer('adj', torch.tensor(adj).float())
+        self.adj = torch.tensor(adj).float()
         self.fc_1 = nn.Linear(1, d_hidden)
 
         self.gcn_1 = SpatialConvOrderK(c_in=self.t_dim * d_hidden, c_out=d_hidden, support_len=2 * 1, order=1, include_self=False)
@@ -177,7 +178,20 @@ class KITS(BaseModel):
                 edge_weight = None, edge_index = None, u = None, transform=None):
         test1 = (torch.sum(mask, dim=(0, 1)))
         test = (torch.sum(x, dim=(0, 1)))
-        adj = self.adj.clone()  # adjacency matrix
+        adj = self.adj.clone().to(device=x.device)  # adjacency matrix
+
+        # # Do residual
+        # original_x = x.clone()
+        # gain = torch.zeros_like(original_x, device=original_x.device)
+        # gain[:, 1:] = (x[:, 1:] - x[:, :-1]) 
+        # x = gain
+
+        # resid = torch.roll(original_x, shifts=1, dims=1)
+        # resid[:, 0] = resid[:, 1]
+
+        # testing = resid+gain
+
+        # print(torch.equal(original_x, testing))
 
         if training:
             if reset:
@@ -192,10 +206,23 @@ class KITS(BaseModel):
                 # get the 1-hop neighbors of each observed entry.
                 if self.obs_neighbors is None:
                     obs_neighbors = {}
+                    neighbors_2h = {}
+
+                    # Get two hop diagonal
+                    sp_adj = adj.to_sparse_coo()
+                    two_hops = torch.mm(sp_adj, sp_adj).to_dense()
+                    two_hops = two_hops.fill_diagonal_(0)
+
                     for i in range(n1):
                         row_nonzero = set(torch.where(adj[i, :] > 0)[0].detach().cpu().numpy().tolist())
                         col_nonzero = set(torch.where(adj[:, i] > 0)[0].detach().cpu().numpy().tolist())
                         nonzero = row_nonzero.union(col_nonzero)
+
+                        row_n_2 = set(torch.nonzero(two_hops[i]).squeeze(1).tolist())
+                        col_n_2 = set(torch.nonzero(two_hops[:, i]).squeeze(1).tolist())
+                        all_n_2 = row_n_2.union(col_n_2)
+                        all_n = all_n_2.union(nonzero)
+
                         obs_neighbors[i] = list(nonzero)  # 1-hop neighbors
                     self.obs_neighbors = obs_neighbors
                 else:
@@ -257,7 +284,10 @@ class KITS(BaseModel):
 
                 self.adj_aug = adj_aug
             else:
-                adj_aug = adj
+                if self.adj_aug is not None:
+                    adj_aug = self.adj_aug
+                else:
+                    adj_aug = adj
             adj = adj_aug.detach()
 
         supp = SpatialConvOrderK.compute_support(adj)
@@ -265,11 +295,15 @@ class KITS(BaseModel):
         imputation = self.impute(x, mask, supp)
         if not training:
             imputation = torch.where(mask, x, imputation)
+            # imputation += resid
             return imputation
         else:
             y = torch.where(mask, x, imputation)
             x = imputation * (1 - mask)
             imputation_cyc = self.impute(x, 1 - mask, supp)
+
+            # imputation += resid
+            # imputation_cyc += resid
             return imputation, imputation_cyc, y
 
     def impute(self, x, mask, supp):

@@ -16,13 +16,14 @@ from tsl.metrics import numpy as numpy_metrics
 from tsl.metrics import torch as torch_metrics
 from tsl.nn.models import (BiRNNImputerModel, GRINModel, RNNImputerModel,
                            SPINHierarchicalModel, SPINModel)
-from tsl.ops.imputation import add_missing_values
 from tsl.transforms import MaskInput
 from tsl.utils.casting import torch_to_numpy
 
-from my_datasets import AirQualitySmaller, AirQualityAuckland, AirQualityKrig
+from my_datasets import AirQualitySmaller, AirQualityAuckland, AirQualityKrig, add_missing_sensors
 from KITS import KITS
 from KITS_filler import GCNCycVirtualFiller
+from unnamed_filler import UnnamedKrigFiller
+from unnamedKrig import UnnamedKrigModel
 
 
 def get_model_class(model_str):
@@ -38,6 +39,8 @@ def get_model_class(model_str):
         model = SPINHierarchicalModel
     elif model_str == 'kits':
         model = KITS
+    elif model_str == 'unkrig':
+        model = UnnamedKrigModel
     else:
         raise NotImplementedError(f'Model "{model_str}" not available.')
     return model
@@ -59,20 +62,22 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-0
     if dataset_name.endswith('_block'):
         p_fault, p_noise = 0.0015, 0.05
         dataset_name = dataset_name[:-6]
-    if dataset_name == 'la':
-        return add_missing_values(MetrLA(),
+    if dataset_name == 'metrla':
+        return add_missing_sensors(MetrLA(freq='5T'),
                                   p_fault=p_fault,
                                   p_noise=p_noise,
                                   min_seq=12,
                                   max_seq=12 * 4,
-                                  seed=9101112)
+                                  seed=9101112, 
+                                  masked_sensors=masked_s)
     if dataset_name == 'bay':
-        return add_missing_values(PemsBay(),
+        return add_missing_sensors(PemsBay(),
                                   p_fault=p_fault,
                                   p_noise=p_noise,
                                   min_seq=12,
                                   max_seq=12 * 4,
-                                  seed=56789)
+                                  seed=56789,
+                                  masked_sensors=masked_s)
     raise ValueError(f"Dataset {dataset_name} not available in this setting.")
 
 
@@ -83,8 +88,8 @@ def run_imputation(cfg: DictConfig):
     torch.set_float32_matmul_precision('high')
 
     dataset = get_dataset(cfg.dataset.name,
-                        p_fault=cfg.get('p_fault'),
-                        p_noise=cfg.get('p_noise'),
+                        p_fault=cfg.dataset.get('p_fault'),
+                        p_noise=cfg.dataset.get('p_noise'),
                         t_range=cfg.dataset.get('t_range'),
                         masked_s=cfg.dataset.get('masked_sensors'),
                         agg_func=cfg.dataset.get('agg_func'),
@@ -95,7 +100,7 @@ def run_imputation(cfg: DictConfig):
     # covariates = {'u': dataset.datetime_encoded('day').values}
 
     # get adjacency matrix
-    if cfg.model.name == 'kits':
+    if cfg.model.name == 'kits' or cfg.model.name == 'unkrig':
         adj = dataset.get_connectivity(**cfg.dataset.connectivity, layout='dense')
     else:
         adj = dataset.get_connectivity(**cfg.dataset.connectivity)
@@ -135,6 +140,8 @@ def run_imputation(cfg: DictConfig):
     
     if cfg.model.name == 'kits':
         model_kwargs = dict(adj=adj, d_in=dm.n_channels, n_nodes=dm.n_nodes, args=cfg.model)
+    elif cfg.model.name == 'unkrig':
+        model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels)
     else:
         model_kwargs = dict(n_nodes=torch_dataset.n_nodes,
                             input_size=torch_dataset.n_channels)
@@ -174,7 +181,26 @@ def run_imputation(cfg: DictConfig):
                                     metrics=log_metrics,
                                     scheduler_class=scheduler_class,
                                     scheduler_kwargs=scheduler_kwargs,
-                                    inductive=cfg.model.inductive)
+                                    gradient_clip_val=cfg.grad_clip_val,
+                                    gradient_clip_algorithm=cfg.grad_clip_alg,
+                                    known_nodes = [i for i in range(adj.shape[0]) if i not in cfg.dataset.get('masked_sensors')],
+                                    **cfg.model.technique)
+    elif cfg.model.name == "unkrig":
+        imputer = UnnamedKrigFiller(model_class=model_cls,
+                                    model_kwargs=model_kwargs,
+                                    optim_class=getattr(torch.optim, cfg.optimizer.name),
+                                    optim_kwargs=dict(cfg.optimizer.hparams),
+                                    loss_fn=loss_fn,
+                                    scaled_target=cfg.scale_target,
+                                    whiten_prob=cfg.whiten_prob,
+                                    pred_loss_weight=cfg.prediction_loss_weight,
+                                    warm_up=cfg.warm_up_steps,
+                                    metrics=log_metrics,
+                                    scheduler_class=scheduler_class,
+                                    scheduler_kwargs=scheduler_kwargs,
+                                    gradient_clip_val=cfg.grad_clip_val,
+                                    gradient_clip_algorithm=cfg.grad_clip_alg,
+                                    **cfg.model.regs)
     else:
         imputer = Imputer(model_class=model_cls,
                         model_kwargs=model_kwargs,
@@ -220,15 +246,26 @@ def run_imputation(cfg: DictConfig):
         mode='min',
     )
 
-    trainer = Trainer(
-        max_epochs=cfg.epochs,
-        default_root_dir=cfg.run.dir,
-        logger=exp_logger,
-        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
-        devices=cfg.device,
-        gradient_clip_val=cfg.grad_clip_val,
-        gradient_clip_algorithm=cfg.grad_clip_alg,
-        callbacks=[early_stop_callback, checkpoint_callback])
+    if cfg.model.name =='kits' or cfg.model.name =='unkrig':
+        trainer = Trainer(
+            max_epochs=cfg.epochs,
+            default_root_dir=cfg.run.dir,
+            logger=exp_logger,
+            accelerator='gpu' if torch.cuda.is_available() else 'cpu',
+            devices=cfg.device,
+            callbacks=[early_stop_callback, checkpoint_callback],
+            detect_anomaly=True)
+    else:
+        trainer = Trainer(
+            max_epochs=cfg.epochs,
+            default_root_dir=cfg.run.dir,
+            logger=exp_logger,
+            accelerator='gpu' if torch.cuda.is_available() else 'cpu',
+            devices=cfg.device,
+            gradient_clip_val=cfg.grad_clip_val,
+            gradient_clip_algorithm=cfg.grad_clip_alg,
+            callbacks=[early_stop_callback, checkpoint_callback])
+
 
     trainer.fit(imputer, datamodule=dm)
 
@@ -267,6 +304,7 @@ def run_imputation(cfg: DictConfig):
 
 
 if __name__ == '__main__':
+    torch.autograd.set_detect_anomaly(True)
     exp = Experiment(run_fn=run_imputation, config_path='config', config_name='default')
     print(exp)
     res = exp.run()

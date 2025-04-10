@@ -1,0 +1,22 @@
+name: 'unkrig'
+hparams:
+  hidden_size: 128
+  # horizon: 12
+  exog_size: 0
+  enc_layers: 2
+  gcn_layers: 1
+  dropout: 0.4
+  intervention_steps: 3
+regs:
+  y1: 0.8
+  y2: 0.8
+  y3: 0.8
+
+# technique:
+#   inductive: True
+#   randomise: False
+#   start_active: 10
+#   storage_size: 50
+#   distance_metric: 'kl'
+#   graph_feature: 'n_degree'
+#   # individual_reg: 0.1

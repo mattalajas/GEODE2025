@@ -120,17 +120,25 @@ class Filler(pl.LightningModule):
     def predict_step(self, batch, batch_idx, dataloader_idx=None):
         batch_data, batch_preprocessing = self._unpack_batch(batch)
         batch_data["training"] = False
+        batch_data["predict"] = True
 
         # Extract mask and target
         eval_mask = batch_data.pop('eval_mask', None)
         y = batch_data.pop('y')
+        batch_data.pop("edge_index", None)
 
         # Compute outputs and rescale
-        imputation = self.predict_batch(batch, preprocess=False, postprocess=True)
+        finrecos, finpreds, fin_irm_all_s, \
+            output_invars_s, output_vars_s, inv_adj, var_adj = self.predict_batch(batch, preprocess=False, postprocess=True)
+        
         output = dict(y=y,
-                      y_hat=imputation,
+                      y_hat=finpreds,
                       mask=batch.mask,
-                      eval_mask=eval_mask)
+                      eval_mask=eval_mask,
+                      invars=output_invars_s[0],
+                      vars=output_vars_s[0],
+                      inv_adj=inv_adj,
+                      var_adj=var_adj)
         return output
 
     @staticmethod
@@ -350,7 +358,7 @@ class Filler(pl.LightningModule):
                 cfg['monitor'] = metric
         return cfg
 
-class GCNCycVirtualFiller(Filler):
+class UnnamedKrigFiller(Filler):
     def __init__(self,
                  model_class,
                  model_kwargs,
@@ -365,17 +373,13 @@ class GCNCycVirtualFiller(Filler):
                  scheduler_class=None,
                  scheduler_kwargs=None,
                  inductive=True,
-                 generative=False,
                  gradient_clip_val=None,
                  gradient_clip_algorithm=None,
-                 randomise = False,
-                 start_active = np.inf,
-                 storage_size = None,
-                 graph_feature = 'n_degree',
-                 distance_metric = 'euclidean',
-                 known_nodes=None,
-                 individual_reg=0):
-        super(GCNCycVirtualFiller, self).__init__(model_class=model_class,
+                 known_set=None,
+                 y1 = 1,
+                 y2 = 1,
+                 y3 = 1):
+        super(UnnamedKrigFiller, self).__init__(model_class=model_class,
                                                   model_kwargs=model_kwargs,
                                                   optim_class=optim_class,
                                                   optim_kwargs=optim_kwargs,
@@ -389,26 +393,13 @@ class GCNCycVirtualFiller(Filler):
         self.tradeoff = pred_loss_weight
         self.trimming = (warm_up, warm_up)
 
-        self.known_set = None
+        self.known_set = known_set
         self.inductive = inductive
-        self.generative = generative
-        self.start_active = start_active
         self.gradient_clip_val = gradient_clip_val
         self.gradient_clip_algorithm = gradient_clip_algorithm
-        self.randomise = randomise
-        if storage_size is not None:
-            self.graph_storage = GraphStorage(storage_size, graph_feature=graph_feature, 
-                                              distance_metric=distance_metric)
-
-            adj = self.model.adj.clone()
-            adj = adj[known_nodes, :]
-            adj = adj[:, known_nodes]
-            self.graph_storage.original_graph = adj
-        else:
-            self.graph_storage = None
-
-        self.cur_epo = -1
-        self.indiv_reg = individual_reg
+        self.y1 = y1
+        self.y2 = y2
+        self.y3 = y3
 
     def trim_seq(self, *seq):
         seq = [s[:, self.trimming[0]:s.size(1) - self.trimming[1]] for s in seq]
@@ -487,7 +478,7 @@ class GCNCycVirtualFiller(Filler):
         mask = batch_data["mask"]
         y = batch_data.pop("y")
         _ = batch_data.pop("eval_mask")  # drop this, we will re-create a new eval_mask (=mask during training)
-        og_adj = self.model.adj.clone().to(device=x.device)
+        batch_data.pop("edge_index", None)
 
         x = x[:, :, known_set, :]  # b s n1 d, n1 = num of observed entries
         mask = mask[:, :, known_set, :]  # b s n1 d
@@ -501,101 +492,97 @@ class GCNCycVirtualFiller(Filler):
             b, s, n, d = mask.size()
             cur_entry_num = n
 
-            if self.randomise:
-                # Check if its per batch or epoch
-                if self.current_epoch >= self.start_active:
-                    # Grab from tensor storage after set epochs, if storage is prompted, and randomly permitted
-                    # Per epoch randomisation
-                    if self.current_epoch != self.cur_epo:
-                        if self.graph_storage is not None and torch.rand(1,).item() > 0.2:
-                            new_adj = self.graph_storage.get_random_tensor()
-                            sub_entry_num = new_adj.shape[0] - cur_entry_num
-                            self.sub_entry_num = sub_entry_num
-                        else:
-                            dynamic_ratio = self.ratio + 0.2 * np.random.random()  # ratio + 0.1
-                            aug_entry_num = max(int(cur_entry_num / dynamic_ratio), cur_entry_num + 1)
-                            sub_entry_num = aug_entry_num - cur_entry_num  # n2 - n1
-                            assert sub_entry_num > 0, "The augmented data should have more entries than original data."
-                            self.sub_entry_num = sub_entry_num
+            # if self.randomise:
+            #     # Check if its per batch or epoch
+            #     if self.current_epoch >= self.start_active:
+            #         # Grab from tensor storage after set epochs, if storage is prompted, and randomly permitted
+            #         # Per epoch randomisation
+            #         if self.current_epoch != self.cur_epo:
+            #             if self.graph_storage is not None and torch.rand(1,).item() > 0.2:
+            #                 new_adj = self.graph_storage.get_random_tensor()
+            #                 sub_entry_num = new_adj.shape[0] - cur_entry_num
+            #                 self.sub_entry_num = sub_entry_num
+            #             else:
+            #                 dynamic_ratio = self.ratio + 0.2 * np.random.random()  # ratio + 0.1
+            #                 aug_entry_num = max(int(cur_entry_num / dynamic_ratio), cur_entry_num + 1)
+            #                 sub_entry_num = aug_entry_num - cur_entry_num  # n2 - n1
+            #                 assert sub_entry_num > 0, "The augmented data should have more entries than original data."
+            #                 self.sub_entry_num = sub_entry_num
 
-                            # Generate graph
-                            og_adj = self.model.adj.clone().to(device=x.device)
-                            og_adj = og_adj[known_set, :]
-                            og_adj = og_adj[:, known_set]
+            #                 # Generate graph
+            #                 og_adj = self.model.adj.clone().to(device=x.device)
+            #                 og_adj = og_adj[known_set, :]
+            #                 og_adj = og_adj[:, known_set]
 
-                            N = og_adj.shape[0]
-                            new_size = N + sub_entry_num
+            #                 N = og_adj.shape[0]
+            #                 new_size = N + sub_entry_num
 
-                            # Expand adjacency matrix with zeros
-                            new_adj = torch.zeros((new_size, new_size), dtype=torch.float32).to(device=x.device)
-                            new_adj[:N, :N] = og_adj  # Copy old matrix
+            #                 # Expand adjacency matrix with zeros
+            #                 new_adj = torch.zeros((new_size, new_size), dtype=torch.float32).to(device=x.device)
+            #                 new_adj[:N, :N] = og_adj  # Copy old matrix
 
-                            # Randomly generate edges for new nodes
-                            random_edges = torch.rand((sub_entry_num, new_size))
-                            edge_mask = (torch.rand((sub_entry_num, new_size)) < 0.4).float()
-                            new_edges = random_edges * edge_mask
+            #                 # Randomly generate edges for new nodes
+            #                 random_edges = torch.rand((sub_entry_num, new_size))
+            #                 edge_mask = (torch.rand((sub_entry_num, new_size)) < 0.4).float()
+            #                 new_edges = random_edges * edge_mask
                             
-                            # Ensure symmetry if the graph is undirected
-                            new_adj[N:, :] = new_edges
-                            new_adj[:, N:] = new_edges.T
+            #                 # Ensure symmetry if the graph is undirected
+            #                 new_adj[N:, :] = new_edges
+            #                 new_adj[:, N:] = new_edges.T
 
-                            if self.graph_storage is not None:
-                                self.graph_storage.add_tensor(new_adj)                    
-                        # Store current graph to be used for all batches
-                        self.cur_rand_graph = new_adj
-                        self.cur_epo = self.current_epoch
+            #                 if self.graph_storage is not None:
+            #                     self.graph_storage.add_tensor(new_adj)                    
+            #             # Store current graph to be used for all batches
+            #             self.cur_rand_graph = new_adj
+            #             self.cur_epo = self.current_epoch
     
-                    # Get previous graph
-                    else:
-                        new_adj = self.cur_rand_graph
-                        sub_entry_num = new_adj.shape[0] - cur_entry_num
-                        self.sub_entry_num = sub_entry_num
+            #         # Get previous graph
+            #         else:
+            #             new_adj = self.cur_rand_graph
+            #             sub_entry_num = new_adj.shape[0] - cur_entry_num
+            #             self.sub_entry_num = sub_entry_num
 
-                # Per batch randomisation
-                else:
-                    dynamic_ratio = self.ratio + 0.2 * np.random.random()  # ratio + 0.1
-                    aug_entry_num = max(int(cur_entry_num / dynamic_ratio), cur_entry_num + 1)
-                    sub_entry_num = aug_entry_num - cur_entry_num  # n2 - n1
-                    assert sub_entry_num > 0, "The augmented data should have more entries than original data."
-                    self.sub_entry_num = sub_entry_num
+            #     # Per batch randomisation
+            #     else:
+            #         dynamic_ratio = self.ratio + 0.2 * np.random.random()  # ratio + 0.1
+            #         aug_entry_num = max(int(cur_entry_num / dynamic_ratio), cur_entry_num + 1)
+            #         sub_entry_num = aug_entry_num - cur_entry_num  # n2 - n1
+            #         assert sub_entry_num > 0, "The augmented data should have more entries than original data."
+            #         self.sub_entry_num = sub_entry_num
 
-                    # Generate graph
-                    og_adj = self.model.adj.clone().to(device=x.device)
-                    og_adj = og_adj[known_set, :]
-                    og_adj = og_adj[:, known_set]
+            #         # Generate graph
+            #         og_adj = self.model.adj.clone().to(device=x.device)
+            #         og_adj = og_adj[known_set, :]
+            #         og_adj = og_adj[:, known_set]
 
-                    N = og_adj.shape[0]
-                    new_size = N + sub_entry_num
+            #         N = og_adj.shape[0]
+            #         new_size = N + sub_entry_num
 
-                    # Expand adjacency matrix with zeros
-                    new_adj = torch.zeros((new_size, new_size), dtype=torch.float32).to(device=x.device)
-                    new_adj[:N, :N] = og_adj  # Copy old matrix
+            #         # Expand adjacency matrix with zeros
+            #         new_adj = torch.zeros((new_size, new_size), dtype=torch.float32).to(device=x.device)
+            #         new_adj[:N, :N] = og_adj  # Copy old matrix
 
-                    # Randomly generate edges for new nodes
-                    random_edges = torch.rand((sub_entry_num, new_size))
-                    edge_mask = (torch.rand((sub_entry_num, new_size)) < 0.4).float()
-                    new_edges = random_edges * edge_mask
+            #         # Randomly generate edges for new nodes
+            #         random_edges = torch.rand((sub_entry_num, new_size))
+            #         edge_mask = (torch.rand((sub_entry_num, new_size)) < 0.4).float()
+            #         new_edges = random_edges * edge_mask
                     
-                    # Ensure symmetry if the graph is undirected
-                    new_adj[N:, :] = new_edges
-                    new_adj[:, N:] = new_edges.T
-
-                    if self.graph_storage is not None:
-                        self.graph_storage.add_tensor(new_adj)
+            #         # Ensure symmetry if the graph is undirected
+            #         new_adj[N:, :] = new_edges
+            #         new_adj[:, N:] = new_edges.T
             
-                self.model.adj_aug = new_adj
-                batch_data["reset"] = False
+            #     self.model.adj_aug = new_adj
+            #     batch_data["reset"] = False
 
             # Standard KITS implementation
-            else:
-                dynamic_ratio = self.ratio + 0.2 * np.random.random()  # ratio + 0.1
-                aug_entry_num = max(int(cur_entry_num / dynamic_ratio), cur_entry_num + 1)
-                sub_entry_num = aug_entry_num - cur_entry_num  # n2 - n1
-                assert sub_entry_num > 0, "The augmented data should have more entries than original data."
-                self.sub_entry_num = sub_entry_num
+            # else:
+            dynamic_ratio = self.ratio + 0.2 * np.random.random()  # ratio + 0.1
+            aug_entry_num = max(int(cur_entry_num / dynamic_ratio), cur_entry_num + 1)
+            sub_entry_num = aug_entry_num - cur_entry_num  # n2 - n1
+            assert sub_entry_num > 0, "The augmented data should have more entries than original data."
+            self.sub_entry_num = sub_entry_num
 
             sub_entry = torch.zeros(b, s, sub_entry_num, d).to(x.device)
-            x = torch.cat([x, sub_entry], dim=2)  # b s n2 d
             mask = torch.cat([mask, sub_entry], dim=2).byte()  # b s n2 d
             y = torch.cat([y, sub_entry], dim=2)  # b s n2 d
 
@@ -608,145 +595,63 @@ class GCNCycVirtualFiller(Filler):
 
         # Compute predictions and compute loss
         res = self.predict_batch(batch, preprocess=False, postprocess=False)
-        imputation, imputation_cyc, target_cyc = res[0], res[1], res[2]
+        finrecos, finpreds, fin_irm_all_s, output_invars_s, output_vars_s = res[0], res[1], res[2], res[3], res[4]
+        finrecos = torch.cat(finrecos)
+        finpreds = torch.cat(finpreds)
+        fin_irm_all_s = torch.cat(fin_irm_all_s)
 
-        # trim to imputation horizon len
-        imputation, mask, eval_mask, y = self.trim_seq(imputation, mask, eval_mask, y)
-        imputation_cyc, target_cyc = self.trim_seq(imputation_cyc, target_cyc)
-
+        b = x.shape[0]
         if self.scaled_target:
             target = batch.transform['y'].transform(y)
         else:
             target = y
-            imputation = self._postprocess(imputation, batch_preprocessing)
-            imputation_cyc = self._postprocess(imputation_cyc, batch_preprocessing)
+            finrecos = self._postprocess(finrecos, batch_preprocessing)
+            finpreds = self._postprocess(finpreds, batch_preprocessing)
+            fin_irm_all_s = self._postprocess(fin_irm_all_s, batch_preprocessing)
 
-        # partial loss + cycle loss
+        fin_irm_all_s = rearrange(fin_irm_all_s, '(a b s) t n d -> a s b t n d', b=b, a=2)
+        fin_target = torch.cat([target, target])
+
         opt.zero_grad()
-        
-        # # STRUCTURE BASED
-        # # TMD Calculation
-        # First graph
-        # g1_adj = self.model.adj.clone().to(device=x.device)
-        # g1_adj = g1_adj[known_set, :]
-        # g1_adj = g1_adj[:, known_set]
-        # g1_edge_index = dense_to_sparse(g1_adj)[0]
-        # g1_x = torch.ones((g1_adj.shape[0], 1))/g1_adj.shape[0]
-        # G1 = Data(x = g1_x, edge_index=g1_edge_index)
-        # nx_g1 = nx.Graph()
-        # nx_g1.add_edges_from(g1_edge_index.T)
-
-        # # Get second augmented graph
-        # g2_adj = self.model.adj_aug.clone().to(device=x.device)
-        # g2_edge_index = dense_to_sparse(g2_adj)[0]
-        # g2_x = torch.ones((g2_adj.shape[0], 1))/g2_adj.shape[0]
-        # G2 = Data(x = g2_x, edge_index=g2_edge_index)
-        # nx_g2 = nx.Graph()
-        # nx_g2.add_edges_from(g2_edge_index.T)
-
-        # # Get real graph
-        # g3_adj = self.model.adj.clone().to(device=x.device)
-        # g3_edge_index = dense_to_sparse(g3_adj)[0]
-        # g3_x = torch.ones((g3_adj.shape[0], 1))/g3_adj.shape[0]
-        # G3 = Data(x = g3_x, edge_index=g3_edge_index)
-        # nx_g3 = nx.Graph()
-        # nx_g3.add_edges_from(g3_edge_index.T)
-
-        # fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-
-        # # Plot G1
-        # nx.draw(nx_g1, ax=axes[0], node_color='lightblue', edge_color='gray', node_size=500)
-        # axes[0].set_title("G1")
-
-        # # Plot G2
-        # nx.draw(nx_g2, ax=axes[1], node_color='lightgreen', edge_color='gray', node_size=500)
-        # axes[1].set_title("G2")
-
-        # # Plot G3
-        # nx.draw(nx_g3, ax=axes[2], node_color='lightcoral', edge_color='gray', node_size=500)
-        # axes[2].set_title("G3")
-
-        # # Show the figure
-        # plt.tight_layout()
-        # plt.savefig('outputs/first_graphs.png')
-
-        # tmd = TMD(G1, G2, [0.33, 1, 3], 4)
-        # self.log('tmd', 
-        #          tmd,                  
-        #          on_step=False,
-        #          on_epoch=True,
-        #          logger=True,
-        #          prog_bar=False)
-        
-        # tmd_true = TMD(G3, G2, [0.33, 1, 3], 4)
-        # self.log('tmd_true', 
-        #          tmd_true,                  
-        #          on_step=False,
-        #          on_epoch=True,
-        #          logger=True,
-        #          prog_bar=False)
-        
-        # # tmd_test = TMD(G3, G1, [0.33, 1, 3], 4)
-
-        # Pagerank centrality
-        # page_rank = get_ppr(g1_edge_index)
-        
-        # # EMBEDDING BASED
-        # # Get variation of augmented nodes
-        # val = self.loss_fn.metric_fn(imputation, target)
-        # mask = self.loss_fn._check_mask(mask, val)
-        # val = torch.where(mask, val, torch.zeros_like(val))
-        # t_s = val.mean(dim=(2, 3))
-        # variation = torch.std(t_s)
-        # self.log('variation', 
-        #          variation,                  
-        #          on_step=False,
-        #          on_epoch=True,
-        #          logger=True,
-        #          prog_bar=False)
-
-        # # Get variation of augmented nodes
-        # val = self.loss_fn.metric_fn(imputation_cyc, target_cyc)
-        # mask = self.loss_fn._check_mask(mask, val)
-        # val = torch.where(mask, val, torch.zeros_like(val))
-        # t_s = val.mean(dim=(2, 3))
-        # variation = torch.std(t_s)
-        # self.log('variation_1', 
-        #          variation,                  
-        #          on_step=False,
-        #          on_epoch=True,
-        #          logger=True,
-        #          prog_bar=False)
 
         # Losses
-        regularisation = 0
-        if self.indiv_reg != 0:
-            true_loss_mat = torch.zeros((len(known_set), len(known_set)), device=og_adj.device)
-            pred_loss_mat = torch.zeros((len(known_set), len(known_set)), device=og_adj.device)
+        # regularisation = 0
+        # if self.indiv_reg != 0:
+        #     true_loss_mat = torch.zeros((len(known_set), len(known_set)), device=og_adj.device)
+        #     pred_loss_mat = torch.zeros((len(known_set), len(known_set)), device=og_adj.device)
             
-            imp_masked = torch.where(mask, imputation, torch.zeros_like(imputation))
-            tar_masked = torch.where(mask, target, torch.zeros_like(target))
+        #     imp_masked = torch.where(mask, imputation, torch.zeros_like(imputation))
+        #     tar_masked = torch.where(mask, target, torch.zeros_like(target))
             
-            for i in range(len(known_set)):
-                for j in range(len(known_set)):
-                    imp_val = mre(imp_masked[:, :, i], imp_masked[:, :, j])
-                    tar_val = mre(tar_masked[:, :, i], tar_masked[:, :, j])
+        #     for i in range(len(known_set)):
+        #         for j in range(len(known_set)):
+        #             imp_val = mre(imp_masked[:, :, i], imp_masked[:, :, j])
+        #             tar_val = mre(tar_masked[:, :, i], tar_masked[:, :, j])
                     
-                    pred_loss_mat[i, j] = imp_val
-                    true_loss_mat[i, j] = tar_val
+        #             pred_loss_mat[i, j] = imp_val
+        #             true_loss_mat[i, j] = tar_val
             
-            regularisation = self.loss_fn(pred_loss_mat, true_loss_mat, torch.ones_like(true_loss_mat).bool())
+        #     regularisation = self.loss_fn(pred_loss_mat, true_loss_mat, torch.ones_like(true_loss_mat).bool())
+        # IRM Loss
+        env_loss = torch.tensor([]).to(x.device)
+        for i in range(fin_irm_all_s.shape[1]):
+            env_loss = torch.cat(
+                        [env_loss,
+                         self.loss_fn(fin_irm_all_s[0, i], target, mask).unsqueeze(0)])
+            env_loss = torch.cat(
+                        [env_loss,
+                         self.loss_fn(fin_irm_all_s[1, i], target, mask).unsqueeze(0)])
+        env_mean = env_loss.mean()
+        env_var = torch.var(env_loss * fin_irm_all_s.shape[1])
+        penalty = env_mean + env_var
 
-        loss = self.loss_fn(imputation, target, mask) + \
-            1 * self.loss_fn(imputation_cyc, target_cyc, torch.ones_like(imputation_cyc).bool()) + \
-            self.indiv_reg * regularisation
-    
-        self.log('regularisation', 
-                 regularisation,                  
-                 on_step=False,
-                 on_epoch=True,
-                 logger=True,
-                 prog_bar=False)
+        # Invariant node similarity
+        sim = self.loss_fn(output_invars_s[0][:n], output_invars_s[1][:n])
+
+        stack_mask = torch.cat([mask, mask])
+        loss = self.loss_fn(finpreds, fin_target, stack_mask) + \
+            self.y1 * self.loss_fn(finrecos, fin_target, (1-stack_mask)) + \
+            self.y2 * penalty + self.y3 * sim
         
         self.manual_backward(loss)
 
@@ -755,6 +660,8 @@ class GCNCycVirtualFiller(Filler):
 
         opt.step()
 
+        imputation = rearrange(finpreds, '(a b) t n d -> a b t n d', b=b)
+        imputation = torch.mean(imputation, dim=0)
         # Logging
         if self.scaled_target:
             imputation = self._postprocess(imputation, batch_preprocessing)
@@ -773,7 +680,8 @@ class GCNCycVirtualFiller(Filler):
         # Unpack batch
         batch_data, batch_preprocessing = self._unpack_batch(batch)
         batch_data["training"] = False
-
+        batch_data.pop("edge_index", None)
+        
         # Extract mask and target
         mask = batch_data.get('mask')
         eval_mask = batch_data.pop('eval_mask', None)
@@ -785,7 +693,7 @@ class GCNCycVirtualFiller(Filler):
         imputation = self.predict_batch(batch, preprocess=False, postprocess=False)
 
         # trim to imputation horizon len
-        imputation, mask, eval_mask, y = self.trim_seq(imputation, mask, eval_mask, y)
+        # imputation, mask, eval_mask, y = self.trim_seq(imputation, mask, eval_mask, y)
 
         if self.scaled_target:
             target = batch.transform['y'].transform(y)
@@ -812,6 +720,7 @@ class GCNCycVirtualFiller(Filler):
         # Unpack batch
         batch_data, batch_preprocessing = self._unpack_batch(batch)
         batch_data["training"] = False
+        batch_data.pop("edge_index", None)
 
         # Extract mask and target
         eval_mask = batch_data.pop('eval_mask', None)

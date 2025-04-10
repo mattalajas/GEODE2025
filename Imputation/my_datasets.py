@@ -6,11 +6,52 @@ import pandas as pd
 
 from tsl.data.datamodule.splitters import Splitter, disjoint_months
 from tsl.data.synch_mode import HORIZON
-from tsl.datasets.prototypes import DatetimeDataset
+from tsl.datasets.prototypes import DatetimeDataset, TabularDataset
 from tsl.datasets.prototypes.mixin import MissingValuesMixin
 from tsl.utils import download_url, extract_zip
 from tsl.ops.framearray import framearray_shape, framearray_to_numpy
+from tsl.ops.imputation import to_missing_values_dataset
 
+def add_missing_sensors(dataset: TabularDataset,
+                       p_noise=0.05,
+                       p_fault=0.01,
+                       min_seq=1,
+                       max_seq=10,
+                       seed=None,
+                       inplace=True,
+                       masked_sensors = []):
+    if seed is None:
+        seed = np.random.randint(1e9)
+    # Fix seed for random mask generation
+    random = np.random.default_rng(seed)
+
+    # Compute evaluation mask
+    shape = (dataset.length, dataset.n_nodes, dataset.n_channels)
+    if masked_sensors is None:
+        eval_mask = sample_mask(shape,
+                            p=p_fault,
+                            p_noise=p_noise,
+                            mode='road')
+        
+        dataset.p_fault = p_fault
+        dataset.p_noise = p_noise
+        dataset.min_seq = min_seq
+        dataset.max_seq = max_seq
+        dataset.seed = seed
+        dataset.random = random
+    else:
+        masked_sensors = list(masked_sensors)
+        eval_mask = np.zeros_like(dataset.mask)
+        eval_mask[:, masked_sensors] = dataset.mask[:, masked_sensors]
+
+    # Convert to missing values dataset
+    dataset = to_missing_values_dataset(dataset, eval_mask, inplace)
+
+    test2 = np.sum(dataset.mask, axis=(0))
+    test1 = np.sum(eval_mask, axis=(0))
+
+    # Store evaluation mask params in dataset
+    return dataset
 
 class AirQualitySplitter(Splitter):
 

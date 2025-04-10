@@ -5,10 +5,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from einops.layers.torch import Rearrange
-from Grin import get_dataset
+from einops import rearrange
+# from Grin import get_dataset
 from torch import Tensor, nn
 from torch.nn import MultiheadAttention
 from torch_geometric.utils import dense_to_sparse
+from torch_geometric.nn import SimpleConv
+from torch_geometric.nn.models import GCN
 from tsl import logger
 from tsl.data import ImputationDataset, SpatioTemporalDataModule
 from tsl.data.preprocessing import StandardScaler
@@ -23,14 +26,11 @@ from tsl.utils.casting import torch_to_numpy
 
 
 class UnnamedKrigModel(BaseModel):
-    return_type = tuple
-
     def __init__(self,
                  input_size,
                  hidden_size,
                  output_size,
                  adj,
-                 horizon,
                  exog_size,
                  enc_layers,
                  gcn_layers,
@@ -38,9 +38,11 @@ class UnnamedKrigModel(BaseModel):
                  encode_edges=False,
                  activation='softplus',
                  n_heads=8,
-                 device='cpu'):
+                 dropout=0,
+                 intervention_steps = 2):
         super(UnnamedKrigModel, self).__init__()
 
+        self.steps = intervention_steps
         input_size += exog_size
         self.input_encoder_fwd = RNN(input_size=input_size,
                                  hidden_size=hidden_size,
@@ -64,7 +66,7 @@ class UnnamedKrigModel(BaseModel):
                 nn.Linear(hidden_size, 1),
                 nn.Softplus(),
                 Rearrange('e f -> (e f)', f=1),
-            ).to(device)
+            )
         else:
             self.register_parameter('edge_encoder', None)
 
@@ -102,6 +104,22 @@ class UnnamedKrigModel(BaseModel):
                         activation=activation)
         
         self.multihead = MultiheadAttention(hidden_size, n_heads, batch_first=True)
+
+        self.init_pass = SimpleConv('mean', combine_root='sum')
+
+        self.gcn1 = GCN(in_channels=hidden_size,
+                        hidden_channels=hidden_size,
+                        num_layers=gcn_layers, 
+                        out_channels=output_size,
+                        dropout=dropout,
+                        norm='InstanceNorm')
+        self.gcn2 = GCN(in_channels=hidden_size,
+                        hidden_channels=hidden_size,
+                        num_layers=gcn_layers, 
+                        out_channels=output_size,
+                        dropout=dropout,
+                        norm='InstanceNorm')
+
         self.adj = adj
         self.adj_n1 = None
         self.adj_n2 = None
@@ -111,21 +129,24 @@ class UnnamedKrigModel(BaseModel):
                 x,
                 mask=None,
                 known_set=None,
-                sub_entry_num=None,
+                sub_entry_num=0,
                 edge_weight=None,
                 edge_features=None,
                 training=False,
                 reset=False,
-                u=None):
+                u=None,
+                predict=False,
+                transform=None):
         # x: [batches steps nodes features]
         # Unrandomised x, make sure this only has training nodes
         # x transferred here would be the imputed x
         # adj is the original 
         # mask is for nodes that need to get predicted, mask is also imputed 
-
+        b, t, n, _ = x.size()
         x = utils.maybe_cat_exog(x, u)
         device = x.device
-        o_adj = self.adj.clone().to(device)
+
+        o_adj = torch.tensor(self.adj).to(device)
 
         if training:
             o_adj = o_adj[known_set, :]
@@ -147,55 +168,21 @@ class UnnamedKrigModel(BaseModel):
             edge_weight = self.edge_encoder(edge_features)
 
         # forward encoding 
+        x_fwd = rearrange(x_fwd, 'b t n d -> (b t) n d')
         out_f = x_fwd
         for layer in self.gcn_layers_fwd:
             out_f = layer(out_f, edge_index, edge_weight)
         out_f = out_f + self.skip_con_fwd(x_fwd)
 
         # backward encoding
+        x_bwd = rearrange(x_bwd, 'b t n d -> (b t) n d')
         out_b = x_bwd
         for layer in self.gcn_layers_bwd:
             out_b = layer(out_b, edge_index, edge_weight)
         out_b = out_b + self.skip_con_bwd(x_bwd)
 
         # Concatenate backward and forward processes
-        sum_out = torch.cat([out_f, out_b], dim=3)
-
-        # ========================================
-        # Calculating variant and invariant features using self-attention across different nodes using their representations
-        # ========================================
-
-        # Query represents new matrix
-        query = self.query(sum_out)
-        key = self.key(sum_out)
-        value = self.value(sum_out)
-
-        adj_var = []
-        adj_invar = []
-        output_invars = []
-        output_vars = []
-
-        # Calculate cross attention between Q and K,V
-        # Do this for the two Queries 
-        for t in range(x.shape[1]):
-            q = query[:, t]
-            k = key[:, t]
-            v = value[:, t]
-
-            att_var, att_invar, output_invar, output_var = self.scaled_dot_product_attention(q, k, v, mask = o_adj)
-            
-            adj_var.append(att_var)
-            adj_invar.append(att_invar)
-            output_invars.append(output_invar)
-            output_vars.append(output_var)
-        
-        # [batch, time, nodes, nodes]
-        adj_var = torch.stack(adj_var).permute(1, 0, 2, 3).to(device)
-        adj_invar = torch.stack(adj_invar).permute(1, 0, 2, 3).to(device)
-        output_invars = torch.stack(output_invars).permute(1, 0, 2, 3).to(device)
-        output_vars = torch.stack(output_vars).permute(1, 0, 2, 3).to(device)
-            
-        # TODO: Check distributions after training
+        sum_out = torch.cat([out_f, out_b], dim=-1)
 
         # ========================================
         # Create new adjacency matrix 
@@ -205,14 +192,15 @@ class UnnamedKrigModel(BaseModel):
         # TODO: need to put this in the filler
         if training:
             if reset:
-                b, s, n, d = mask.size()
-
-                sub_entry = torch.zeros(b, s, sub_entry_num, d).to(device)
-                x = torch.cat([x, sub_entry], dim=2)  # b s n2 d
-                mask = torch.cat([mask, sub_entry], dim=2).byte()  # b s n2 d
+                # d = mask.shape[-1]
+                # sub_entry = torch.zeros(b, t, sub_entry_num, d).to(device)
+                # mask = torch.cat([mask, sub_entry], dim=2).byte()  # b s n2 d
+                # test = rearrange(mask, 'b t n d -> b n (t d)')
                 # y = torch.cat([y, sub_entry], dim=2)  # b s n2 d
 
                 adj_n1, adj_n2 = self.get_new_adj(o_adj, sub_entry_num)
+                adj_n1 = adj_n1
+                adj_n2 = adj_n2
             else:
                 if self.adj_n1 is None and self.adj_n2 is None:
                     adj_n1 = o_adj
@@ -222,38 +210,122 @@ class UnnamedKrigModel(BaseModel):
                     adj_n1 = self.adj_n1
                     adj_n2 = self.adj_n2
 
-        # Edge weights must be scaled down 
-        # Need to propagate this too
-        # Need to scale the new edges based on the probability of the softmax
-        # TODO: optimise this
-        b, t, n, _ = adj_invar.shape
-        adj_invar_exp_n1 = torch.stack([adj_n1]*t).to(device)
-        adj_invar_exp_n1 = torch.stack([adj_invar_exp_n1]*b)
-        adj_invar_exp_n1[:, :, :n, :n] = adj_invar
+            adjs = [adj_n1, adj_n2]
+        else:
+            adjs = [o_adj]
 
-        adj_invar_exp_n2 = torch.stack([adj_n2]*t).to(device)
-        adj_invar_exp_n2 = torch.stack([adj_invar_exp_n2]*b)
-        adj_invar_exp_n2[:, :, :n, :n] = adj_invar
+        finrecos = []
+        finpreds = []
+        fin_irm_all_s = []
+        output_invars_s = []
+        output_vars_s = []
 
-        adj_var_exp_n1 = torch.stack([adj_n1]*t).to(device)
-        adj_var_exp_n1 = torch.stack([adj_var_exp_n1]*b)
-        adj_var_exp_n1[:, :, :n, :n] = adj_var
+        for adj in adjs:
+            # ========================================
+            # Calculating variant and invariant features using self-attention across different nodes using their representations
+            # Adding the edge expansion here as well
+            # ========================================
+            bt, n, d = sum_out.shape
+            if sub_entry_num != 0:
+                sub_entry = torch.zeros(bt, sub_entry_num, d).to(device)
+                full_sum_out = torch.cat([sum_out, sub_entry], dim=1)  # b*t n2 d
+            else:
+                full_sum_out = sum_out
 
-        adj_var_exp_n2 = torch.stack([adj_n2]*t).to(device)
-        adj_var_exp_n2 = torch.stack([adj_var_exp_n2]*b)
-        adj_var_exp_n2[:, :, :n, :n] = adj_var
+            adj_l = dense_to_sparse(adj)
 
-        # Propagate variant and invariant features to new nodes features
+            t_mask = rearrange(mask, 'b t n d -> (b t) n d')
+            full_sum_out = self.init_pass(full_sum_out, adj_l[0], adj_l[1]) * (1 - t_mask) + full_sum_out
 
+            # Query represents new matrix of n1
+            query = self.query(full_sum_out)
+            key = self.key(full_sum_out)
+            value = self.value(full_sum_out)
+
+            # Calculate self attention between Q and K,V
+            # Do this for the two Queries 
+            adj_var, adj_invar, output_invars, output_vars = self.scaled_dot_product_attention(query, 
+                                                                                               key, 
+                                                                                               value,
+                                                                                               mask = adj)
+
+            output_invars_s.append(output_invars)
+            output_vars_s.append(output_vars)
+            # TODO: Check distributions after training
+
+            # Edge weights must be scaled down 
+            # Need to propagate this too
+            # Need to scale the new edges based on the probability of the softmax
+            # TODO: optimise this
+            # [batch, time, node, node]
+
+            # adj_invar_exp_n1 = torch.stack([adj_n1]*bt).to(device)
+            # adj_invar_exp_n1[:, :n, :n] = adj_invar
+            # adj_invar_exp_n2 = torch.stack([adj_n2]*bt).to(device)
+            # adj_invar_exp_n2[:, :n, :n] = adj_invar
+            # adj_var_exp_n1 = torch.stack([adj_n1]*bt).to(device)
+            # adj_var_exp_n1[:, :n, :n] = adj_var
+            # adj_var_exp_n2 = torch.stack([adj_n2]*bt).to(device)
+            # adj_var_exp_n2[:, :n, :n] = adj_var
+
+            # sub_entry = torch.zeros(bt, sub_entry_num, d).to(device)
+            # rep_invars = torch.cat([output_invars, sub_entry], dim=1)  # b*t n2 d
+            # rep_vars = torch.cat([output_vars, sub_entry], dim=1)  # b*t n2 d
+
+            # Use this to get similarity between the known nodes 
+            # rep_invars = (output_invars_n1 + output_invars_n2) / 2
+            # rep_vars = (output_vars_n1 + output_vars_n2) / 2
+
+            # Propagate variant and invariant features to new nodes features
+            invar_adj = dense_to_sparse(adj_invar)
+            var_adj = dense_to_sparse(adj_var)
+
+            t_mask = rearrange(t_mask, 'b n d -> (b n) d')
+            xh_inv = rearrange(output_invars, 'b n d -> (b n) d')
+            xh_var = rearrange(output_vars, 'b n d -> (b n) d')
+
+            # ========================================
+            # Final prediction
+            # ========================================
+            # With the final representations, predict the unknown nodes again, just using the invariant features
+            # Get reconstruction loss with pseudo labels 
+            batches = torch.arange(0, b).to(device=device)
+            batches = torch.repeat_interleave(batches, repeats=t*(n+sub_entry_num))
+
+            finrp = self.gcn1(xh_inv, invar_adj[0], invar_adj[1], batch=batches)
+            finrp = rearrange(finrp, '(b t n) d -> b t n d', b=b, t=t)
+            finpreds.append(finrp)
+            if not training and not predict:
+                return finpreds[0]
+
+            # ========================================
+            # Reconstruction model
+            # ========================================
+            # Shape: b*t*n, d
+
+            rec = xh_inv * (1 - t_mask)
+
+            # Predict the real nodes by propagating back using just the invariant features
+            # Get reconstruction loss
+            finr = self.gcn2(rec, invar_adj[0], invar_adj[1], batch=batches)
+            finr = rearrange(finr, '(b t n) d -> b t n d', b=b, t=t)
+            finrecos.append(finr)
+
+            # ========================================
+            # IRM model
+            # ========================================
+            # Predict the real nodes by propagating back using both variant and invariant features
+            # Get IRM loss
+            fin_irm_all = []
         
-        # ========================================
-        # Kriging model
-        # ========================================
-        # Predict the real nodes by propagating back using just the invariant features
-        # Get reconstruction loss
+            for _ in range(self.steps):
+                rands = torch.randperm(xh_var.shape[0])
+                rand_vars = xh_var[rands].detach()
+                fin_irm = self.gcn1(xh_inv + rand_vars, invar_adj[0], invar_adj[1], batch=batches)
+                fin_irm_all.append(rearrange(fin_irm, '(b t n) d -> b t n d', b=b, t=t))
 
-        # Predict the real nodes by propagating back using both variant and invariant features
-        # Get IRM loss
+            fin_irm_all = torch.cat(fin_irm_all)
+            fin_irm_all_s.append(fin_irm_all)
 
         # ========================================
         # Size regularisation
@@ -261,15 +333,11 @@ class UnnamedKrigModel(BaseModel):
         # Regularise both graphs using CMD using 
         # <https://proceedings.neurips.cc/paper_files/paper/2022/file/ceeb3fa5be458f08fbb12a5bb783aac8-Paper-Conference.pdf>
 
+        if training:
+            return finrecos, finpreds, fin_irm_all_s, output_invars_s, output_vars_s
+        elif predict:
+            return finrecos[0], finpreds[0], fin_irm_all_s[0], output_invars_s[0], output_vars_s[0], adj_invar[0], adj_var[0]
         
-        # ========================================
-        # Final prediction
-        # ========================================
-        # With the final representations, predict the unknown nodes again, just using the invariant features
-        # Get reconstruction loss with pseudo labels 
-
-        return out_f, out_b, (out_f+out_b), adj_invar, adj_var, adj_n2, adj_n1, output_invars
-
     def get_new_adj(self, adj, sub_entry_num):
         n1 = adj.shape[0]
         
@@ -304,8 +372,8 @@ class UnnamedKrigModel(BaseModel):
 
         n2 = n1 + sub_entry_num
         # Create matrices for both n1 and n2
-        adj_aug_n1 = torch.ones((n2, n2)).to(device = adj.device)  # n2, n2
-        adj_aug_n2 = torch.ones((n2, n2)).to(device = adj.device)  # n2, n2
+        adj_aug_n1 = torch.rand((n2, n2)).to(device = adj.device)  # n2, n2
+        adj_aug_n2 = torch.rand((n2, n2)).to(device = adj.device)  # n2, n2
 
         # preserve original observed parts in newly-created adj
         adj_aug_n1[:n1, :n1] = adj
@@ -379,81 +447,123 @@ class UnnamedKrigModel(BaseModel):
         return adj_aug_n1, adj_aug_n2
             
 
-    def scaled_dot_product_attention(self, Q, K, V, mask=None):
+    def scaled_dot_product_attention(self, Q, K, V, mask):
     # Compute the dot products between Q and K, then scale by the square root of the key dimension
         d_k = Q.size(-1)
-        scores_var = -torch.matmul(Q, K.transpose(-2, -1)) / torch.sqrt(torch.tensor(d_k, dtype=torch.float32))
-        scores_invar = torch.matmul(Q, K.transpose(-2, -1)) / torch.sqrt(torch.tensor(d_k, dtype=torch.float32))
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / torch.sqrt(torch.tensor(d_k, dtype=torch.float32))
+        # test = torch.rand_like(scores).to(device=scores.device)
 
         # Apply mask if provided (useful for masked self-attention in transformers)
         if mask is not None:
-            scores_var = scores_var.masked_fill(mask == 0, float('-inf'))
-            scores_invar = scores_invar.masked_fill(mask == 0, float('-inf'))
+            scores_invar = scores.masked_fill(mask == 0, float('-inf'))
+            scores_var = scores.masked_fill(mask == 0, float('inf'))
 
         # Softmax to normalize scores, producing attention weights
-        attention_weights_var = F.softmax(scores_var, dim=-1)
-        attention_weights_invar = F.softmax(scores_invar, dim=-1)
+        attention_weights_var = torch.nan_to_num(F.softmax(-scores_var, dim=-1), nan=0.0)
+        attention_weights_invar = torch.nan_to_num(F.softmax(scores_invar, dim=-1), nan=0.0)
 
         # Value should be aggregated using the attention weights as adjacency matrix weights
         output_invar = torch.matmul(attention_weights_invar, V)
         output_var = torch.matmul(attention_weights_var, V)
 
-        return attention_weights_var, attention_weights_invar, output_invar, output_var
+        # # ========================================
+        # # New edge generation
+        # # ========================================
+        # # Maybe add the active learning here
+        # # For now just randomly choose an entry from the 
+        # n = mask.shape[0]
+        # m = adj_mask.shape[0]
+        # batch = Q.shape[0]
+        # diff = m-n
 
-if __name__ == '__main__':
-    mask_s = list(range(0, 69))
-    known_set = [0, 13, 36, 37, 42]
-    dataset = get_dataset('metrla', p_noise=0.5, masked_s=mask_s)
-    # covariates = {'u': dataset.datetime_encoded('day').values}
-    adj = dataset.get_connectivity(method='distance', threshold=0.1, include_self=False, layout='dense', force_symmetric=True)
-    adj_list = dataset.get_connectivity(method='distance', threshold=0.1, include_self=False, force_symmetric=True)
+        # exp_att_var = torch.ones((batch, m, m)).to(device=Q.device)
+        # exp_att_inv = torch.ones((batch, m, m)).to(device=Q.device)
+        # exp_list = [exp_att_var, exp_att_inv]
 
-    adj_weights = torch.tensor(adj_list[1])
-    adj_list_t = torch.tensor(adj_list[0])
-    adj = torch.tensor(adj)
+        # # Randomly choose from the existing edges to impute the immediate missing edge weights
+        # for i in range(n):
+        #     for ind, scores in enumerate([scores_var, scores_invar]):
+        #         original = scores[:, i]
+        #         valid_mask = original != float('-inf')
+                
+        #         safe_tensor = torch.where(valid_mask, original, torch.tensor(0.0))
 
-    torch_dataset = ImputationDataset(target=dataset.dataframe(),
-                                        mask=dataset.training_mask,
-                                        eval_mask=dataset.eval_mask,
-                                    #   covariates=covariates,
-                                        transform=MaskInput(),
-                                        connectivity=adj,
-                                        window=12,
-                                        stride=1)
+        #         valid_counts = valid_mask.sum(dim=1)
+        #         sorted_indices = torch.argsort(~valid_mask.cpu(), dim=1).to(device=Q.device)
+        #         sorted_values = torch.gather(safe_tensor, dim=1, index=sorted_indices)
 
-    scalers = {'target': StandardScaler(axis=(0, 1))}
-
-    dm = SpatioTemporalDataModule(
-        dataset=torch_dataset,
-        scalers=scalers,
-        splitter=dataset.get_splitter(val_len= 0.1, test_len= 0.2),
-        batch_size=128,
-        workers=0)
-    dm.setup(stage='fit')
-
-    batch = next(iter(dm.train_dataloader()))
-
-    input_size = 1
-    hidden_size = 128
-    output_size = 1
-    horizon = 12
-    exog_size = 0
-    enc_layers = 2
-    gcn_layers = 1
-
-    model = UnnamedKrigModel(input_size=input_size,
-                        hidden_size=hidden_size,
-                        output_size=output_size,
-                        horizon=horizon,
-                        exog_size=exog_size,
-                        enc_layers=enc_layers,
-                        gcn_layers=gcn_layers,
-                        adj=adj)
+        #         max_valid = valid_counts.max()
+        #         rand_idx = torch.randint(0, max_valid, (batch, m)).to(device=Q.device)
     
-    x = batch['x'][:, :, known_set, :]
-    mask = batch['mask'][:, :, known_set, :]
-    sub_entry_num = 2
+        #         clamped_idx = torch.minimum(rand_idx, valid_counts.unsqueeze(1) - 1)
 
-    out_f, out_b, _, adj_invar_exp_n1, adj_invar_exp_n2, adj_var_exp_n2, \
-        adj_var_exp_n2, output_invars = model(x=x, edge_weight=None, sub_entry_num=sub_entry_num,
-                                              mask=mask, known_set=known_set, training=True, reset=True)
+        #         # Now gather using clamped indices
+        #         batch_idx = torch.arange(batch).unsqueeze(1).expand(-1, m)
+        #         exp_list[ind][:, i, :] = sorted_values[batch_idx, clamped_idx]
+
+        # exp_att_var[:, :n, :n] = scores_var.detach()
+        # exp_att_inv[:, :n, :n] = scores_invar.detach()
+
+
+        return attention_weights_var.detach(), attention_weights_invar.detach(), output_invar, output_var
+
+# if __name__ == '__main__':
+#     mask_s = list(range(0, 69))
+#     known_set = list(range(69, 207))
+#     dataset = get_dataset('metrla', p_noise=0.5, masked_s=mask_s)
+#     # covariates = {'u': dataset.datetime_encoded('day').values}
+#     adj = dataset.get_connectivity(method='distance', threshold=0.1, include_self=False, layout='dense', force_symmetric=True)
+#     adj_list = dataset.get_connectivity(method='distance', threshold=0.1, include_self=False, force_symmetric=True)
+
+#     adj_weights = torch.tensor(adj_list[1])
+#     adj_list_t = torch.tensor(adj_list[0])
+#     adj = torch.tensor(adj)
+
+#     torch_dataset = ImputationDataset(target=dataset.dataframe(),
+#                                         mask=dataset.training_mask,
+#                                         eval_mask=dataset.eval_mask,
+#                                     #   covariates=covariates,
+#                                         transform=MaskInput(),
+#                                         connectivity=adj,
+#                                         window=12,
+#                                         stride=1)
+
+#     scalers = {'target': StandardScaler(axis=(0, 1))}
+
+#     dm = SpatioTemporalDataModule(
+#         dataset=torch_dataset,
+#         scalers=scalers,
+#         splitter=dataset.get_splitter(val_len= 0.1, test_len= 0.2),
+#         batch_size=64,
+#         workers=0)
+#     dm.setup(stage='fit')
+
+#     batch = next(iter(dm.train_dataloader()))
+
+#     input_size = 1
+#     hidden_size = 128
+#     output_size = 1
+#     horizon = 12
+#     exog_size = 0
+#     enc_layers = 2
+#     gcn_layers = 2
+#     dropout=0.4
+#     S=3
+
+#     model = UnnamedKrigModel(input_size=input_size,
+#                         hidden_size=hidden_size,
+#                         output_size=output_size,
+#                         exog_size=exog_size,
+#                         enc_layers=enc_layers,
+#                         gcn_layers=gcn_layers,
+#                         adj=adj,
+#                         dropout=0.4,
+#                         S=3,
+#                         device='cuda:3')
+    
+#     x = batch['x'][:, :, known_set, :].to(device='cuda:3')
+#     mask = batch['mask'][:, :, known_set, :].to(device='cuda:3')
+#     sub_entry_num = 69
+
+#     finrecos, finpreds, fin_irm_all_s, output_invars_s, output_vars_s = model(x=x, edge_weight=None, sub_entry_num=sub_entry_num,
+#                                               mask=mask, known_set=known_set, training=True, reset=True)
