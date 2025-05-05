@@ -35,6 +35,37 @@ def get_neighbors(g):
             adj[node1] = [node2]
     return adj
 
+def kernel(X, mul_fac=2.0, n_ker=5, eps=1e-8):
+    L2_distances = torch.cdist(X, X) ** 2
+    bandwidth_multipliers = mul_fac ** (torch.arange(n_ker).to(X.device) - n_ker // 2)
+    n_samples = L2_distances.shape[0]
+    bandwidth = L2_distances.data.sum() / (n_samples ** 2 - n_samples) + eps
+
+    return torch.exp(-L2_distances[None, ...] / (bandwidth * bandwidth_multipliers)[:, None, None]).sum(dim=0)
+
+def mmd_loss(X_n, Y_n):
+    mmd_losses = []
+
+    for node in range(X_n.size(0)):
+        K = kernel(torch.vstack([X_n[node], Y_n[node]]))
+
+        X_size = X_n[node].shape[0]
+        XX = K[:X_size, :X_size].mean()
+        XY = K[:X_size, X_size:].mean()
+        YY = K[X_size:, X_size:].mean()
+
+        mmd_losses.append(XX - 2 * XY + YY)
+
+    return torch.stack(mmd_losses).mean()
+
+def batchwise_min_max_scale(x, eps=1e-8):
+    x_min = x.view(x.size(0), -1).min(dim=1, keepdim=True).values  # [batch, 1]
+    x_max = x.view(x.size(0), -1).max(dim=1, keepdim=True).values  # [batch, 1]
+
+    x_min = x_min.view(-1, 1, 1)  # [batch, 1, 1]
+    x_max = x_max.view(-1, 1, 1)  # [batch, 1, 1]
+
+    return (x - x_min) / (x_max - x_min + eps)
 
 def TMD(g1, g2, w, L=4):
     '''
