@@ -62,9 +62,11 @@ class SpatialConvOrderK(nn.Module):
             support = [support]
         for a in support:
             x1 = torch.einsum('ncvl,wv->ncwl', (x, a)).contiguous()
+            # x1 = torch.einsum('ncvl,nwvl->ncwl', (x, a)).contiguous()
             out.append(x1)
             for k in range(2, self.order + 1):
                 x2 = torch.einsum('ncvl,wv->ncwl', (x1, a)).contiguous()
+                # x2 = torch.einsum('ncvl,nwvl->ncwl', (x1, a)).contiguous()
                 out.append(x2)
                 x1 = x2
         out = torch.cat(out, dim=1)
@@ -75,9 +77,11 @@ class SpatialConvOrderK(nn.Module):
                 support_diag = [support_diag]
             for a in support_diag:
                 x1 = torch.einsum('ncvl,wv->ncwl', (x, a)).contiguous()
+                # x1 = torch.einsum('ncvl,nwvl->ncwl', (x, a)).contiguous()
                 out_diag.append(x1)
                 for k in range(2, self.order + 1):
                     x2 = torch.einsum('ncvl,wv->ncwl', (x1, a)).contiguous()
+                    # x2 = torch.einsum('ncvl,nwvl->ncwl', (x1, a)).contiguous()
                     out_diag.append(x2)
                     x1 = x2
             out_diag = torch.cat(out_diag, dim=1)
@@ -174,10 +178,8 @@ class KITS(BaseModel):
             supp_update.append(s)
         return supp_update
 
-    def forward(self, x, mask=None, known_set=None, sub_entry_num=None, reset=False, training=False, 
+    def forward(self, x, mask=None, known_set=None, sub_entry_num=None, reset=False, training=False,
                 edge_weight = None, edge_index = None, u = None, transform=None):
-        test1 = (torch.sum(mask, dim=(0, 1)))
-        test = (torch.sum(x, dim=(0, 1)))
         adj = self.adj.clone().to(device=x.device)  # adjacency matrix
 
         # # Do residual
@@ -204,29 +206,29 @@ class KITS(BaseModel):
                 n1 = adj.size(0)
 
                 # get the 1-hop neighbors of each observed entry.
-                if self.obs_neighbors is None:
-                    obs_neighbors = {}
-                    neighbors_2h = {}
+                # if self.obs_neighbors is None:
+                obs_neighbors = {}
+                neighbors_2h = {}
 
-                    # Get two hop diagonal
-                    sp_adj = adj.to_sparse_coo()
-                    two_hops = torch.mm(sp_adj, sp_adj).to_dense()
-                    two_hops = two_hops.fill_diagonal_(0)
+                # Get two hop diagonal
+                sp_adj = adj.to_sparse_coo()
+                two_hops = torch.mm(sp_adj, sp_adj).to_dense()
+                two_hops = two_hops.fill_diagonal_(0)
 
-                    for i in range(n1):
-                        row_nonzero = set(torch.where(adj[i, :] > 0)[0].detach().cpu().numpy().tolist())
-                        col_nonzero = set(torch.where(adj[:, i] > 0)[0].detach().cpu().numpy().tolist())
-                        nonzero = row_nonzero.union(col_nonzero)
+                for i in range(n1):
+                    row_nonzero = set(torch.where(adj[i, :] > 0)[0].detach().cpu().numpy().tolist())
+                    col_nonzero = set(torch.where(adj[:, i] > 0)[0].detach().cpu().numpy().tolist())
+                    nonzero = row_nonzero.union(col_nonzero)
 
-                        row_n_2 = set(torch.nonzero(two_hops[i]).squeeze(1).tolist())
-                        col_n_2 = set(torch.nonzero(two_hops[:, i]).squeeze(1).tolist())
-                        all_n_2 = row_n_2.union(col_n_2)
-                        all_n = all_n_2.union(nonzero)
+                    row_n_2 = set(torch.nonzero(two_hops[i]).squeeze(1).tolist())
+                    col_n_2 = set(torch.nonzero(two_hops[:, i]).squeeze(1).tolist())
+                    all_n_2 = row_n_2.union(col_n_2)
+                    all_n = all_n_2.union(nonzero)
 
-                        obs_neighbors[i] = list(nonzero)  # 1-hop neighbors
-                    self.obs_neighbors = obs_neighbors
-                else:
-                    obs_neighbors = self.obs_neighbors  # n1, n1, note that cannot use copy!!!
+                    obs_neighbors[i] = list(nonzero)  # 1-hop neighbors
+                self.obs_neighbors = obs_neighbors
+                # else:
+                #     obs_neighbors = self.obs_neighbors  # n1, n1, note that cannot use copy!!!
 
                 # ========================================
                 # Create dynamic adjacency matrix
@@ -289,6 +291,10 @@ class KITS(BaseModel):
                 else:
                     adj_aug = adj
             adj = adj_aug.detach()
+        else:
+            if known_set is not None:
+                adj = adj[known_set, :]
+                adj = adj[:, known_set] 
 
         supp = SpatialConvOrderK.compute_support(adj)
 
@@ -316,12 +322,24 @@ class KITS(BaseModel):
         imputation = F.unfold(imputation, kernel_size=(self.t_dim, n), padding=(self.t_dim // 2, 0), stride=(1, 1))
         imputation = imputation.reshape(b, self.t_dim * d, -1, s)  # b d n' s
         supp_drop = self.adj_drop(supp, mask)
+        
+        # for ind in range(len(supp_drop)):
+        #     suppx = supp_drop[ind].expand(b, -1, -1)
+        #     suppx = suppx.expand(s, -1, -1, -1)
+        #     supp_drop[ind] = rearrange(suppx, 's b n m -> b n m s')
+
         imputation = self.relu(self.gcn_1(imputation, supp_drop))
 
         imputation = rearrange(imputation, 'b d n s -> b d s n')
         imputation = F.unfold(imputation, kernel_size=(self.t_dim, n), padding=(self.t_dim // 2, 0), stride=(1, 1))
         imputation = imputation.reshape(b, self.t_dim * d, -1, s)  # b d n' s
         supp_drop = self.adj_drop(supp, mask)
+
+        # for ind in range(len(supp_drop)):
+        #     suppx = supp_drop[ind].expand(b, -1, -1)
+        #     suppx = suppx.expand(s, -1, -1, -1)
+        #     supp_drop[ind] = rearrange(suppx, 's b n m -> b n m s')
+        
         imputation = self.relu(self.gcn_2(imputation, supp_drop))
 
         # cross reference
@@ -373,6 +391,12 @@ class KITS(BaseModel):
         imputation = F.unfold(imputation, kernel_size=(self.t_dim, n), padding=(self.t_dim // 2, 0), stride=(1, 1))
         imputation = imputation.reshape(b, self.t_dim * d, -1, s)  # b d n' s
         supp_drop = self.adj_drop(supp, mask)
+        
+        # for ind in range(len(supp_drop)):
+        #     suppx = supp_drop[ind].expand(b, -1, -1)
+        #     suppx = suppx.expand(s, -1, -1, -1)
+        #     supp_drop[ind] = rearrange(suppx, 's b n m -> b n m s')
+        
         imputation = self.relu(self.gcn_3(imputation, supp_drop))
 
         imputation = rearrange(imputation, 'b d n s -> b s n d')

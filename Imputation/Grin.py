@@ -1,3 +1,4 @@
+import argparse
 import torch
 from omegaconf import DictConfig
 from pytorch_lightning import Trainer
@@ -141,11 +142,10 @@ def run_imputation(cfg: DictConfig):
     if cfg.model.name == 'kits':
         model_kwargs = dict(adj=adj, d_in=dm.n_channels, n_nodes=dm.n_nodes, args=cfg.model)
     elif cfg.model.name == 'unkrig':
-        model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels)
+        model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
     else:
         model_kwargs = dict(n_nodes=torch_dataset.n_nodes,
                             input_size=torch_dataset.n_channels)
-                            # ,exog_size=torch_dataset.input_map.u.shape[-1])
 
     model_cls.filter_model_args_(model_kwargs)
 
@@ -200,6 +200,7 @@ def run_imputation(cfg: DictConfig):
                                     scheduler_kwargs=scheduler_kwargs,
                                     gradient_clip_val=cfg.grad_clip_val,
                                     gradient_clip_algorithm=cfg.grad_clip_alg,
+                                    known_set = [i for i in range(adj.shape[0]) if i not in cfg.dataset.get('masked_sensors')],
                                     **cfg.model.regs)
     else:
         imputer = Imputer(model_class=model_cls,
@@ -235,16 +236,18 @@ def run_imputation(cfg: DictConfig):
     # training                             #
     ########################################
 
-    early_stop_callback = EarlyStopping(monitor='val_mae',
+    early_stop_callback = EarlyStopping(monitor='val_loss',
                                         patience=cfg.patience,
                                         mode='min')
 
     checkpoint_callback = ModelCheckpoint(
         dirpath=cfg.run.dir,
         save_top_k=1,
-        monitor='val_mae',
+        save_last=True,
+        monitor='val_loss',
         mode='min',
     )
+    checkpoint_callback.CHECKPOINT_NAME_LAST = "{epoch}-last"
 
     if cfg.model.name =='kits' or cfg.model.name =='unkrig':
         trainer = Trainer(
@@ -254,7 +257,7 @@ def run_imputation(cfg: DictConfig):
             accelerator='gpu' if torch.cuda.is_available() else 'cpu',
             devices=cfg.device,
             callbacks=[early_stop_callback, checkpoint_callback],
-            detect_anomaly=True)
+            detect_anomaly=False)
     else:
         trainer = Trainer(
             max_epochs=cfg.epochs,
@@ -267,7 +270,7 @@ def run_imputation(cfg: DictConfig):
             callbacks=[early_stop_callback, checkpoint_callback])
 
 
-    trainer.fit(imputer, datamodule=dm)
+    trainer.fit(imputer, datamodule=dm, ckpt_path=cfg.call_path)
 
     ########################################
     # testing                              #
@@ -296,15 +299,16 @@ def run_imputation(cfg: DictConfig):
                            output.get('eval_mask', None))
     res.update(
         dict(val_mae=numpy_metrics.mae(y_hat, y_true, mask),
-             val_rmse=numpy_metrics.rmse(y_hat, y_true, mask),
+             val_mre=numpy_metrics.mre(y_hat, y_true, mask),
              val_mape=numpy_metrics.mape(y_hat, y_true, mask),
-             val_mse=numpy_metrics.mse(y_hat, y_true, mask)))
+             val_mse=numpy_metrics.mse(y_hat, y_true, mask),
+             val_rmse=numpy_metrics.rmse(y_hat, y_true, mask)))
 
     return res
 
 
 if __name__ == '__main__':
-    torch.autograd.set_detect_anomaly(True)
+    # torch.autograd.set_detect_anomaly(True)
     exp = Experiment(run_fn=run_imputation, config_path='config', config_name='default')
     print(exp)
     res = exp.run()
