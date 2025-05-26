@@ -172,3 +172,5 @@ models
 plots
 logs
 lightning_logs
+pipenv_gfn
+pipenv_test
