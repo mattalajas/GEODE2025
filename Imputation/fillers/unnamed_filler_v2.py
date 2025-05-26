@@ -12,7 +12,7 @@ from torchmetrics import MetricCollection
 from tsl import logger
 from tsl.metrics.torch import MaskedMetric
 from tsl.metrics.torch.functional import mre
-from utils import mmd_loss
+from utils import mmd_loss, mmd_loss_single
 
 warnings.filterwarnings("ignore")
 
@@ -25,7 +25,7 @@ def ensure_list(obj):
     else:
         return [obj]
 
-class Filler(pl.LightningModule):
+class unKrigFillerV2(pl.LightningModule):
     def __init__(self,
                  model_class,
                  model_kwargs,
@@ -51,8 +51,9 @@ class Filler(pl.LightningModule):
         :param scheduler_class: Scheduler class.
         :param scheduler_kwargs: Scheduler's keyword arguments.
         """
-        super(Filler, self).__init__()
-        self.save_hyperparameters(ignore=['loss_fn'], logger=False)
+        super(unKrigFillerV2, self).__init__()
+        self.save_hyperparameters(ignore=['loss_fn_1'], logger=False)
+        self.save_hyperparameters(ignore=['loss_fn_2'], logger=False)
         self.model_cls = model_class
         self.model_kwargs = model_kwargs
         self.optim_class = optim_class
@@ -66,9 +67,11 @@ class Filler(pl.LightningModule):
             self.scheduler_kwargs = scheduler_kwargs
 
         if loss_fn is not None:
-            self.loss_fn = self._check_metric(loss_fn, on_step=True)
+            self.loss_fn_1 = self._check_metric(loss_fn[0], on_step=True)
+            self.loss_fn_2 = self._check_metric(loss_fn[1], on_step=True)
         else:
-            self.loss_fn = None
+            self.loss_fn_1 = None
+            self.loss_fn_2 = None
 
         self.scaled_target = scaled_target
 
@@ -129,7 +132,6 @@ class Filler(pl.LightningModule):
     def predict_step(self, batch, batch_idx, dataloader_idx=None):
         batch_data, batch_preprocessing = self._unpack_batch(batch)
         batch_data["training"] = False
-        batch_data["predict"] = True
 
         # if self.known_set is None:
             # Get observed entries (nonzero masks across time)
@@ -146,6 +148,7 @@ class Filler(pl.LightningModule):
         known_set = known_set.detach().cpu().numpy().tolist()
 
         batch_data["sub_entry_num"] = len(unknown_set)
+        batch_data["masked_set"] = unknown_set.detach().cpu().numpy().tolist()
         #     else:
         #         known_set = list(range(batch_data['mask'].shape[2]))
         # else:
@@ -166,11 +169,11 @@ class Filler(pl.LightningModule):
 
         # Compute outputs and rescale
         # finpreds, _, inv_adj, var_adj, sum_out = self.predict_batch(batch, preprocess=False, postprocess=True)
-        finpreds, inv_adj, var_adj = self.predict_batch(batch, preprocess=False, postprocess=True)
-        inv_adj = inv_adj[:, reverse, :]
-        inv_adj = inv_adj[:, :, reverse]
-        var_adj = var_adj[:, reverse, :]
-        var_adj = var_adj[:, :, reverse]
+        finpreds, _, _ = self.predict_batch(batch, preprocess=False, postprocess=True)
+        # inv_adj = inv_adj[:, reverse, :]
+        # inv_adj = inv_adj[:, :, reverse]
+        # var_adj = var_adj[:, reverse, :]
+        # var_adj = var_adj[:, :, reverse]
 
         finpreds = finpreds[:, :, reverse, :]
         mask = mask[:, :, reverse, :]
@@ -179,11 +182,11 @@ class Filler(pl.LightningModule):
         output = dict(y=y,
                       y_hat=finpreds,
                       mask=mask,
-                      eval_mask=eval_mask,
+                      eval_mask=eval_mask)
                     #   invars=output_invars_s[0],
                     #   vars=output_vars_s[0],
-                      inv_adj=inv_adj,
-                      var_adj=var_adj)
+                    #   inv_adj=inv_adj,
+                    #   var_adj=var_adj)
                     #   sum_out=sum_out)
         return output
 
@@ -260,17 +263,12 @@ class Filler(pl.LightningModule):
             y_hat = self.forward(**batch_data)
         # Rescale outputs
         if postprocess:
-            if len(y_hat) != 3:
-                y_hat = self._postprocess(y_hat, batch_preprocessing)
-            else:
-                fpred, adjinv, adjvar = y_hat
-                fpred = self._postprocess(fpred, batch_preprocessing)
-                y_hat = [fpred, adjinv, adjvar]
+            y_hat = self._postprocess(y_hat, batch_preprocessing)
         if return_target:
             y = batch_data.get('y')
             mask = batch_data.get('mask', None)
             return y, y_hat, mask
-        return y_hat
+        return y_hat, None, None
 
     def predict_loader(self, loader, preprocess=False, postprocess=True, return_mask=True):
         """
@@ -290,7 +288,7 @@ class Filler(pl.LightningModule):
             eval_mask = batch_data.pop('eval_mask', None)
             y = batch_data.pop('y')
 
-            y_hat = self.predict_batch(batch, preprocess=preprocess, postprocess=postprocess)
+            y_hat, _, _ = self.predict_batch(batch, preprocess=preprocess, postprocess=postprocess)
 
             if isinstance(y_hat, (list, tuple)):
                 y_hat = y_hat[0]
@@ -323,18 +321,23 @@ class Filler(pl.LightningModule):
             self.log(f'lr_{i}', lr, on_step=False, on_epoch=True, logger=True, prog_bar=False)
 
     def configure_optimizers(self):
-        cfg = dict()
-        optimizer = self.optim_class(self.parameters(), **self.optim_kwargs)
-        cfg['optimizer'] = optimizer
-        if self.scheduler_class is not None:
-            metric = self.scheduler_kwargs.pop('monitor', None)
-            scheduler = self.scheduler_class(optimizer, **self.scheduler_kwargs)
-            cfg['lr_scheduler'] = scheduler
-            if metric is not None:
-                cfg['monitor'] = metric
-        return cfg
+        cfgs = []
 
-class UnnamedKrigFillerV2(Filler):
+        for ind, val in enumerate(self.optim_class):
+            cfg = dict()
+            optimizer = val(self.parameters(), **self.optim_kwargs[ind])
+            cfg['optimizer'] = optimizer
+            if self.scheduler_class is not None:
+                metric = self.scheduler_kwargs.pop('monitor', None)
+                scheduler = self.scheduler_class(optimizer, **self.scheduler_kwargs)
+                cfg['lr_scheduler'] = scheduler
+                if metric is not None:
+                    cfg['monitor'] = metric
+            cfgs.append(cfg)
+
+        return cfgs
+
+class UnnamedKrigFillerV2(unKrigFillerV2):
     def __init__(self,
                  model_class,
                  model_kwargs,
@@ -351,7 +354,7 @@ class UnnamedKrigFillerV2(Filler):
                  inductive=True,
                  gradient_clip_val=None,
                  gradient_clip_algorithm=None,
-                 known_set=None,
+                 known_set=[],
                  y1 = 1,
                  y2 = 1,
                  y3 = 1):
@@ -380,6 +383,7 @@ class UnnamedKrigFillerV2(Filler):
         self.train_set = known_set
         self.val_set = []
         self.e_start = True
+        # self.ratio = 0.
 
     def trim_seq(self, *seq):
         seq = [s[:, self.trimming[0]:s.size(1) - self.trimming[1]] for s in seq]
@@ -431,6 +435,9 @@ class UnnamedKrigFillerV2(Filler):
                  prog_bar=False,
                  **kwargs)
 
+    # def on_train_epoch_start(self):
+    #     self.e_start = True
+
     def on_train_batch_start(self, batch, batch_idx):
         if self.e_start:
             batch_data, batch_preprocessing = self._unpack_batch(batch)
@@ -459,7 +466,7 @@ class UnnamedKrigFillerV2(Filler):
     # Experimental
     def training_step(self, batch, batch_idx):
         # Unpack batch
-        opt = self.optimizers()
+        opt1, opt2 = self.optimizers()
         batch_data, batch_preprocessing = self._unpack_batch(batch)
 
         # To make the model inductive
@@ -555,11 +562,11 @@ class UnnamedKrigFillerV2(Filler):
         batch_data["training"] = True
 
         # Compute predictions and compute loss
-        res = self.predict_batch(batch, preprocess=False, postprocess=False)
-        finpreds, finrecos, fin_irm_all_s, output_invars_s, output_vars_s = res[0], res[1], res[2], res[3], res[4]
+        res, _, _ = self.predict_batch(batch, preprocess=False, postprocess=False)
+        finpreds, finrecos, fin_irm_all_s = res[0], res[1], res[2]
         # finrecos = torch.cat(finrecos)
-        finpreds = torch.cat(finpreds)
-        fin_irm_all_s = torch.cat(fin_irm_all_s)
+        # finpreds = torch.cat(finpreds)
+        # fin_irm_all_s = torch.cat(fin_irm_all_s)
 
         b = x.shape[0]
         if self.scaled_target:
@@ -573,7 +580,7 @@ class UnnamedKrigFillerV2(Filler):
         # fin_irm_all_s = rearrange(fin_irm_all_s, '(a b s) t n d -> a s b t n d', b=b, a=2)
         # fin_target = torch.cat([target, target])
 
-        opt.zero_grad()
+        opt1.zero_grad()
 
         # IRM Loss
         irm_target = target[:, :, :len(train_set)]
@@ -583,38 +590,36 @@ class UnnamedKrigFillerV2(Filler):
         for i in range(steps):
             env_loss = torch.cat(
                         [env_loss,
-                         self.loss_fn(fin_irm_all_s[i], irm_target, irm_mask.bool()).unsqueeze(0)])
-            # env_loss = torch.cat(
-            #             [env_loss,
-            #              self.loss_fn(fin_irm_all_s[1, i], target, mask).unsqueeze(0)])
+                         self.loss_fn_1(fin_irm_all_s[i], irm_target, irm_mask.bool()).unsqueeze(0)])
         env_mean = env_loss.mean()
         env_var = torch.var(env_loss * steps)
         irm_loss = env_var + env_mean
 
-        # Invariant node similarity
-        # sim = self.loss_fn(finrecos[0][:n], finrecos[1][:n])
-
-        # stack_mask = torch.cat([mask, mask])
-        stack_mask = eval_mask
-
-        # recon_loss = self.loss_fn(finrecos, finpreds, torch.ones_like(finpreds).bool())
         # MMD Loss
         mmds = torch.tensor([]).to(x.device)
         for reco in finrecos:
             # MMD for inv 
-            mmds = torch.cat([mmds, max(0, mmd_loss(reco[0], reco[2])).unsqueeze(0)])
-            mmds = torch.cat([mmds, max(0, mmd_loss(reco[1], reco[3])).unsqueeze(0)])
+            mmds = torch.cat([mmds, torch.clamp(mmd_loss(reco[0], reco[2]), min=0).unsqueeze(0)])
+            mmds = torch.cat([mmds, torch.clamp(mmd_loss(reco[1], reco[3]), min=0).unsqueeze(0)])
+
+        # mmds = torch.tensor([]).to(x.device)
+        # true_embs = finrecos.pop(0)
+        # for reco in finrecos:
+        #     # MMD for inv 
+        #     mmds = torch.cat([mmds, torch.clamp(mmd_loss(true_embs[0], reco[0]), min=0).unsqueeze(0)])
+        #     mmds = torch.cat([mmds, torch.clamp(mmd_loss(true_embs[1], reco[1]), min=0).unsqueeze(0)])
+
         recon_loss = mmds.mean()
 
-        main_loss = self.loss_fn(finpreds, target, stack_mask.bool()) 
+        main_loss = self.loss_fn_1(finpreds, target, eval_mask.bool()) 
         loss = main_loss + self.y1 * recon_loss + self.y2 * irm_loss
         
         self.manual_backward(loss)
 
         if self.gradient_clip_algorithm and self.gradient_clip_val:
-            self.clip_gradients(opt, gradient_clip_val=self.gradient_clip_val, gradient_clip_algorithm=self.gradient_clip_algorithm)
+            self.clip_gradients(opt1, gradient_clip_val=self.gradient_clip_val, gradient_clip_algorithm=self.gradient_clip_algorithm)
 
-        opt.step()
+        opt1.step()
 
         imputation = rearrange(finpreds, '(a b) t n d -> a b t n d', b=b)
         imputation = torch.mean(imputation, dim=0)
@@ -705,7 +710,7 @@ class UnnamedKrigFillerV2(Filler):
         y = y[:, :, known_set, :]
 
         # Compute predictions and compute loss
-        imputation = self.predict_batch(batch, preprocess=False, postprocess=False)
+        imputation, _, _ = self.predict_batch(batch, preprocess=False, postprocess=False)
         # reverse = reverse.to(imputation.device)
         # imputation = imputation[:, :, reverse, :]
 
@@ -718,7 +723,7 @@ class UnnamedKrigFillerV2(Filler):
             target = y
             imputation = self._postprocess(imputation, batch_preprocessing)
 
-        val_loss = self.loss_fn(imputation, target, eval_mask)
+        val_loss = self.loss_fn_1(imputation, target, eval_mask)
 
         # Logging
         if self.scaled_target:
@@ -738,8 +743,7 @@ class UnnamedKrigFillerV2(Filler):
         batch_data, batch_preprocessing = self._unpack_batch(batch)
         batch_data["training"] = False
         batch_data.pop("edge_index", None)
-        batch_data["unmasked_set"] = None
-        batch_data["masked_set"] = None
+        
 
         # if self.known_set is None:
         #     # Get observed entries (nonzero masks across time)
@@ -764,6 +768,7 @@ class UnnamedKrigFillerV2(Filler):
         batch_data["known_set"] = known_set
         x = batch_data["x"]
         batch_data["x"] = x[:, :, known_set, :]
+        batch_data["masked_set"] = unknown_set.detach().cpu().numpy().tolist()
 
         mask = batch_data["mask"]
         mask = mask[:, :, arrange, :]
@@ -774,9 +779,9 @@ class UnnamedKrigFillerV2(Filler):
         y = batch_data.pop('y')
 
         # Compute outputs and rescale
-        imputation = self.predict_batch(batch, preprocess=False, postprocess=True)
+        imputation, _, _ = self.predict_batch(batch, preprocess=False, postprocess=True)
         imputation = imputation[:, :, reverse, :]
-        test_loss = self.loss_fn(imputation, y, eval_mask)
+        test_loss = self.loss_fn_1(imputation, y, eval_mask)
 
         # Logging
         self.test_metrics.update(imputation.detach(), y, eval_mask)

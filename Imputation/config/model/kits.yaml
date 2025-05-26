@@ -2,7 +2,14 @@ name: 'kits'
 hparams:
   d_hidden: 64
 
-inductive: False
 use_adj_drop: False
 use_init: False
 
+technique:
+  inductive: True
+  randomise: False
+  # start_active: 10
+  # storage_size: 50
+  # distance_metric: 'kl'
+  # graph_feature: 'n_degree'
+  # # individual_reg: 0.1

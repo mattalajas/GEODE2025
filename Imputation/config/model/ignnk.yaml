@@ -1,0 +1,6 @@
+name: 'ignnk'
+hparams:
+  n_o_n_m: 150 #sampled space dimension
+  z: 100 #hidden dimension for graph convolution
+  K: 1 #If using diffusion convolution, the actual diffusion convolution step is K+1
+  E_maxvalue: 80 #the max value from experience

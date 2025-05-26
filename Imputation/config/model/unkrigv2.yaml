@@ -1,0 +1,15 @@
+name: 'unkrigv2'
+hparams:
+  hidden_size: 128
+  exog_size: 0
+  enc_layers: 1
+  gcn_layers: 2
+  psd_layers: 1
+  dropout: 0.4
+  intervention_steps: 2
+  mmd_sample_ratio: 0.1
+  k: 3
+regs:
+  y1: 0.2 # SS-MMD Loss
+  y2: 1 # IRM Loss
+  y3: 0.8 # Similarity Loss

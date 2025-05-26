@@ -25,7 +25,7 @@ def ensure_list(obj):
     else:
         return [obj]
 
-class Filler(pl.LightningModule):
+class unKrigFiller(pl.LightningModule):
     def __init__(self,
                  model_class,
                  model_kwargs,
@@ -51,8 +51,9 @@ class Filler(pl.LightningModule):
         :param scheduler_class: Scheduler class.
         :param scheduler_kwargs: Scheduler's keyword arguments.
         """
-        super(Filler, self).__init__()
-        self.save_hyperparameters(ignore=['loss_fn'], logger=False)
+        super(unKrigFiller, self).__init__()
+        self.save_hyperparameters(ignore=['loss_fn_1'], logger=False)
+        self.save_hyperparameters(ignore=['loss_fn_2'], logger=False)
         self.model_cls = model_class
         self.model_kwargs = model_kwargs
         self.optim_class = optim_class
@@ -66,9 +67,11 @@ class Filler(pl.LightningModule):
             self.scheduler_kwargs = scheduler_kwargs
 
         if loss_fn is not None:
-            self.loss_fn = self._check_metric(loss_fn, on_step=True)
+            self.loss_fn_1 = self._check_metric(loss_fn[0], on_step=True)
+            self.loss_fn_2 = self._check_metric(loss_fn[1], on_step=True)
         else:
-            self.loss_fn = None
+            self.loss_fn_1 = None
+            self.loss_fn_2 = None
 
         self.scaled_target = scaled_target
 
@@ -323,18 +326,23 @@ class Filler(pl.LightningModule):
             self.log(f'lr_{i}', lr, on_step=False, on_epoch=True, logger=True, prog_bar=False)
 
     def configure_optimizers(self):
-        cfg = dict()
-        optimizer = self.optim_class(self.parameters(), **self.optim_kwargs)
-        cfg['optimizer'] = optimizer
-        if self.scheduler_class is not None:
-            metric = self.scheduler_kwargs.pop('monitor', None)
-            scheduler = self.scheduler_class(optimizer, **self.scheduler_kwargs)
-            cfg['lr_scheduler'] = scheduler
-            if metric is not None:
-                cfg['monitor'] = metric
-        return cfg
+        cfgs = []
 
-class UnnamedKrigFiller(Filler):
+        for ind, val in enumerate(self.optim_class):
+            cfg = dict()
+            optimizer = val(self.parameters(), **self.optim_kwargs[ind])
+            cfg['optimizer'] = optimizer
+            if self.scheduler_class is not None:
+                metric = self.scheduler_kwargs.pop('monitor', None)
+                scheduler = self.scheduler_class(optimizer, **self.scheduler_kwargs)
+                cfg['lr_scheduler'] = scheduler
+                if metric is not None:
+                    cfg['monitor'] = metric
+            cfgs.append(cfg)
+
+        return cfgs
+
+class UnnamedKrigFiller(unKrigFiller):
     def __init__(self,
                  model_class,
                  model_kwargs,
@@ -623,7 +631,7 @@ class UnnamedKrigFiller(Filler):
     # Experimental
     def training_step(self, batch, batch_idx):
         # Unpack batch
-        opt = self.optimizers()
+        opt1, opt2 = self.optimizers()
         batch_data, batch_preprocessing = self._unpack_batch(batch)
 
         # To make the model inductive
@@ -720,7 +728,7 @@ class UnnamedKrigFiller(Filler):
 
         # Compute predictions and compute loss
         res = self.predict_batch(batch, preprocess=False, postprocess=False)
-        finpreds, finrecos, fin_irm_all_s, output_invars_s, output_vars_s = res[0], res[1], res[2], res[3], res[4]
+        finpreds, finrecos, fin_irm_all_s = res[0], res[1], res[2]
         # finrecos = torch.cat(finrecos)
         finpreds = torch.cat(finpreds)
         fin_irm_all_s = torch.cat(fin_irm_all_s)
@@ -737,8 +745,13 @@ class UnnamedKrigFiller(Filler):
         # fin_irm_all_s = rearrange(fin_irm_all_s, '(a b s) t n d -> a s b t n d', b=b, a=2)
         # fin_target = torch.cat([target, target])
 
-        opt.zero_grad()
+        # opt2.zero_grad()
+        # # Edge Conv loss
+        # loss_edge = self.y3 * torch.sqrt(self.loss_fn_2(pred_scores[0], pred_scores[1], pred_scores[2].bool()))
+        # self.manual_backward(loss_edge, retain_graph=True)
+        # opt2.step()
 
+        opt1.zero_grad()
         # IRM Loss
         irm_target = target[:, :, :len(train_set)]
         irm_mask = mask[:, :, :len(train_set)]
@@ -747,7 +760,7 @@ class UnnamedKrigFiller(Filler):
         for i in range(steps):
             env_loss = torch.cat(
                         [env_loss,
-                         self.loss_fn(fin_irm_all_s[i], irm_target, irm_mask.bool()).unsqueeze(0)])
+                         self.loss_fn_1(fin_irm_all_s[i], irm_target, irm_mask.bool()).unsqueeze(0)])
             # env_loss = torch.cat(
             #             [env_loss,
             #              self.loss_fn(fin_irm_all_s[1, i], target, mask).unsqueeze(0)])
@@ -770,15 +783,15 @@ class UnnamedKrigFiller(Filler):
             mmds = torch.cat([mmds, max(0, mmd_loss(reco[1], reco[3])).unsqueeze(0)])
         recon_loss = mmds.mean()
 
-        main_loss = self.loss_fn(finpreds, target, stack_mask.bool()) 
+        main_loss = self.loss_fn_1(finpreds, target, stack_mask.bool()) 
         loss = main_loss + self.y1 * recon_loss + self.y2 * irm_loss
         
         self.manual_backward(loss)
 
         if self.gradient_clip_algorithm and self.gradient_clip_val:
-            self.clip_gradients(opt, gradient_clip_val=self.gradient_clip_val, gradient_clip_algorithm=self.gradient_clip_algorithm)
+            self.clip_gradients(opt1, gradient_clip_val=self.gradient_clip_val, gradient_clip_algorithm=self.gradient_clip_algorithm)
 
-        opt.step()
+        opt1.step()
 
         imputation = rearrange(finpreds, '(a b) t n d -> a b t n d', b=b)
         imputation = torch.mean(imputation, dim=0)
@@ -807,8 +820,8 @@ class UnnamedKrigFiller(Filler):
                  logger=True,
                  prog_bar=False)
         
-        # self.log('Similarity score', 
-        #          sim,                  
+        # self.log('Edge Conv', 
+        #          loss_edge,                  
         #          on_step=False,
         #          on_epoch=True,
         #          logger=True,
@@ -882,7 +895,7 @@ class UnnamedKrigFiller(Filler):
             target = y
             imputation = self._postprocess(imputation, batch_preprocessing)
 
-        val_loss = self.loss_fn(imputation, target, eval_mask)
+        val_loss = self.loss_fn_1(imputation, target, eval_mask)
 
         # Logging
         if self.scaled_target:
@@ -940,7 +953,7 @@ class UnnamedKrigFiller(Filler):
         # Compute outputs and rescale
         imputation = self.predict_batch(batch, preprocess=False, postprocess=True)
         imputation = imputation[:, :, reverse, :]
-        test_loss = self.loss_fn(imputation, y, eval_mask)
+        test_loss = self.loss_fn_1(imputation, y, eval_mask)
 
         # Logging
         self.test_metrics.update(imputation.detach(), y, eval_mask)

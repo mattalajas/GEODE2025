@@ -982,3 +982,192 @@
     #         # xh_inv = rearrange(xh_inv, '(b t n) d -> b t n d', b=b, t=t)
             
     #         return finpreds[0]#, finrecos[0], new_inv_adj[0][:2], new_var_adj[0][:2], xh_inv[:2]
+
+# Two hop graph gneeration
+# def get_new_adj(self, adj, sub_entry_num):
+#         n1 = adj.shape[0]
+        
+#         # if self.obs_neighbors is None:
+#         neighbors_1h = {}
+#         neighbors_2h = {}
+
+#         # Get two hop diagonal
+#         sp_adj = adj.to_sparse_coo()
+#         two_hops = torch.mm(sp_adj, sp_adj).to_dense()
+#         two_hops = two_hops.fill_diagonal_(0)
+
+#         for i in range(n1):
+#             row_n_1 = set(torch.nonzero(adj[i]).squeeze(1).tolist())
+#             col_n_1 = set(torch.nonzero(adj[:, i]).squeeze(1).tolist())
+#             all_n_1 = row_n_1.union(col_n_1)
+
+#             # 1-hop neighbors
+#             neighbors_1h[i] = list(all_n_1)
+
+#             row_n_2 = set(torch.nonzero(two_hops[i]).squeeze(1).tolist())
+#             col_n_2 = set(torch.nonzero(two_hops[:, i]).squeeze(1).tolist())
+#             all_n_2 = row_n_2.union(col_n_2)
+#             all_n = all_n_2.union(all_n_1)
+
+#             # 1 and 2 hop neighbors
+#             neighbors_2h[i] = list(all_n)
+                
+#         #     self.obs_neighbors = (neighbors_1h, neighbors_2h)
+#         # else:
+#         #     neighbors_1h, neighbors_2h = self.obs_neighbors  # n1, n1, note that cannot use copy!!!
+
+#         n2 = n1 + sub_entry_num
+#         # Create matrices for both n1 and n2
+#         adj_aug_n1 = torch.rand((n2, n2)).to(device = adj.device)  # n2, n2
+#         adj_aug_n1 = torch.triu(adj_aug_n1) + torch.triu(adj_aug_n1, 1).T
+
+#         adj_aug_n2 = torch.rand((n2, n2)).to(device = adj.device)  # n2, n2
+#         adj_aug_n2 = torch.triu(adj_aug_n2) + torch.triu(adj_aug_n2, 1).T
+
+#         # preserve original observed parts in newly-created adj
+#         adj_aug_n1[:n1, :n1] = adj
+#         adj_aug_n2[:n1, :n1] = adj
+
+#         adj_aug_n1 = adj_aug_n1.fill_diagonal_(0)
+#         adj_aug_n2 = adj_aug_n2.fill_diagonal_(0)
+
+#         adj_aug_mask_n1 = torch.zeros_like(adj_aug_n1)  # n2, n2
+#         adj_aug_mask_n2 = torch.zeros_like(adj_aug_n2)  # n2, n2
+
+#         adj_aug_mask_n1[:n1, :n1] = 1
+#         adj_aug_mask_n2[:n1, :n1] = 1
+
+#         neighbors_1 = copy.deepcopy(neighbors_1h)
+#         neighbors_2 = copy.deepcopy(neighbors_2h)
+
+#         for i in range(n1, n2):
+#             n_current = range(len(neighbors_1.keys()))  # number of current entries (obs and already added virtual)
+#             rand_entry = random.sample(n_current, 1)[0] # randomly sample 1 entry (obs or already added virtual)
+#             rand_neighbors_1 = neighbors_1[rand_entry]  # get 1-hop neighbors of sampled entry
+#             rand_neighbors_2 = neighbors_2[rand_entry]  # get 1 and 2-hop neighbors of sample entry
+
+#             p = np.random.rand(1)
+
+#             # randomly select 1 hop neighbors
+#             valid_neighbors_1 = (np.random.rand(len(rand_neighbors_1)) < p).astype(int)
+#             valid_neighbors_1 = np.where(valid_neighbors_1 == 1)[0].tolist()
+#             valid_neighbors_1 = [rand_neighbors_1[idx] for idx in valid_neighbors_1]
+
+#             all_entries = [rand_entry]
+#             all_entries.extend(valid_neighbors_1)
+
+#             # add current virtual entry to the 1-hop neighbors of selected entries
+#             for entry in all_entries:
+#                 neighbors_1[entry].append(i)
+
+#             # add selected entries to the 1-hop neighbors of current virtual entry
+#             neighbors_1[i] = all_entries
+
+#             # Add to mask
+#             for j in range(len(all_entries)):
+#                 entry = all_entries[j]
+#                 adj_aug_mask_n1[entry, i] = 1
+#                 adj_aug_mask_n1[i, entry] = 1
+
+#             # randomly select 1-2 hop neighbors
+#             valid_neighbors_2 = (np.random.rand(len(rand_neighbors_2)) < p).astype(int)
+#             valid_neighbors_2 = np.where(valid_neighbors_2 == 1)[0].tolist()
+#             valid_neighbors_2 = [rand_neighbors_2[idx] for idx in valid_neighbors_2]
+
+#             all_entries = [rand_entry]
+#             all_entries.extend(valid_neighbors_2)
+
+#             # add current virtual entry to the 1-2 hop neighbors of selected entries
+#             for entry in all_entries:
+#                 neighbors_2[entry].append(i)
+
+#             # add selected entries to the 1-2 hop neighbors of current virtual entry
+#             neighbors_2[i] = all_entries
+
+#             # Add to mask
+#             for j in range(len(all_entries)):
+#                 entry = all_entries[j]
+#                 adj_aug_mask_n2[entry, i] = 1
+#                 adj_aug_mask_n2[i, entry] = 1
+
+#         adj_aug_n1 *= adj_aug_mask_n1
+#         adj_aug_n2 *= adj_aug_mask_n2
+    
+#         return adj_aug_n1, adj_aug_n2
+
+
+# ========================================
+# Reconstruction model
+# ========================================
+# Shape: b*t*n, d
+# rec = xh_inv * (1 - mask)
+# rec = rearrange(rec, 'b t n d -> (b t n) d')
+
+# # fin_rec = self.init_pass(rec, invar_adj[0], invar_adj[1]) * (t_mask) + rec
+# # Predict the real nodes by propagating back using just the invariant features
+# # Get reconstruction loss
+# # finr = self.gcn1(fin_rec, invar_adj[0], invar_adj[1], batch=batches)
+
+# fin_rec = self.gcn2(rec, invar_adj[0], invar_adj[1]) + rec # * (t_mask)
+# fin_rec = rearrange(fin_rec, '(b t n) d -> b t n d', b=b, t=t)
+# fin_rec = self.layernorm2(fin_rec)
+
+# finr = self.readout2(fin_rec)
+# finrecos.append(finr)
+
+## This is before the graph convolutions
+# batches = torch.arange(0, b).to(device=device)
+# batches = torch.repeat_interleave(batches, repeats=t*n)
+# xh_inv = self.gcn2(xh_inv, invar_adj[0], invar_adj[1]) * (1 - t_mask) + xh_inv
+# xh_var = self.gcn2(xh_var, var_adj[0], var_adj[1]) * (1 - t_mask) + xh_var
+# xh_inv = rearrange(xh_inv, '(b t n) d -> b t n d', b=b, t=t)
+# xh_inv = self.layernorm2(xh_inv)
+# xh_inv = rearrange(xh_inv, 'b t n d -> (b t n) d')
+
+# xh_var = rearrange(xh_var, '(b t n) d -> b t n d', b=b, t=t)
+# xh_var = self.layernorm2(xh_var)
+# xh_var = rearrange(xh_var, 'b t n d -> (b t n) d')
+
+# spr_adj = dense_to_sparse(adj)
+
+
+# GETTING MMD FOR BOTH SEEN AND UNSEEN
+            # Get embedding softmax
+            # sps_var_adj = F.softmax(-mmd_scores, dim=-1) * (adj + EPSILON)
+            # sps_inv_adj = F.softmax(mmd_scores, dim=-1) * (adj + EPSILON)
+
+            # # Get most similar embedding with virtual nodes and vice versa
+            # sps_var_adj[:, :, :virt, :virt] = 0.
+            # sps_var_adj[:, :, virt:, virt:] = 0.
+
+            # sps_inv_adj[:, :, :virt, :virt] = 0.
+            # sps_inv_adj[:, :, virt:, virt:] = 0.
+
+            # sps_var_max = torch.argmax(sps_var_adj, dim=-1)
+            # sps_inv_max = torch.argmax(sps_inv_adj, dim=-1)
+
+            # # sps_var_max = sps_var_max[:, n_og:]
+            # # sps_inv_max = sps_inv_max[:, n_og:]
+
+            # sps_var_max = sps_var_max.unsqueeze(-1).expand(-1, -1, -1, vir_var.size(-1))
+            # sps_inv_max = sps_inv_max.unsqueeze(-1).expand(-1, -1, -1, vir_inv.size(-1))
+
+            # sim_inv = torch.gather(vir_inv.detach(), dim=2, index=sps_inv_max)
+            # sim_var = torch.gather(vir_var.detach(), dim=2, index=sps_var_max)
+
+            # # # Sample batches
+            # # if self.mmd_ratio < 1.0:
+            # #     s_batch = int(b*self.mmd_ratio)
+            # #     indx = torch.randperm(b, device=device)[:s_batch]
+            # #     sim_inv = sim_inv[indx]
+            # #     sim_var = sim_var[indx]
+
+            # #     vir_inv = xh_inv_1[indx]
+            # #     vir_var = xh_var_1[indx]
+            
+            # # Shape: b*t, n, n
+            # emb_tru_inv = sim_inv.view(s_batch*t, n, d).permute(1, 0, 2)
+            # emb_tru_var = sim_var.view(s_batch*t, n, d).permute(1, 0, 2)
+
+            # emb_vir_inv = vir_inv.view(s_batch*t, n, d).permute(1, 0, 2)
+            # emb_vir_var = vir_var.view(s_batch*t, n, d).permute(1, 0, 2)

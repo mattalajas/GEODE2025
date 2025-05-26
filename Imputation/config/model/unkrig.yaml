@@ -1,16 +1,16 @@
 name: 'unkrig'
 hparams:
-  hidden_size: 128
-  # horizon: 12
+  hidden_size: 64
   exog_size: 0
-  enc_layers: 2
-  gcn_layers: 1
+  enc_layers: 1
+  gcn_layers: 2
   dropout: 0.4
-  intervention_steps: 3
+  intervention_steps: 2
+  mmd_sample_ratio: 0.4
 regs:
-  y1: 0.8
-  y2: 0.8
-  y3: 0.8
+  y1: 0.2 # SS-MMD Loss
+  y2: 1 # IRM Loss
+  y3: 0.8 # Similarity Loss
 
 # technique:
 #   inductive: True

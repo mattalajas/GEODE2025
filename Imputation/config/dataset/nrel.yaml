@@ -1,14 +1,17 @@
 #### Dataset params ###########################################################
-name: air_auckland
-masked_sensors: [5]
-test_month: [6]
-agg_func: 'mean'
-location: 'Auckland'
-t_range: ['2022-04-01', '2022-12-01']
+name: nrel
+# Point
+mode: 'region'
+p_fault: 0.
+p_noise: 0.25
+
+# Block
+# p_fault: 0.0015
+# p_noise : 0.05
 splitting:
   val_len: 0.1
   test_len: 0.2
 connectivity:
   method: distance
-  threshold: 1
+  threshold: 0.1
   include_self: False
