@@ -3,14 +3,17 @@ from typing import List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
-
+import random
+from collections import deque
+from einops import rearrange
 from tsl.data.datamodule.splitters import Splitter, disjoint_months
 from tsl.data.synch_mode import HORIZON
 from tsl.datasets.prototypes import DatetimeDataset, TabularDataset
 from tsl.datasets.prototypes.mixin import MissingValuesMixin
-from tsl.utils import download_url, extract_zip
 from tsl.ops.framearray import framearray_shape, framearray_to_numpy
 from tsl.ops.imputation import to_missing_values_dataset
+from tsl.utils import download_url, extract_zip
+
 
 def add_missing_sensors(dataset: TabularDataset,
                        p_noise=0.05,
@@ -19,7 +22,9 @@ def add_missing_sensors(dataset: TabularDataset,
                        max_seq=10,
                        seed=None,
                        inplace=True,
-                       masked_sensors = []):
+                       masked_sensors = [],
+                       connect = None,
+                       mode='road'):
     if seed is None:
         seed = np.random.randint(1e9)
     # Fix seed for random mask generation
@@ -31,7 +36,8 @@ def add_missing_sensors(dataset: TabularDataset,
         eval_mask = sample_mask(shape,
                             p=p_fault,
                             p_noise=p_noise,
-                            mode='road')
+                            mode=mode,
+                            adj=dataset.get_connectivity(**connect, layout='dense'))
         
         dataset.p_fault = p_fault
         dataset.p_noise = p_noise
@@ -39,6 +45,10 @@ def add_missing_sensors(dataset: TabularDataset,
         dataset.max_seq = max_seq
         dataset.seed = seed
         dataset.random = random
+
+        # mask = rearrange(eval_mask, "b n 1 -> b n")
+        mask_sum = eval_mask.sum(0)  # n
+        masked_sensors = (np.where(mask_sum > 0)[0]).tolist()
     else:
         masked_sensors = list(masked_sensors)
         eval_mask = np.zeros_like(dataset.mask)
@@ -51,7 +61,7 @@ def add_missing_sensors(dataset: TabularDataset,
     test1 = np.sum(eval_mask, axis=(0))
 
     # Store evaluation mask params in dataset
-    return dataset
+    return dataset, masked_sensors
 
 class AirQualitySplitter(Splitter):
 
@@ -91,8 +101,8 @@ class AirQualitySplitter(Splitter):
         train_idxs = nontest_idxs[~ovl_idxs]
         self.set_indices(train_idxs, val_idxs, test_idxs)
 
-def sample_mask(shape, p=0.002, p_noise=0., mode="random"):
-    assert mode in ["random", "road", "mix"], "The missing mode must be 'random' or 'road' or 'mix'."
+def sample_mask(shape, p=0.002, p_noise=0., mode="random", adj=None):
+    assert mode in ["random", "road", "mix", "region"], "The missing mode must be 'random' or 'road' or 'mix'."
     rand = np.random.random
     mask = np.zeros(shape).astype(bool)
     if mode == "random" or mode == "mix":
@@ -103,7 +113,41 @@ def sample_mask(shape, p=0.002, p_noise=0., mode="random"):
         road_mask = np.zeros(shape).astype(bool)
         road_mask[:, rand_mask] = True
         mask |= road_mask
+    if mode == "region":
+        num_vert = (rand(mask.shape[1]) < p_noise).sum().item()
+        regions = region_masking(adj, num_vert)
+        region_mask = np.zeros(shape).astype(bool)
+        region_mask[:, regions] = True
+        mask |= region_mask
+
     return mask.astype('uint8')
+
+def region_masking(adj_matrix, n):
+    num_nodes = adj_matrix.shape[0]
+    if n >= num_nodes:
+        return list(range(num_nodes))
+
+    visited = set()
+    all_nodes = set(range(num_nodes))
+
+    while len(visited) < n:
+        # Start from an unvisited random seed node
+        seed = random.choice(list(all_nodes - visited))
+        queue = deque([seed])
+        visited.add(seed)
+
+        while queue and len(visited) < n:
+            current = queue.popleft()
+            neighbors = np.nonzero(adj_matrix[current])[0]  # indices with edge
+
+            for neighbor in neighbors:
+                if neighbor not in visited:
+                    visited.add(neighbor.item())
+                    queue.append(neighbor)
+                    if len(visited) == n:
+                        break
+
+    return list(visited)
 
 class AirQualityKrig(DatetimeDataset, MissingValuesMixin):
     r"""Measurements of pollutant :math:`PM2.5` collected by 437 air quality

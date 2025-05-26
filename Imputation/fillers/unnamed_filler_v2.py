@@ -12,7 +12,7 @@ from torchmetrics import MetricCollection
 from tsl import logger
 from tsl.metrics.torch import MaskedMetric
 from tsl.metrics.torch.functional import mre
-from utils import mmd_loss, mmd_loss_single
+from utils import mmd_loss, mmd_loss_single, cmd_time, cmd
 
 warnings.filterwarnings("ignore")
 
@@ -357,7 +357,8 @@ class UnnamedKrigFillerV2(unKrigFillerV2):
                  known_set=[],
                  y1 = 1,
                  y2 = 1,
-                 y3 = 1):
+                 y3 = 1,
+                 dloss = 'mmd'):
         super(UnnamedKrigFillerV2, self).__init__(model_class=model_class,
                                                   model_kwargs=model_kwargs,
                                                   optim_class=optim_class,
@@ -383,6 +384,10 @@ class UnnamedKrigFillerV2(unKrigFillerV2):
         self.train_set = known_set
         self.val_set = []
         self.e_start = True
+        
+        assert dloss in ['mmd', 'cmd']
+        self.dloss = dloss
+        
         # self.ratio = 0.
 
     def trim_seq(self, *seq):
@@ -595,12 +600,34 @@ class UnnamedKrigFillerV2(unKrigFillerV2):
         env_var = torch.var(env_loss * steps)
         irm_loss = env_var + env_mean
 
-        # MMD Loss
-        mmds = torch.tensor([]).to(x.device)
-        for reco in finrecos:
-            # MMD for inv 
-            mmds = torch.cat([mmds, torch.clamp(mmd_loss(reco[0], reco[2]), min=0).unsqueeze(0)])
-            mmds = torch.cat([mmds, torch.clamp(mmd_loss(reco[1], reco[3]), min=0).unsqueeze(0)])
+        if self.dloss == 'mmd':
+            # MMD Loss
+            mmds = torch.tensor([]).to(x.device)
+            for reco in finrecos:
+                # MMD for inv 
+                s_batch = reco.pop(0)
+                mmds = torch.cat([mmds, torch.clamp(mmd_loss(reco[0], reco[2]), min=0).unsqueeze(0)])
+                mmds = torch.cat([mmds, torch.clamp(mmd_loss(reco[1], reco[3]), min=0).unsqueeze(0)])
+
+                recon_loss = mmds.mean()
+
+        elif self.dloss == 'cmd':
+            cmds = torch.tensor([]).to(x.device)
+            for reco in finrecos:
+                B = reco.pop(0)
+                og_nt = reco[0].size(1) // B
+                cr_nt = reco[2].size(1) // B
+
+                batches = torch.arange(0, B).to(device=x.device)
+                og_batch = torch.repeat_interleave(batches, repeats=(og_nt))
+                cr_batch = torch.repeat_interleave(batches, repeats=(cr_nt))
+
+                cmds = torch.cat([cmds, torch.clamp(cmd(reco[0].squeeze(0), reco[2].squeeze(0), \
+                                                        og_batch, cr_batch).mean(), min=0).unsqueeze(0)])
+                cmds = torch.cat([cmds, torch.clamp(cmd(reco[1].squeeze(0), reco[3].squeeze(0), \
+                                                        og_batch, cr_batch).mean(), min=0).unsqueeze(0)])
+
+            recon_loss = cmds.mean()
 
         # mmds = torch.tensor([]).to(x.device)
         # true_embs = finrecos.pop(0)
@@ -608,8 +635,6 @@ class UnnamedKrigFillerV2(unKrigFillerV2):
         #     # MMD for inv 
         #     mmds = torch.cat([mmds, torch.clamp(mmd_loss(true_embs[0], reco[0]), min=0).unsqueeze(0)])
         #     mmds = torch.cat([mmds, torch.clamp(mmd_loss(true_embs[1], reco[1]), min=0).unsqueeze(0)])
-
-        recon_loss = mmds.mean()
 
         main_loss = self.loss_fn_1(finpreds, target, eval_mask.bool()) 
         loss = main_loss + self.y1 * recon_loss + self.y2 * irm_loss

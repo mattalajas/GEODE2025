@@ -10,7 +10,7 @@ import numpy as np
 from tsl import logger
 from tsl.data import ImputationDataset, SpatioTemporalDataModule
 from tsl.data.preprocessing import StandardScaler
-from tsl.datasets import AirQuality, MetrLA, PemsBay
+from tsl.datasets import AirQuality, MetrLA, PemsBay, PvUS
 from tsl.engines import Imputer
 from tsl.experiment import Experiment
 from tsl.metrics import numpy as numpy_metrics
@@ -21,11 +21,17 @@ from tsl.transforms import MaskInput
 from tsl.utils.casting import torch_to_numpy
 
 from my_datasets import AirQualitySmaller, AirQualityAuckland, AirQualityKrig, add_missing_sensors
-from KITS import KITS
-from KITS_filler import GCNCycVirtualFiller
-from unnamed_filler import UnnamedKrigFiller
+from baselines.KITS import KITS
+from baselines.IGNNK import IGNNK
+from fillers.KITS_filler import GCNCycVirtualFiller
+from fillers.unnamed_filler import UnnamedKrigFiller
+from fillers.unnamed_filler_v2 import UnnamedKrigFillerV2
 from unnamedKrig import UnnamedKrigModel
+from unnamedKrig_v2 import UnnamedKrigModelV2
+from unnamedKrig_v3 import UnnamedKrigModelV3
+from utils import classical_mds_with_inf
 
+MODELS = ['kits', 'unkrig', 'kcn', 'unkrigv2', 'unkrigv3', 'ignnk']
 
 def get_model_class(model_str):
     if model_str == 'rnni':
@@ -42,21 +48,27 @@ def get_model_class(model_str):
         model = KITS
     elif model_str == 'unkrig':
         model = UnnamedKrigModel
+    elif model_str == 'unkrigv2':
+        model = UnnamedKrigModelV2
+    elif model_str == 'unkrigv3':
+        model = UnnamedKrigModelV3
+    elif model_str == 'ignnk':
+        model = IGNNK
     else:
         raise NotImplementedError(f'Model "{model_str}" not available.')
     return model
 
 
 def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-01', '2022-12-01'],
-                masked_s=None, agg_func = 'mean', test_month=[5], location='Auckland'):
+                masked_s=None, agg_func = 'mean', test_month=[5], location='Auckland', connectivity=None, mode='road'):
     if dataset_name == 'air':
-        return AirQualityKrig(impute_nans=True, small=True, masked_sensors=masked_s, p=p_noise)
+        return AirQualityKrig(impute_nans=True, small=True, masked_sensors=masked_s, p=p_noise), masked_s
     if dataset_name == 'air_smaller':
-        return AirQualitySmaller('../../AirData/AQI/Stations', impute_nans=True, masked_sensors=masked_s)
+        return AirQualitySmaller('../../AirData/AQI/Stations', impute_nans=True, masked_sensors=masked_s), masked_s
     if dataset_name == 'air_auckland' or dataset_name == 'air_invercargill1' or dataset_name == 'air_invercargill2':
         return AirQualityAuckland('../../AirData/Niwa', t_range=t_range, masked_sensors=masked_s, 
                                   agg_func=agg_func, test_months=test_month,
-                                  location=location, p=p_noise)
+                                  location=location, p=p_noise), masked_s
     if dataset_name.endswith('_point'):
         p_fault, p_noise = 0., 0.25
         dataset_name = dataset_name[:-6]
@@ -68,9 +80,10 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-0
                                   p_fault=p_fault,
                                   p_noise=p_noise,
                                   min_seq=12,
-                                  max_seq=12 * 4,
-                                  seed=9101112, 
-                                  masked_sensors=masked_s)
+                                  max_seq=12 * 4, 
+                                  masked_sensors=masked_s,
+                                  connect=connectivity,
+                                  mode=mode)
     if dataset_name == 'bay':
         return add_missing_sensors(PemsBay(),
                                   p_fault=p_fault,
@@ -78,7 +91,28 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-0
                                   min_seq=12,
                                   max_seq=12 * 4,
                                   seed=56789,
-                                  masked_sensors=masked_s)
+                                  masked_sensors=masked_s,
+                                  connect=connectivity,
+                                  mode=mode)
+    
+    if dataset_name == 'nrel':
+        pv_us = PvUS(zones='east')
+        pv_us.metadata = pv_us.metadata[:137]
+        cols = pv_us.target.columns[:137]
+        pv_us.target = pv_us.target.loc[:, cols]
+
+        masks = np.ones((pv_us.target.shape[0], pv_us.target.shape[1], 1))
+        pv_us.set_mask(masks)
+        
+        return add_missing_sensors(pv_us,
+                                  p_fault=p_fault,
+                                  p_noise=p_noise,
+                                  min_seq=12,
+                                  max_seq=12 * 4,
+                                  masked_sensors=masked_s,
+                                  connect=connectivity,
+                                  mode=mode)
+    
     raise ValueError(f"Dataset {dataset_name} not available in this setting.")
 
 
@@ -88,20 +122,23 @@ def run_imputation(cfg: DictConfig):
     ########################################
     torch.set_float32_matmul_precision('high')
 
-    dataset = get_dataset(cfg.dataset.name,
-                        p_fault=cfg.dataset.get('p_fault'),
-                        p_noise=cfg.dataset.get('p_noise'),
-                        t_range=cfg.dataset.get('t_range'),
-                        masked_s=cfg.dataset.get('masked_sensors'),
-                        agg_func=cfg.dataset.get('agg_func'),
-                        test_month=cfg.dataset.get('test_month'),
-                        location=cfg.dataset.get('location'))
+    dataset, masked_sensors = get_dataset(cfg.dataset.name,
+                            p_fault=cfg.dataset.get('p_fault'),
+                            p_noise=cfg.dataset.get('p_noise'),
+                            t_range=cfg.dataset.get('t_range'),
+                            masked_s=cfg.dataset.get('masked_sensors'),
+                            agg_func=cfg.dataset.get('agg_func'),
+                            test_month=cfg.dataset.get('test_month'),
+                            location=cfg.dataset.get('location'),
+                            connectivity=cfg.dataset.get('connectivity'),
+                            mode=cfg.dataset.get('mode'))
+    print(f'Masked sensors: {masked_sensors}')
 
     # encode time of the day and use it as exogenous variable
     # covariates = {'u': dataset.datetime_encoded('day').values}
 
     # get adjacency matrix
-    if cfg.model.name == 'kits' or cfg.model.name == 'unkrig':
+    if cfg.model.name in MODELS:
         adj = dataset.get_connectivity(**cfg.dataset.connectivity, layout='dense')
     else:
         adj = dataset.get_connectivity(**cfg.dataset.connectivity)
@@ -143,6 +180,14 @@ def run_imputation(cfg: DictConfig):
         model_kwargs = dict(adj=adj, d_in=dm.n_channels, n_nodes=dm.n_nodes, args=cfg.model)
     elif cfg.model.name == 'unkrig':
         model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
+    elif cfg.model.name == 'unkrigv2':
+        model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
+    elif cfg.model.name == 'unkrigv3':
+        model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
+    elif cfg.model.name == 'ignnk':
+        model_kwargs = dict(z=cfg.model.z, h=cfg.window, K=cfg.model.K)
+    elif cfg.model.name == 'kcn':
+        pass
     else:
         model_kwargs = dict(n_nodes=torch_dataset.n_nodes,
                             input_size=torch_dataset.n_channels)
@@ -151,7 +196,14 @@ def run_imputation(cfg: DictConfig):
 
     model_kwargs.update(cfg.model.hparams)
 
-    loss_fn = torch_metrics.MaskedMAE()
+    if cfg.model.name == 'kcn':
+        loss_fn = torch_metrics.MaskedMSE()
+    elif cfg.model.name == 'unkrig' or cfg.model.name == 'unkrigv2' or cfg.model.name == 'unkrigv3':
+        loss_fn = [torch_metrics.MaskedMAE(), torch_metrics.MaskedMSE()]
+    elif cfg.model.name == 'ignnk':
+        loss_fn = torch_metrics.MaskedMSE()
+    else:
+        loss_fn = torch_metrics.MaskedMAE()
 
     log_metrics = {
         'mae': torch_metrics.MaskedMAE(),
@@ -183,13 +235,15 @@ def run_imputation(cfg: DictConfig):
                                     scheduler_kwargs=scheduler_kwargs,
                                     gradient_clip_val=cfg.grad_clip_val,
                                     gradient_clip_algorithm=cfg.grad_clip_alg,
-                                    known_nodes = [i for i in range(adj.shape[0]) if i not in cfg.dataset.get('masked_sensors')],
+                                    known_nodes = [i for i in range(adj.shape[0]) if i not in masked_sensors],
                                     **cfg.model.technique)
     elif cfg.model.name == "unkrig":
         imputer = UnnamedKrigFiller(model_class=model_cls,
                                     model_kwargs=model_kwargs,
-                                    optim_class=getattr(torch.optim, cfg.optimizer.name),
-                                    optim_kwargs=dict(cfg.optimizer.hparams),
+                                    optim_class=[getattr(torch.optim, cfg.optimizer.name_1), 
+                                                 getattr(torch.optim, cfg.optimizer.name_2)],
+                                    optim_kwargs=[dict(cfg.optimizer.hparams_1),
+                                                  dict(cfg.optimizer.hparams_2)],
                                     loss_fn=loss_fn,
                                     scaled_target=cfg.scale_target,
                                     whiten_prob=cfg.whiten_prob,
@@ -200,8 +254,27 @@ def run_imputation(cfg: DictConfig):
                                     scheduler_kwargs=scheduler_kwargs,
                                     gradient_clip_val=cfg.grad_clip_val,
                                     gradient_clip_algorithm=cfg.grad_clip_alg,
-                                    known_set = [i for i in range(adj.shape[0]) if i not in cfg.dataset.get('masked_sensors')],
+                                    known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
                                     **cfg.model.regs)
+    elif cfg.model.name == "unkrigv2" or cfg.model.name == "unkrigv3":
+        imputer = UnnamedKrigFillerV2(model_class=model_cls,
+                            model_kwargs=model_kwargs,
+                            optim_class=[getattr(torch.optim, cfg.optimizer.name_1), 
+                                         getattr(torch.optim, cfg.optimizer.name_2)],
+                            optim_kwargs=[dict(cfg.optimizer.hparams_1),
+                                          dict(cfg.optimizer.hparams_2)],
+                            loss_fn=loss_fn,
+                            scaled_target=cfg.scale_target,
+                            whiten_prob=cfg.whiten_prob,
+                            pred_loss_weight=cfg.prediction_loss_weight,
+                            warm_up=cfg.warm_up_steps,
+                            metrics=log_metrics,
+                            scheduler_class=scheduler_class,
+                            scheduler_kwargs=scheduler_kwargs,
+                            gradient_clip_val=cfg.grad_clip_val,
+                            gradient_clip_algorithm=cfg.grad_clip_alg,
+                            known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
+                            **cfg.model.regs)
     else:
         imputer = Imputer(model_class=model_cls,
                         model_kwargs=model_kwargs,
@@ -249,7 +322,7 @@ def run_imputation(cfg: DictConfig):
     )
     checkpoint_callback.CHECKPOINT_NAME_LAST = "{epoch}-last"
 
-    if cfg.model.name =='kits' or cfg.model.name =='unkrig':
+    if cfg.model.name =='kits' or cfg.model.name =='unkrig' or cfg.model.name =='unkrigv2' or cfg.model.name == 'unkrigv3':
         trainer = Trainer(
             max_epochs=cfg.epochs,
             default_root_dir=cfg.run.dir,
@@ -308,7 +381,7 @@ def run_imputation(cfg: DictConfig):
 
 
 if __name__ == '__main__':
-    # torch.autograd.set_detect_anomaly(True)
+    # with torch.autograd.set_detect_anomaly(True):
     exp = Experiment(run_fn=run_imputation, config_path='config', config_name='default')
     print(exp)
     res = exp.run()

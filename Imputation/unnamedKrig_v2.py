@@ -1,6 +1,7 @@
 import copy
 import random
 
+import networkx as nx
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -9,7 +10,7 @@ from einops.layers.torch import Rearrange
 # from Grin import get_dataset
 from torch import Tensor, nn
 from torch.nn import LayerNorm
-from torch_geometric.nn import SimpleConv
+from torch_geometric.nn import DynamicEdgeConv
 from torch_geometric.nn.models import GAT, GCN, GraphSAGE
 from torch_geometric.utils import dense_to_sparse
 from tsl.nn import utils
@@ -18,7 +19,7 @@ from tsl.nn.blocks.encoders.mlp import MLP
 from tsl.nn.layers.graph_convs import DiffConv, GraphConv
 from tsl.nn.models.base_model import BaseModel
 from tsl.utils.casting import torch_to_numpy
-from utils import batchwise_min_max_scale
+from utils import closest_distances_unweighted
 
 EPSILON = 1e-8
 
@@ -31,18 +32,22 @@ class UnnamedKrigModelV2(BaseModel):
                  exog_size,
                  enc_layers,
                  gcn_layers,
+                 psd_layers,
                  norm='mean',
-                 encode_edges=False,
                  activation='relu',
                  dropout=0,
                  intervention_steps=2,
                  horizon=24,
-                 mmd_sample_ratio=1.):
+                 mmd_sample_ratio=1.,
+                 k=5,
+                 att_heads=8):
         super(UnnamedKrigModelV2, self).__init__()
 
         self.steps = intervention_steps
         self.horizon = horizon
         self.mmd_ratio = mmd_sample_ratio
+        self.k = k
+        self.att_heads = att_heads
         input_size += exog_size
         self.input_encoder_fwd = RNN(input_size=input_size,
                                  hidden_size=hidden_size,
@@ -55,27 +60,6 @@ class UnnamedKrigModelV2(BaseModel):
                                  n_layers=enc_layers,
                                  return_only_last_state=False,
                                  cell='gru')
-
-        if encode_edges:
-            self.edge_encoder = nn.Sequential(
-                RNN(input_size=input_size,
-                    hidden_size=hidden_size,
-                    n_layers=enc_layers,
-                    return_only_last_state=True,
-                    cell='gru'),
-                nn.Linear(hidden_size, 1),
-                nn.Softplus(),
-                Rearrange('e f -> (e f)', f=1),
-            )
-        else:
-            self.register_parameter('edge_encoder', None)
-
-        # # TODO: remove this eventually
-        # self.temporal_enc = nn.Sequential(
-        #     MLP(input_size=hidden_size*2,
-        #         hidden_size=hidden_size,
-        #         output_size=hidden_size//2)
-        # )
 
         self.gcn_layers_fwd = nn.ModuleList([
             GraphConv(hidden_size,
@@ -109,12 +93,10 @@ class UnnamedKrigModelV2(BaseModel):
                         hidden_size=hidden_size,
                         output_size=hidden_size,
                         activation=activation)
-        # self.out_proj = MLP(input_size=hidden_size*horizon,
-        #                     hidden_size=hidden_size,
-        #                     output_size=hidden_size*horizon,
-        #                     activation=activation)
-
-        # self.init_pass = SimpleConv('max')
+        self.out_proj = MLP(input_size=hidden_size,
+                            hidden_size=hidden_size,
+                            output_size=hidden_size,
+                            activation=activation)
 
         self.layernorm1 = LayerNorm(hidden_size)
         self.layernorm2 = LayerNorm(hidden_size)
@@ -122,30 +104,41 @@ class UnnamedKrigModelV2(BaseModel):
 
         self.gcn1 = GCN(in_channels=hidden_size,
                         hidden_channels=hidden_size,
-                        num_layers=gcn_layers, 
+                        num_layers=psd_layers, 
                         out_channels=hidden_size,
                         dropout=dropout,
                         norm='LayerNorm')
         self.gcn2 = GCN(in_channels=hidden_size,
                         hidden_channels=hidden_size,
-                        num_layers=max((gcn_layers-1), 1), 
+                        num_layers=gcn_layers, 
                         out_channels=hidden_size,
                         dropout=dropout,
                         norm='LayerNorm')
-        # self.gcn1 = DiffConv(in_channels=hidden_size, 
-        #                     out_channels=hidden_size,
-        #                     k=gcn_layers)
-        # self.gcn2 = DiffConv(in_channels=hidden_size, 
-        #                     out_channels=hidden_size,
-        #                     k=gcn_layers)
+        self.squeeze = MLP(input_size=hidden_size*2,
+                        hidden_size=hidden_size,
+                        output_size=hidden_size,
+                        activation=activation)
 
         self.readout1 = nn.Linear(hidden_size, output_size)
         self.readout2 = nn.Linear(hidden_size, output_size)
         self.readout3 = nn.Linear(hidden_size*2, output_size)
 
+        # self.edge_conv = DynamicEdgeConv(
+        #     nn=nn.Sequential(
+        #         nn.Linear(2, hidden_size),
+        #         nn.ReLU(),
+        #         nn.Linear(hidden_size, hidden_size)
+        #     ),
+        #     k=k  # number of neighbors to consider
+        # )
+        # self.edge_predictor = nn.Sequential(
+        #     nn.Linear(2 * hidden_size, hidden_size),
+        #     nn.ReLU(),
+        #     nn.Linear(hidden_size, 1)
+        # )
+
         self.adj = adj
         self.adj_n1 = None
-        self.adj_n2 = None
         self.obs_neighbors = None
 
     # Experimental: Adding virtual and masking other nodes
@@ -153,15 +146,13 @@ class UnnamedKrigModelV2(BaseModel):
                 x,
                 mask,
                 known_set,
-                seened_set=None,
-                masked_set=None, 
+                seened_set=[],
+                masked_set=[], 
                 sub_entry_num=0,
                 edge_weight=None,
-                edge_features=None,
                 training=False,
                 reset=False,
                 u=None,
-                predict=False,
                 transform=None):
         # x: [batches steps nodes features]
         # Unrandomised x, make sure this only has training nodes
@@ -176,7 +167,7 @@ class UnnamedKrigModelV2(BaseModel):
         known_adj = full_adj[known_set, :]
         known_adj = known_adj[:, known_set]
 
-        if seened_set is not None:
+        if seened_set != []:
             o_adj = full_adj[seened_set, :]
             o_adj = o_adj[:, seened_set]
         else:
@@ -191,11 +182,6 @@ class UnnamedKrigModelV2(BaseModel):
         # flat time dimension fwd and bwd
         x_fwd = self.input_encoder_fwd(x)
         x_bwd = self.input_encoder_bwd(torch.flip(x, (1,)))
-
-        # Edge encoder
-        if self.edge_encoder is not None:
-            assert edge_weight is None
-            edge_weight = self.edge_encoder(edge_features)
 
         # forward encoding 
         x_fwd = rearrange(x_fwd, 'b t n d -> (b t) n d')
@@ -230,22 +216,21 @@ class UnnamedKrigModelV2(BaseModel):
 
         # # Calculate self attention between Q and K,V
         # # Do this for the two Queries 
-        # adj_var, adj_invar, output_invars, \
-        # output_vars, scores = self.scaled_dot_product_mhattention(query, 
-        #                                                           key, 
-        #                                                           value,
-        #                                                           mask = o_adj,
-        #                                                           n_head = t)
+        output_invars, output_vars = self.scaled_dot_product_mhattention(query, 
+                                                                        key, 
+                                                                        value,
+                                                                        mask = o_adj,
+                                                                        n_head = self.att_heads)
         
         # output_invars = rearrange(output_invars, 'b n (t d) -> (b t) n d', t=self.horizon)
         # output_vars = rearrange(output_vars, 'b n (t d) -> (b t) n d', t=self.horizon)
         # scores = rearrange(scores, 'b t n d -> (b t) n d')
 
-        adj_var, adj_invar, output_invars, \
-        output_vars, scores = self.scaled_dot_product_attention(query, 
-                                                                key, 
-                                                                value,
-                                                                mask = o_adj)
+        # adj_var, adj_invar, output_invars, \
+        # output_vars, scores = self.scaled_dot_product_attention(query, 
+        #                                                         key, 
+        #                                                         value,
+        #                                                         mask = o_adj)
         
         # adj_invar = rearrange(adj_invar, 'b t n d -> (b t) n d') + o_adj
         # adj_var = rearrange(adj_var, 'b t n d -> (b t) n d') + o_adj
@@ -254,28 +239,39 @@ class UnnamedKrigModelV2(BaseModel):
         # Create new adjacency matrix 
         # ========================================
         # Get two graphs, one with one hop connections, another with two hop connections
-        if seened_set is not None:
+        if seened_set != []:
             arrange = seened_set + masked_set
 
             o_adj = full_adj[arrange, :]
             o_adj = o_adj[:, arrange]
 
-            # Its a secret weapon we're using in the future
-            masked_edges = full_adj[masked_set, :]
-            masked_edges = masked_edges[:, masked_set]
-
         if training:
             # inductive
             if reset:
-                adj_n1 = self.get_new_adj(o_adj, sub_entry_num)
-            else:
-                if self.adj_n1 is None and self.adj_n2 is None:
-                    adj_n1 = o_adj
-                else:
-                    assert self.adj_n2 is not None and self.adj_n1 is not None
-                    adj_n1 = self.adj_n1
+                numpy_graph = nx.from_numpy_array(o_adj.cpu().numpy())
+                target_nodes = list(range(o_adj.shape[0]))[:len(seened_set)]
+                source_nodes = list(range(o_adj.shape[0]))[len(seened_set):]
 
-            adjs = [adj_n1]
+                init_hops = closest_distances_unweighted(numpy_graph, source_nodes, target_nodes)
+                adj_aug, level_hops = self.get_new_adj(o_adj, self.k, n_add=sub_entry_num, init_hops=init_hops)
+
+                # up_graph = nx.from_numpy_array(adj_aug.cpu().numpy())
+                # new_dict = closest_distances_unweighted(up_graph, list(range(o_adj.shape[0]+sub_entry_num)), target_nodes)
+                # if new_dict == level_hops:
+                #     diff = [k for k in new_dict if k in level_hops and new_dict[k] != level_hops[k]]
+                #     breakpoint()
+            else:
+                if self.adj_n1 is None:
+                    adj_aug = o_adj
+                else:
+                    adj_aug = self.adj_n1
+
+                numpy_graph = nx.from_numpy_array(adj_aug.cpu().numpy())
+                target_nodes = list(range(adj_aug.shape[0]))[:len(seened_set)]
+                source_nodes = list(range(adj_aug.shape[0]))
+                level_hops = closest_distances_unweighted(numpy_graph, source_nodes, target_nodes)
+
+            adj = adj_aug
 
             # transductive
             # unkn = [i for i in range(self.adj.shape[0]) if i not in arrange][:sub_entry_num]
@@ -286,297 +282,333 @@ class UnnamedKrigModelV2(BaseModel):
 
             # adjs = [n_adj]
         else:
-            if masked_set is not None:
-                arrange = known_set + masked_set
-            else:
-                arrange = known_set + [i for i in range(self.adj.shape[0]) if i not in known_set]
+            arrange = known_set + masked_set
 
             n_adj = full_adj[arrange, :]
             n_adj = n_adj[:, arrange]
-
+            
+            numpy_graph = nx.from_numpy_array(n_adj.cpu().numpy())
+            target_nodes = list(range(n_adj.shape[0]))[:len(known_set)]
+            source_nodes = list(range(n_adj.shape[0]))
+            level_hops = closest_distances_unweighted(numpy_graph, source_nodes, target_nodes)
             # n_adj[len(known_set):, :] = 1
             # n_adj[:, len(known_set):] = 1
 
-            adjs = [n_adj]
+            adj = n_adj
 
-        finrecos = []
-        finpreds = []
-        fin_irm_all_s = []
-        output_invars_s = []
-        output_vars_s = []
+        # for adj in adjs:
+        bt, n_og, d = output_invars.shape
 
-        for adj in adjs:
-            bt, n_og, d = output_invars.shape
+        if seened_set != []:
+            # virt = len(arrange)
+            add_nodes = len(masked_set) + sub_entry_num
+        else:
+            # virt = n_og
+            add_nodes = sub_entry_num
+        # ========================================
+        # Edge expansion
+        # ========================================
+        # Propagate variant and invariant features to new nodes features
+        # new_scores = self.expand_adj(adj, scores, add_nodes)
 
-            if seened_set is not None:
-                virt = len(arrange)
-                add_nodes = len(masked_edges) + sub_entry_num
+        if add_nodes != 0:
+            sub_entry = torch.zeros(bt, add_nodes, d).to(device)
+
+            xh_inv = torch.cat([output_invars, sub_entry], dim=1)  # b*t n2 d
+            xh_var = torch.cat([output_vars, sub_entry], dim=1)
+        else:
+            xh_inv = output_invars
+            xh_var = output_vars
+
+        # ========================================
+        # Curriculum based pseudo-labelling
+        # ========================================
+
+        # Get the paritions of each index
+        threshold = self.k
+        grouped = {label: [] for label in list(range(self.k+1))}
+        for key, value in level_hops.items():
+            if value < threshold:
+                if value in grouped:
+                    grouped[value].append(key)
             else:
-                virt = n_og
-                add_nodes = sub_entry_num
-            # ========================================
-            # Edge expansion
-            # ========================================
-            # Propagate variant and invariant features to new nodes features
-            new_scores = self.expand_adj(adj, scores, add_nodes)
+                grouped[threshold].append(key)
 
-            if add_nodes != 0:
-                sub_entry = torch.zeros(bt, add_nodes, d).to(device)
+        ################# Standard Message passing ####################
+        # gcn_adj = dense_to_sparse(adj.to(torch.float32))
+        # t_mask = rearrange(mask, 'b t n d -> (b t) n d')
 
-                xh_inv = torch.cat([output_invars, sub_entry], dim=1)  # b*t n2 d
-                xh_var = torch.cat([output_vars, sub_entry], dim=1)
-            else:
-                xh_inv = output_invars
-                xh_var = output_vars
+        # xh_inv_1 = self.gcn1(xh_inv, gcn_adj[0], gcn_adj[1]) * (1 - t_mask) + xh_inv
+        # xh_inv_2 = self.layernorm1(xh_inv_1)
 
-            scores_var = new_scores.masked_fill(adj == 0, float('1e16'))
-            scores_invar = new_scores.masked_fill(adj == 0, float('-1e16')) 
+        # xh_var_1 = self.gcn1(xh_var, gcn_adj[0], gcn_adj[1]) * (1 - t_mask) + xh_var
+        # xh_var_2 = self.layernorm1(xh_var_1)
 
-            # Softmax to normalize scores, producing attention weights
-            new_var_adj = F.softmax(-scores_var, dim=-1) + adj
-            # new_var_adj = batchwise_min_max_scale(new_var_adj)
-            new_inv_adj = F.softmax(scores_invar, dim=-1) + adj
-            # new_inv_adj = batchwise_min_max_scale(new_inv_adj)
-
-            invar_adj = dense_to_sparse(new_inv_adj)
-            var_adj = dense_to_sparse(new_var_adj)
-
-            # adj_l = dense_to_sparse(adj)
-            # sum_out = rearrange(sum_out, '(b t) n d -> b (t n) d', b=b, t=t)
-
-            # ========================================
-            # Final prediction
-            # ========================================
-            t_mask = rearrange(mask, 'b t n d -> (b t n) d')
-            # Edge weights must be scaled down 
-            # Need to propagate this too
-            # Need to scale the new edges based on the probability of the softmax
-            # [batch, time, node, node]
-
-            n = xh_inv.shape[1]
-            xh_inv = rearrange(xh_inv, 'b n d -> (b n) d')
-            xh_var = rearrange(xh_var, 'b n d -> (b n) d')
-
-            xh_inv_1 = self.gcn1(xh_inv, invar_adj[0], invar_adj[1]) * (1 - t_mask) + xh_inv
-            xh_inv_1 = rearrange(xh_inv_1, '(b t n) d -> b t n d', b=b, t=t)
-            xh_inv_1 = self.layernorm1(xh_inv_1)
-            xh_inv_2 = rearrange(xh_inv_1, 'b t n d -> (b t n) d')
-
-            xh_var_1 = self.gcn1(xh_var, var_adj[0], var_adj[1]) * (1 - t_mask) + xh_var
-            xh_var_1 = rearrange(xh_var_1, '(b t n) d -> b t n d', b=b, t=t)
-            xh_var_1 = self.layernorm1(xh_var_1)
-            xh_var_2 = rearrange(xh_var_1, 'b t n d -> (b t n) d')
-
-            xh_inv_2 = self.gcn2(xh_inv_2, invar_adj[0], invar_adj[1]) + xh_inv_2
-            xh_inv_2 = rearrange(xh_inv_2, '(b t n) d -> b t n d', b=b, t=t)
-            xh_inv_2 = self.layernorm2(xh_inv_2)
-
-            xh_var_2 = self.gcn2(xh_var_2, var_adj[0], var_adj[1]) + xh_var_2
-            xh_var_2 = rearrange(xh_var_2, '(b t n) d -> b t n d', b=b, t=t)
-            xh_var_2 = self.layernorm2(xh_var_2)
-
-            # With the final representations, predict the unknown nodes again, just using the invariant features
-            # Get reconstruction loss with pseudo labels 
-
-            # GCN
-            # finrp = self.gcn1(xh_inv, invar_adj[0], invar_adj[1], batch=batches)
-
-            finrp = self.readout1(xh_inv_2)
-            finpreds.append(finrp)
-            if not training:
-                if predict:
-                    return finpreds[0], new_inv_adj[0].unsqueeze(0), new_var_adj[0].unsqueeze(0)
-                else:
-                    return finpreds[0]
-
-            # ========================================
-            # MMD of embeddings
-            # ========================================
-
-            # Get embedding softmax
-            if self.mmd_ratio < 1.0:
-                s_batch = int(b*self.mmd_ratio)
-                indx = torch.randperm(b, device=device)[:s_batch]
-
-                vir_inv = xh_inv_2[indx]
-                vir_var = xh_var_2[indx]
-
-                mmd_scores = rearrange(new_scores, '(b t) n d -> b t n d', b=b)[indx]
-
-            # Get embedding softmax
-            sps_var_adj = F.softmax(-mmd_scores, dim=-1) #* (adj + EPSILON)
-            sps_inv_adj = F.softmax(mmd_scores, dim=-1) #* (adj + EPSILON)
-
-            # Get most similar embedding with virtual nodes and vice versa
-            sps_var_max = torch.argmax((sps_var_adj[:, :, virt:, :virt]), dim=-1)
-            sps_inv_max = torch.argmax((sps_inv_adj[:, :, virt:, :virt]), dim=-1)
-
-            # sps_var_max = sps_var_max[:, n_og:]
-            # sps_inv_max = sps_inv_max[:, n_og:]
-
-            sps_var_max = sps_var_max.unsqueeze(-1).expand(-1, -1, -1, vir_var.size(-1))
-            sps_inv_max = sps_inv_max.unsqueeze(-1).expand(-1, -1, -1, vir_inv.size(-1))
-
-            sim_inv = torch.gather(vir_inv, dim=2, index=sps_inv_max)
-            sim_var = torch.gather(vir_var, dim=2, index=sps_var_max)
-
-            # # Sample batches
-            # if self.mmd_ratio < 1.0:
-            #     s_batch = int(b*self.mmd_ratio)
-            #     indx = torch.randperm(b, device=device)[:s_batch]
-            #     sim_inv = sim_inv[indx]
-            #     sim_var = sim_var[indx]
-
-            #     vir_inv = xh_inv_1[indx]
-            #     vir_var = xh_var_1[indx]
-            
-            # Shape: b*t, n, n
-            emb_tru_inv = sim_inv.view(s_batch*t, sub_entry_num, d).permute(1, 0, 2)
-            emb_tru_var = sim_var.view(s_batch*t, sub_entry_num, d).permute(1, 0, 2)
-
-            emb_vir_inv = vir_inv[:, :, virt:].view(s_batch*t, sub_entry_num, d).permute(1, 0, 2)
-            emb_vir_var = vir_var[:, :, virt:].view(s_batch*t, sub_entry_num, d).permute(1, 0, 2)
-
-            finrecos.append([emb_tru_inv, emb_tru_var, emb_vir_inv, emb_vir_var])
-            # ========================================
-            # IRM model
-            # ========================================
-            # Predict the real nodes by propagating back using both variant and invariant features
-            # Get IRM loss
-            fin_irm_all = []
+        ################# Curriculum learning ########################
+        # Add loop here that goes at every khop
+        # [batch, time, node, node]
+        gcn_adj = dense_to_sparse(adj.to(torch.float32))
         
-            for _ in range(self.steps):
-                seen_vars = xh_var_2[:, :, :len(known_set)]
-                seen_invr = xh_inv_2[:, :, :len(known_set)]
-                # unsn_vars = xh_var_2[:, :, len(known_set):]
-                
-                seen_vars_l = rearrange(seen_vars, 'b t n d -> b (t n) d', b=b, t=t)
-                # unsn_vars_l = rearrange(unsn_vars, 'b t n d -> b (t n) d', b=b, t=t)
+        xh_inv_2 = torch.zeros_like(xh_inv).to(device=device)
+        xh_var_2 = torch.zeros_like(xh_var).to(device=device)
 
-                s_rands = torch.randperm(seen_vars_l.shape[1])
-                # u_rands = torch.randperm(unsn_vars_l.shape[1])
-                # rands = torch.randperm(xh_var_l.shape[1])
+        cur_indices_tensor = torch.tensor(grouped[0], dtype=torch.long, device=device)
+        cur_ind_exp = cur_indices_tensor[None, :, None].expand(bt, -1, xh_inv.size(-1))
+        
+        xh_inv_2 = xh_inv_2.scatter(1, cur_ind_exp, xh_inv[:, grouped[0], :])
+        xh_var_2 = xh_var_2.scatter(1, cur_ind_exp, xh_var[:, grouped[0], :])
 
-                rand_seen = seen_vars_l[:, s_rands, :]
-                # rand_unsn = unsn_vars_l[:, u_rands, :]
-                # rand_vars = xh_var_l[:, rands, :] #.detach()
+        for kh in range(1, self.k+1):
+            # Pass if there are no k-hop reach nodes
+            if grouped[kh] == []:
+                continue
 
-                rand_seen = rearrange(rand_seen, 'b (t n) d -> b t n d', t=t)
-                # rand_unsn = rearrange(rand_unsn, 'b (t n) d -> b t n d', t=t)
-                
-                # rand_vars = torch.cat((rand_seen, rand_unsn), dim=2)
-                # fin_vars = self.layernorm2(xh_inv_2 + rand_vars)
-                fin_vars = torch.cat((seen_invr, rand_seen), dim=-1)
-                # fin_irm = self.gcn2(xh_inv + rand_vars, invar_adj[0], invar_adj[1], batch=batches)
-                fin_irm = self.readout3(fin_vars)
-                fin_irm_all.append(fin_irm)
+            # Organise the khop nodes 
+            # Get the indices of vertices within k-hop reach
+            rep_indices = []
+            cur_indices = grouped[kh]
+            for i in range(kh+1):
+                rep_indices += grouped[i]
+            
+            if kh < self.k:
+                # rep_mask = t_mask[:, rep_indices]
+                rep_adj = adj[:, rep_indices].detach()
+                rep_adj = rep_adj[rep_indices, :]
+                # if len(rep_indices) > xh_inv_2.shape[1]:
+                #     breakpoint()
+                # if max(rep_indices) >= xh_inv_2.shape[1]:
+                #     breakpoint()
 
-            fin_irm_all = torch.stack(fin_irm_all)
-            fin_irm_all_s.append(fin_irm_all)
+                rep_inv = xh_inv_2[:, rep_indices, :].detach()
+                rep_var = xh_var_2[:, rep_indices, :].detach()
+            else:
+                # rep_mask = t_mask
+                rep_adj = adj.detach()
+                rep_inv = xh_inv_2.detach()
+                rep_var = xh_var_2.detach()
+
+            rep_adj = dense_to_sparse(rep_adj.to(torch.float32))
+            # Do the iterative psuedolabelling here
+            xh_inv_0 = self.gcn1(rep_inv, rep_adj[0], rep_adj[1])
+            xh_inv_1 = self.layernorm1(xh_inv_0)
+
+            xh_var_0 = self.gcn1(rep_var, rep_adj[0], rep_adj[1])
+            xh_var_1 = self.layernorm1(xh_var_0)
+
+            cur_indices_tensor = torch.tensor(cur_indices, dtype=torch.long, device=device)
+            cur_ind_exp = cur_indices_tensor[None, :, None].expand(bt, -1, xh_inv_1.size(-1))
+
+            xh_inv_2 = xh_inv_2.scatter(1, cur_ind_exp, xh_inv_1[:, -len(cur_indices):, :])
+            xh_var_2 = xh_var_2.scatter(1, cur_ind_exp, xh_var_1[:, -len(cur_indices):, :])
+
+            # huh1 = torch.sum(xh_var_0, dim=(0, 2))
+            # huh2 = torch.sum(xh_inv_0, dim=(0, 2))
+            # hu31 = torch.sum(xh_var_1, dim=(0, 2))
+            # hu41 = torch.sum(xh_inv_1, dim=(0, 2))
+            # huh3 = torch.sum(xh_var_1[:, -len(cur_indices):, :], dim=(0, 2))
+            # huh4 = torch.sum(xh_inv_1[:, -len(cur_indices):, :], dim=(0, 2))
+            # huh5 = torch.sum(xh_var_2, dim=(0, 2))
+            # huh6 = torch.sum(xh_inv_2, dim=(0, 2))
+            # yes = 1
+
+        # inv_sim = self.get_sim(xh_inv_2, known_set)
+        # var_sim = self.get_sim(xh_var_2, known_set)
+
+        # xh_inv_3 = torch.cat([xh_inv_2, inv_sim], dim=-1)
+        # xh_var_3 = torch.cat([xh_var_2, var_sim], dim=-1)
+        
+        # xh_inv_3 = self.squeeze(xh_inv_3)
+        # xh_var_3 = self.squeeze(xh_var_3)
+
+        # xh_inv_2 = self.layernorm2(xh_inv_3)
+        # xh_var_2 = self.layernorm2(xh_var_3)
+
+        # ========================================
+        # Final Message Passing
+        # ========================================
+        xh_inv_2 = self.gcn2(xh_inv_2, gcn_adj[0], gcn_adj[1]) + xh_inv_2
+        xh_inv_2 = self.layernorm2(xh_inv_2)
+
+        xh_var_2 = self.gcn2(xh_var_2, gcn_adj[0], gcn_adj[1]) + xh_var_2
+        xh_var_2 = self.layernorm2(xh_var_2)
+
+        xh_inv_2 = rearrange(xh_inv_2, '(b t) n d -> b t n d', b=b, t=t)
+        xh_var_2 = rearrange(xh_var_2, '(b t) n d -> b t n d', b=b, t=t)
+
+        finpreds = self.readout1(xh_inv_2)
+        if not training:
+            return finpreds
+        
+        # ========================================
+        # MMD of embeddings
+        # ========================================
+        # Get embedding softmax
+        if self.mmd_ratio < 1.0:
+            s_batch = int(b*self.mmd_ratio)
+            indx = torch.randperm(b, device=device)[:s_batch]
+
+            vir_inv = xh_inv_2[indx]
+            vir_var = xh_var_2[indx]
+                    
+        finrecos = []
+        for i in range(self.k+1):
+            emb_tru_inv = vir_inv[:, :, grouped[i]]
+            emb_tru_inv = rearrange(emb_tru_inv, 'b t n d -> b (t n) d')
+
+            emb_tru_var = vir_var[:, :, grouped[i]]
+            emb_tru_var = rearrange(emb_tru_var, 'b t n d -> b (t n) d')
+
+            if i == 0:
+                emb_tru_inv = emb_tru_inv.detach()
+                emb_tru_var = emb_tru_var.detach()
+
+            if emb_tru_inv.numel() == 0 or emb_tru_var.numel() == 0:
+                continue
+            else:
+                finrecos.append([emb_tru_inv, emb_tru_var])
+
+        # emb_tru_inv = vir_inv[:, :, :virt]
+        # emb_tru_inv = rearrange(emb_tru_inv, 'b t n d -> t (b n) d')
+        # emb_tru_var = vir_var[:, :, :virt]
+        # emb_tru_var = rearrange(emb_tru_var, 'b t n d -> t (b n) d')
+
+        # emb_vir_inv = vir_inv[:, :, virt:]
+        # emb_vir_inv = rearrange(emb_vir_inv, 'b t n d -> t (b n) d')
+        # emb_vir_var = vir_var[:, :, virt:]
+        # emb_vir_var = rearrange(emb_vir_var, 'b t n d -> t (b n) d')
+
+        # finrecos.append([emb_tru_inv, emb_tru_var, emb_vir_inv, emb_vir_var])
+        # # ========================================
+        # IRM model
+        # ========================================
+        # Predict the real nodes by propagating back using both variant and invariant features
+        # Get IRM loss
+        fin_irm_all = []
+        for _ in range(self.steps):
+            seen_vars = xh_var_2[:, :, :len(known_set)]
+            seen_invr = xh_inv_2[:, :, :len(known_set)]
+            
+            seen_vars_l = rearrange(seen_vars, 'b t n d -> b (t n) d', b=b, t=t)
+            s_rands = torch.randperm(seen_vars_l.shape[1])
+            rand_seen = seen_vars_l[:, s_rands, :].detach()
+
+            rand_seen = rearrange(rand_seen, 'b (t n) d -> b t n d', t=t)
+            fin_vars = torch.cat((seen_invr, rand_seen), dim=-1)
+            fin_irm = self.readout3(fin_vars)
+            fin_irm_all.append(fin_irm)
+
+        fin_irm_all = torch.stack(fin_irm_all)
         # ========================================
         # Size regularisation
         # ========================================
         # Regularise both graphs using CMD using 
         # <https://proceedings.neurips.cc/paper_files/paper/2022/file/ceeb3fa5be458f08fbb12a5bb783aac8-Paper-Conference.pdf>
 
-        return finpreds, finrecos, fin_irm_all_s, output_invars_s, output_vars_s
+        return finpreds, finrecos, fin_irm_all
+    
+    def get_sim(self, embs, knownset, eps=1e-8):
+        # B*T N D
+        Bt, N, D = embs.shape
+        q = embs.clone() 
+        k = embs.clone().transpose(-2, -1)
+        q_norm = torch.norm(q, 2, 2, True)
+        k_norm = torch.norm(k, 2, 1, True)
 
-    def expand_adj(self, adj, scores, sub_entry_num):
-        # Get immediate edge samples
-        first_adj = adj[:scores.shape[-1], :scores.shape[-1]]
-        mask = first_adj != 0
-        # scores *= mask
-        mask_scores = scores * mask
-        means = mask_scores.sum(dim=-1)/mask.sum(dim=1).clamp(min=1)
-        squared_diff = ((mask_scores - means.unsqueeze(-1)) ** 2) * mask
-        variance = torch.sqrt(squared_diff.sum(dim=-1) / (mask.sum(dim=1) - 1).clamp(min=1))
+        cos_sim = torch.bmm(q, k) / (torch.bmm(q_norm, k_norm) + eps) 
+        cos_sim = (cos_sim + 1.) / 2.
 
-        means_exp = means.unsqueeze(-1).expand(-1, -1, sub_entry_num)
-        variance_exp = variance.unsqueeze(-1).expand(-1, -1, sub_entry_num)
-        inc_edge = torch.normal(mean=means_exp, std=torch.sqrt(variance_exp)).to(device=scores.device)
-
-        # Get virtual edge samples
-        new_scores = torch.cat((scores, inc_edge), dim=-1)
-        zeros = torch.zeros((new_scores.shape[0], sub_entry_num, new_scores.shape[-1])).to(device=adj.device)
-        new_scores = torch.cat((new_scores, zeros), dim=1)
-
-        upper = torch.triu(new_scores, diagonal=1)
-        new_scores[:, scores.shape[-1]:, :] = ((new_scores + upper.transpose(-1, -2)))[:, scores.shape[-1]:, :]
-
-        next_mask = adj[scores.shape[-1]:, :scores.shape[-1]]
-        next_scores = new_scores[:, scores.shape[-1]:, :scores.shape[-1]] * next_mask
-
-        means = next_scores.sum(dim=-1)/next_mask.sum(dim=1).clamp(min=1)
-        squared_diff = ((next_scores - means.unsqueeze(-1)) ** 2) * next_mask
-        variance = torch.sqrt(squared_diff.sum(dim=-1) / (next_mask.sum(dim=1) - 1).clamp(min=1))
-
-        means_exp = means.unsqueeze(-1).expand(-1, -1, sub_entry_num)
-        variance_exp = variance.unsqueeze(-1).expand(-1, -1, sub_entry_num)
-        inc_edge = torch.normal(mean=means_exp, std=torch.sqrt(variance_exp)).to(device=scores.device)
-
-        new_scores[:, scores.shape[-1]:, scores.shape[-1]:] = inc_edge
-        # mask = adj != 0
-        # new_scores *= mask
-        return new_scores
-
-    def get_new_adj(adj, sub_entry_num):
-        n1 = adj.shape[0]
+        idx = torch.arange(N, device=embs.device)
+        cos_sim[:, idx, idx] = 0
+        cos_sim[:, :len(knownset), :len(knownset)] = 0
+        cos_sim[:, len(knownset):, len(knownset):] = 0
         
-        # if self.obs_neighbors is None:
-        neighbors_1h = {}
+        cos_sim_val, cos_sim_ind = torch.max(cos_sim, dim=1)
+        cos_sim_ind = cos_sim_ind.unsqueeze(-1).expand(-1, -1, D)
+        cos_sim_val = cos_sim_val.unsqueeze(-1).expand(-1, -1, D)
 
-        for i in range(n1):
-            row_n_1 = set(torch.nonzero(adj[i]).squeeze(1).tolist())
-            col_n_1 = set(torch.nonzero(adj[:, i]).squeeze(1).tolist())
-            all_n_1 = row_n_1.union(col_n_1)
+        sim_emb = torch.gather(embs, dim=1, index=cos_sim_ind).detach()
+        # check1 = torch.min(cos_sim_ind[:, :len(knownset)])
+        # if len(knownset) < cos_sim_ind.shape[1]:
+        #     check2 = torch.max(cos_sim_ind[:, len(knownset):])
 
-            # 1-hop neighbors
-            neighbors_1h[i] = list(all_n_1)
+        return sim_emb * cos_sim_val
 
-        n2 = n1 + sub_entry_num
+    def get_new_adj(self, adj, k, n_add, scale=1.0, init_hops={}):
+        """
+        Add n_add new nodes to a subgraph adjacency matrix.
+        
+        Parameters:
+        - subgraph_adj (np.ndarray): Initial adjacency matrix (n x n).
+        - n_add (int): Number of nodes to add.
+        - connect_prob (float): Probability of connecting to anchor's neighbors.
+
+        Returns:
+        - new_adj (np.ndarray): Updated adjacency matrix.
+        - new_node_indices (list): Indices of added nodes.
+        """
+        current_adj = adj.clone()
+        n_current = current_adj.shape[0]
+        prev_cur = 0
+
+        partitions = np.random.exponential(scale, k)
+        partitions = partitions / partitions.sum() * n_add
+        partitions = np.round(partitions).astype(int)
+        partitions[-1] += n_add - partitions.sum()
+        partitions = np.sort(partitions)[::-1]
+
+        if partitions[-1] < 0:
+            partitions[0] += partitions[-1]
+            partitions[-1] = 0
+
+        levels = {i:0 for i in range(n_current+n_add)} | init_hops
+        for hops, part in enumerate(partitions):
+            for i in range(part):
+                n = current_adj.shape[0]
+                new_node_index = n
+
+                # Initialize new (n+1)x(n+1) matrix
+                expanded = torch.zeros(size=(n + 1, n + 1)).to(device=adj.device, dtype=torch.int)
+                expanded[:n, :n] = current_adj
+
+                # Select random anchor
+                anchor = random.randint(prev_cur, n_current - 1)
+                levels[n] = max(levels[anchor] + 1, 1)
+                    
+                # Connect to anchor
+                expanded[anchor, new_node_index] = 1
+                expanded[new_node_index, anchor] = 1
+
+                # Optionally connect to anchor's neighbors
+                neighbors = torch.nonzero(current_adj[anchor, :n_current]).squeeze(-1)
+                # print(anchor, neighbors)
+                for neighbor in neighbors:
+                    connect_prob = np.random.rand(1)
+                    if np.random.rand(1) < connect_prob and levels[n] >= levels[neighbor.item()]:
+                        expanded[neighbor, new_node_index] = 1.
+                        expanded[new_node_index, neighbor] = 1.
+
+                        if levels[n] > levels[neighbor.item()]:
+                            levels[n] = max(levels[neighbor.item()] + 1, 1)
+
+                # Update current_adj
+                current_adj = expanded
+            prev_cur = n_current
+            n_current += part
+
         # Create matrices for both n1 and n2
-        adj_aug_n1 = torch.rand((n2, n2)).to(device = adj.device)  # n2, n2
+        adj_aug_n1 = torch.rand((current_adj.shape)).to(device = adj.device)  # n2, n2
         adj_aug_n1 = torch.triu(adj_aug_n1) + torch.triu(adj_aug_n1, 1).T
 
         # preserve original observed parts in newly-created adj
-        adj_aug_n1[:n1, :n1] = adj
         adj_aug_n1 = adj_aug_n1.fill_diagonal_(0)
-        adj_aug_mask_n1 = torch.zeros_like(adj_aug_n1)  # n2, n2
+        adj_aug_n1 *= current_adj
+        adj_aug_n1[:adj.shape[0], :adj.shape[0]] = adj
 
-        adj_aug_mask_n1[:n1, :n1] = 1
-        neighbors_1 = copy.deepcopy(neighbors_1h)
+        if adj_aug_n1.shape[0] > adj.shape[0] + n_add:
+            breakpoint()
 
-        for i in range(n1, n2):
-            n_current = range(len(neighbors_1.keys()))  # number of current entries (obs and already added virtual)
-            rand_entry = random.sample(n_current, 1)[0] # randomly sample 1 entry (obs or already added virtual)
-            rand_neighbors_1 = neighbors_1[rand_entry]  # get 1-hop neighbors of sampled entry
-
-            p = np.random.rand(1)
-
-            # randomly select 1 hop neighbors
-            valid_neighbors_1 = (np.random.rand(len(rand_neighbors_1)) < p).astype(int)
-            valid_neighbors_1 = np.where(valid_neighbors_1 == 1)[0].tolist()
-            valid_neighbors_1 = [rand_neighbors_1[idx] for idx in valid_neighbors_1]
-
-            all_entries = [rand_entry]
-            all_entries.extend(valid_neighbors_1)
-
-            # add current virtual entry to the 1-hop neighbors of selected entries
-            for entry in all_entries:
-                neighbors_1[entry].append(i)
-
-            # add selected entries to the 1-hop neighbors of current virtual entry
-            neighbors_1[i] = all_entries
-
-            # Add to mask
-            for j in range(len(all_entries)):
-                entry = all_entries[j]
-                adj_aug_mask_n1[entry, i] = 1
-                adj_aug_mask_n1[i, entry] = 1
-
-        adj_aug_n1 *= adj_aug_mask_n1
-
-        return adj_aug_n1
+        return adj_aug_n1, levels
+    
     def scaled_dot_product_attention(self, Q, K, V, mask):
     # Compute the dot products between Q and K, then scale by the square root of the key dimension
         d_k = Q.size(-1)
@@ -635,7 +667,7 @@ class UnnamedKrigModelV2(BaseModel):
         output_invar = self.out_proj(output_invar.transpose(1, 2).contiguous().view(B, T, D))
         output_var = self.out_proj(output_var.transpose(1, 2).contiguous().view(B, T, D))
 
-        return attention_weights_var.detach(), attention_weights_invar.detach(), output_invar, output_var, scores.detach()
+        return output_invar, output_var
 
 # from Grin import get_dataset
 # from tsl.data import ImputationDataset, SpatioTemporalDataModule

@@ -3,6 +3,8 @@ import torch
 import ot
 import copy
 import networkx as nx
+import scipy
+from einops import rearrange
 from torch_scatter import scatter
 
 
@@ -35,11 +37,11 @@ def get_neighbors(g):
             adj[node1] = [node2]
     return adj
 
-def kernel(X, mul_fac=2.0, n_ker=5, eps=1e-8):
+def kernel(X, mul_fac=2.0, n_ker=3, eps=1e-8):
     L2_distances = torch.cdist(X, X) ** 2
     bandwidth_multipliers = mul_fac ** (torch.arange(n_ker).to(X.device) - n_ker // 2)
     n_samples = L2_distances.shape[0]
-    bandwidth = L2_distances.data.sum() / (n_samples ** 2 - n_samples) + eps
+    bandwidth = L2_distances.data.sum() / (n_samples ** 2 - n_samples + eps)
 
     return torch.exp(-L2_distances[None, ...] / (bandwidth * bandwidth_multipliers)[:, None, None]).sum(dim=0)
 
@@ -58,6 +60,54 @@ def mmd_loss(X_n, Y_n):
 
     return torch.stack(mmd_losses).mean()
 
+def mmd_loss_single(X_n, Y_n):
+    K = kernel(torch.vstack([X_n, Y_n]))
+
+    X_size = X_n.shape[0]
+    XX = K[:X_size, :X_size].mean()
+    XY = K[:X_size, X_size:].mean()
+    YY = K[X_size:, X_size:].mean()
+    return XX - 2 * XY + YY
+
+def classical_mds_with_inf(D, d=2):
+    """
+    Classical MDS with support for infinite distances by computing shortest paths.
+    D: (n x n) distance matrix with finite and inf values.
+    d: target embedding dimension (e.g., 2 for x-y)
+    Returns: (n x d) coordinate matrix
+    """
+    # Step 1: Replace inf by computing shortest paths (graph interpretation)
+    D_filled = scipy.sparse.csgraph.floyd_warshall(D, directed=False)
+
+    # Step 2: Classical MDS (same as before)
+    n = D_filled.shape[0]
+    D_squared = D_filled ** 2
+    J = np.eye(n) - np.ones((n, n)) / n
+    B = -0.5 * J @ D_squared @ J
+
+    # Step 3: Eigen-decomposition
+    eigvals, eigvecs = np.linalg.eigh(B)
+    idx = np.argsort(eigvals)[::-1]
+    eigvals = eigvals[idx]
+    eigvecs = eigvecs[:, idx]
+
+    # Step 4: Keep top d components
+    L = np.diag(np.sqrt(np.maximum(eigvals[:d], 0)))
+    V = eigvecs[:, :d]
+    X = V @ L
+    return X
+
+def closest_distances_unweighted(G, source_nodes, target_nodes):
+    result = {}
+    target_set = set(target_nodes)
+    
+    for source in source_nodes:
+        lengths = nx.single_source_shortest_path_length(G, source)
+        distances = [lengths[t] for t in target_set if t in lengths]
+        result[source] = min(distances) if distances else float('inf')
+    
+    return result
+
 def batchwise_min_max_scale(x, eps=1e-8):
     x_min = x.view(x.size(0), -1).min(dim=1, keepdim=True).values  # [batch, 1]
     x_max = x.view(x.size(0), -1).max(dim=1, keepdim=True).values  # [batch, 1]
@@ -66,145 +116,6 @@ def batchwise_min_max_scale(x, eps=1e-8):
     x_max = x_max.view(-1, 1, 1)  # [batch, 1, 1]
 
     return (x - x_min) / (x_max - x_min + eps)
-
-def TMD(g1, g2, w, L=4):
-    '''
-    return the Tree Mover’s Distance (TMD) between g1 and g2
-
-    Parameters
-    ----------
-    g1, g2 : two torch_geometric graphs
-    w : weighting constant for each depth
-         if it is a list, then w[l] is the weight for depth-(l+1) tree
-         if it is a constant, then every layer shares the same weight
-    L    : Depth of computation trees for calculating TMD
-
-    Returns
-    ----------
-    wass : The TMD between g1 and g2
-
-    Reference
-    ----------
-    Chuang et al., Tree Mover’s Distance: Bridging Graph Metrics and
-    Stability of Graph Neural Networks, NeurIPS 2022
-    '''
-
-    if isinstance(w, list):
-        assert(len(w) == L-1)
-    else:
-        w = [w] * (L-1)
-
-    # get attributes
-    n1, n2 = len(g1.x), len(g2.x)
-    feat1, feat2 = g1.x, g2.x
-    adj1 = get_neighbors(g1)
-    adj2 = get_neighbors(g2)
-
-    blank = np.zeros(len(feat1[0]))
-    D = np.zeros((n1, n2))
-
-    # level 1 (pair wise distance)
-    M = np.zeros((n1+1, n2+1))
-    for i in range(n1):
-        for j in range(n2):
-            D[i, j] = torch.norm(feat1[i] - feat2[j])
-            M[i, j] = D[i, j]
-    # distance w.r.t. blank node
-    M[:n1, n2] = torch.norm(feat1, dim=1)
-    M[n1, :n2] = torch.norm(feat2, dim=1)
-
-    # level l (tree OT)
-    for l in range(L-1):
-        M1 = copy.deepcopy(M)
-        M = np.zeros((n1+1, n2+1))
-
-        # calculate pairwise cost between tree i and tree j
-        for i in range(n1):
-            for j in range(n2):
-                try:
-                    degree_i = len(adj1[i])
-                except:
-                    degree_i = 0
-                try:
-                    degree_j = len(adj2[j])
-                except:
-                    degree_j = 0
-
-                if degree_i == 0 and degree_j == 0:
-                    M[i, j] = D[i, j]
-                # if degree of node is zero, calculate TD w.r.t. blank node
-                elif degree_i == 0:
-                    wass = 0.
-                    for jj in range(degree_j):
-                        wass += M1[n1, adj2[j][jj]]
-                    M[i, j] = D[i, j] + w[l] * wass
-                elif degree_j == 0:
-                    wass = 0.
-                    for ii in range(degree_i):
-                        wass += M1[adj1[i][ii], n2]
-                    M[i, j] = D[i, j] + w[l] * wass
-                # otherwise, calculate the tree distance
-                else:
-                    max_degree = max(degree_i, degree_j)
-                    if degree_i < max_degree:
-                        cost = np.zeros((degree_i + 1, degree_j))
-                        cost[degree_i] = M1[n1, adj2[j]]
-                        dist_1, dist_2 = np.ones(degree_i + 1), np.ones(degree_j)
-                        dist_1[degree_i] = max_degree - float(degree_i)
-                    else:
-                        cost = np.zeros((degree_i, degree_j + 1))
-                        cost[:, degree_j] = M1[adj1[i], n2]
-                        dist_1, dist_2 = np.ones(degree_i), np.ones(degree_j + 1)
-                        dist_2[degree_j] = max_degree - float(degree_j)
-                    for ii in range(degree_i):
-                        for jj in range(degree_j):
-                            cost[ii, jj] =  M1[adj1[i][ii], adj2[j][jj]]
-                    wass = ot.emd2(dist_1, dist_2, cost)
-
-                    # summarize TMD at level l
-                    M[i, j] = D[i, j] + w[l] * wass
-
-        # fill in dist w.r.t. blank node
-        for i in range(n1):
-            try:
-                degree_i = len(adj1[i])
-            except:
-                degree_i = 0
-
-            if degree_i == 0:
-                M[i, n2] = torch.norm(feat1[i])
-            else:
-                wass = 0.
-                for ii in range(degree_i):
-                    wass += M1[adj1[i][ii], n2]
-                M[i, n2] = torch.norm(feat1[i]) + w[l] * wass
-
-        for j in range(n2):
-            try:
-                degree_j = len(adj2[j])
-            except:
-                degree_j = 0
-            if degree_j == 0:
-                M[n1, j] = torch.norm(feat2[j])
-            else:
-                wass = 0.
-                for jj in range(degree_j):
-                    wass += M1[n1, adj2[j][jj]]
-                M[n1, j] = torch.norm(feat2[j]) + w[l] * wass
-
-
-    # final OT cost
-    max_n = max(n1, n2)
-    dist_1, dist_2 = np.ones(n1+1), np.ones(n2+1)
-    if n1 < max_n:
-        dist_1[n1] = max_n - float(n1)
-        dist_2[n2] = 0.
-    else:
-        dist_1[n1] = 0.
-        dist_2[n2] = max_n - float(n2)
-
-    wass = ot.emd2(dist_1, dist_2, M)
-    return wass
 
 def l2diff(x1, x2):
     """
@@ -221,7 +132,7 @@ def moment_diff(sx1, sx2, k, og_batch, coarse_batch):
     ss2 = scatter(sx2**k, coarse_batch, dim=0, dim_size=None, reduce='mean')
     return l2diff(ss1,ss2)
 
-def cmd(x1, x2, og_batch, coarse_batch, n_moments=5):
+def cmd(x1, x2, og_batch, coarse_batch, n_moments=2):
     """
     central moment discrepancy (cmd)
     - Zellinger, Werner et al. "Robust unsupervised domain adaptation
@@ -244,6 +155,17 @@ def cmd(x1, x2, og_batch, coarse_batch, n_moments=5):
         # moment diff of centralized samples
         scms = scms + moment_diff(sx1, sx2, i+2, og_batch, coarse_batch)
     return scms
+
+def cmd_time(x1, x2, og_batch, coarse_batch, n_moments=2):
+    # Shape T x B*N x D
+    cmd_losses = []
+    T, BN, D = x1.shape
+
+    for t in range(T):
+        cmd_losses.append(cmd(x1[t], x2[t], og_batch, coarse_batch, n_moments).mean())
+    
+    return torch.stack(cmd_losses).mean()
+
 
 def degree_distribution(adj_matrix):
     """Computes the degree distribution from an adjacency matrix."""
