@@ -615,10 +615,10 @@ class UnnamedKrigFillerV2(unKrigFillerV2):
             cmds = torch.tensor([]).to(x.device)
             for reco in finrecos:
                 B = reco.pop(0)
-                og_nt = reco[0].size(1) // B
-                cr_nt = reco[2].size(1) // B
+                og_nt = reco[0].size(1) // (B*s)
+                cr_nt = reco[2].size(1) // (B*s)
 
-                batches = torch.arange(0, B).to(device=x.device)
+                batches = torch.arange(0, B*s).to(device=x.device)
                 og_batch = torch.repeat_interleave(batches, repeats=(og_nt))
                 cr_batch = torch.repeat_interleave(batches, repeats=(cr_nt))
 

@@ -107,19 +107,21 @@ class UnnamedKrigModelV3(BaseModel):
         self.layernorm2 = LayerNorm(hidden_size)
         self.layernorm3 = LayerNorm(hidden_size)
 
-        self.gcn1 = GCN(in_channels=hidden_size,
+        self.gcn1 = GCN(in_channels=hidden_size*3,
                         hidden_channels=hidden_size,
                         num_layers=psd_layers, 
                         out_channels=hidden_size,
                         dropout=dropout,
                         norm=None,
-                        add_self_loops=None)
+                        add_self_loops=None,
+                        act='tanh')
         self.gcn2 = GCN(in_channels=hidden_size,
                         hidden_channels=hidden_size,
                         num_layers=gcn_layers, 
                         out_channels=hidden_size,
                         dropout=dropout,
-                        norm=norm)
+                        norm=norm,
+                        act='tanh')
         
         self.squeeze = MLP(input_size=hidden_size*2,
                             hidden_size=hidden_size,
@@ -347,6 +349,10 @@ class UnnamedKrigModelV3(BaseModel):
                 rep_inv = xh_inv_2.detach()
                 rep_var = xh_var_2.detach()
 
+            # Concatenate t-1, t, t+1 into one vector then pass
+            rep_inv = self.expand_embs(b, rep_inv)
+            rep_var = self.expand_embs(b, rep_var)
+
             rep_adj = dense_to_sparse(rep_adj.to(torch.float32))
 
             xh_inv_0 = self.gcn1(rep_inv, rep_adj[0], rep_adj[1])
@@ -418,12 +424,11 @@ class UnnamedKrigModelV3(BaseModel):
 
             # xh_inv_sim = rearrange(inv_sim, '(b t) n d -> b t n d', b=b, t=t)
             # xh_var_sim = rearrange(var_sim, '(b t) n d -> b t n d', b=b, t=t)
+            # sml_inv = xh_inv_sim[indx]
+            # sml_var = xh_var_sim[indx]
 
             vir_inv = xh_inv_3[indx]
             vir_var = xh_var_3[indx]
-
-            # sml_inv = xh_inv_sim[indx]
-            # sml_var = xh_var_sim[indx]
         
         finrecos = []
         for i in range(1, self.k+1):
@@ -480,6 +485,25 @@ class UnnamedKrigModelV3(BaseModel):
 
         return finpreds, finrecos, fin_irm_all
     
+    def expand_embs(self, b, data):  
+        data = rearrange(data, '(b t) n d -> b t n d', b=b)
+
+        # Pad in the time dimension (dim=1) with zeros on both sides
+        # Padding = (0, 0, 0, 0, 1, 1): pads nothing on dims/node, but 1 on time before and after
+        pad = (0, 0, 0, 0, 1, 1)  # (D, N, T)
+        padded = F.pad(data, pad, mode='constant', value=0)
+        
+        # t-1, t, t+1 embeddings
+        t_minus_1 = padded[:, :-2]  # shape: (B, T, N, D)
+        t_current = padded[:, 1:-1]
+        t_plus_1 = padded[:, 2:]
+        
+        # Concatenate on the last dimension (dim=3)
+        expanded = torch.cat([t_minus_1, t_current, t_plus_1], dim=3)  # shape: (B, T, N, D*3)
+        
+        expanded = rearrange(expanded, 'b t n d -> (b t) n d')
+        return expanded
+    
     def get_sim(self, embs, knownset, invs=True, eps=1e-8):
         # B*T N D
         Bt, N, D = embs.shape
@@ -494,20 +518,20 @@ class UnnamedKrigModelV3(BaseModel):
         idx = torch.arange(N, device=embs.device)
 
         if invs:
-            cos_sim[:, idx, idx] = 0
-            cos_sim[:, :len(knownset), :len(knownset)] = 0
+            # cos_sim[:, idx, idx] = 0
+            # cos_sim[:, :len(knownset), :len(knownset)] = 0
             cos_sim[:, len(knownset):, len(knownset):] = 0
             cos_sim_val, cos_sim_ind = torch.max(cos_sim, dim=1)
         else:
-            cos_sim[:, idx, idx] = torch.inf
-            cos_sim[:, :len(knownset), :len(knownset)] = torch.inf
+            # cos_sim[:, idx, idx] = torch.inf
+            # cos_sim[:, :len(knownset), :len(knownset)] = torch.inf
             cos_sim[:, len(knownset):, len(knownset):] = torch.inf
             cos_sim_val, cos_sim_ind = torch.min(cos_sim, dim=1)
 
         cos_sim_ind = cos_sim_ind.unsqueeze(-1).expand(-1, -1, D)
         cos_sim_val = cos_sim_val.unsqueeze(-1).expand(-1, -1, D)
 
-        sim_emb = torch.gather(embs, dim=1, index=cos_sim_ind)
+        sim_emb = torch.gather(embs, dim=1, index=cos_sim_ind).detach()
         # check1 = torch.min(cos_sim_ind[:, :len(knownset)])
         # if len(knownset) < cos_sim_ind.shape[1]:
         #     check2 = torch.max(cos_sim_ind[:, len(knownset):])

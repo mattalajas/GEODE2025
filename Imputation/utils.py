@@ -132,7 +132,7 @@ def moment_diff(sx1, sx2, k, og_batch, coarse_batch):
     ss2 = scatter(sx2**k, coarse_batch, dim=0, dim_size=None, reduce='mean')
     return l2diff(ss1,ss2)
 
-def cmd(x1, x2, og_batch, coarse_batch, n_moments=2):
+def cmd(x1, x2, og_batch, coarse_batch, n_moments=3):
     """
     central moment discrepancy (cmd)
     - Zellinger, Werner et al. "Robust unsupervised domain adaptation
@@ -156,7 +156,7 @@ def cmd(x1, x2, og_batch, coarse_batch, n_moments=2):
         scms = scms + moment_diff(sx1, sx2, i+2, og_batch, coarse_batch)
     return scms
 
-def cmd_time(x1, x2, og_batch, coarse_batch, n_moments=2):
+def cmd_time(x1, x2, og_batch, coarse_batch, n_moments=3):
     # Shape T x B*N x D
     cmd_losses = []
     T, BN, D = x1.shape
