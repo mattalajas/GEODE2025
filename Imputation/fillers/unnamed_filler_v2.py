@@ -611,7 +611,7 @@ class UnnamedKrigFillerV2(unKrigFillerV2):
                 # MMD for inv 
                 s_batch = reco.pop(0)
                 mmds = torch.cat([mmds, torch.clamp(mmd_loss(reco[0], reco[2]), min=0).unsqueeze(0)])
-                mmds = torch.cat([mmds, torch.clamp(mmd_loss(reco[1], reco[3]), min=0).unsqueeze(0)])
+                # mmds = torch.cat([mmds, torch.clamp(mmd_loss(reco[1], reco[3]), min=0).unsqueeze(0)])
 
                 recon_loss = mmds.mean()
 
@@ -626,10 +626,13 @@ class UnnamedKrigFillerV2(unKrigFillerV2):
                 og_batch = torch.repeat_interleave(batches, repeats=(og_nt))
                 cr_batch = torch.repeat_interleave(batches, repeats=(cr_nt))
 
-                cmds = torch.cat([cmds, torch.clamp(cmd(reco[0].squeeze(0), reco[2].squeeze(0), \
+                inv_emb_tru = rearrange(reco[0], 'b (t n) d -> b t n d', b=s_batch)
+                inv_emb_vir = rearrange(reco[2], 'b (t n) d -> b t n d', b=s_batch)
+
+                cmds = torch.cat([cmds, torch.clamp(cmd(inv_emb_tru, inv_emb_vir, \
                                                         og_batch, cr_batch).mean(), min=0).unsqueeze(0)])
-                cmds = torch.cat([cmds, torch.clamp(cmd(reco[1].squeeze(0), reco[3].squeeze(0), \
-                                                        og_batch, cr_batch).mean(), min=0).unsqueeze(0)])
+                # cmds = torch.cat([cmds, torch.clamp(cmd(reco[1].squeeze(0), reco[3].squeeze(0), \
+                #                                         og_batch, cr_batch).mean(), min=0).unsqueeze(0)])
 
             recon_loss = cmds.mean()
 

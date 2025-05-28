@@ -34,7 +34,7 @@ class UnnamedKrigModelV3(BaseModel):
                  gcn_layers,
                  psd_layers,
                  norm='LayerNorm',
-                 activation='relu',
+                 activation='tanh',
                  dropout=0,
                  intervention_steps=2,
                  horizon=24,
@@ -107,7 +107,7 @@ class UnnamedKrigModelV3(BaseModel):
         self.layernorm2 = LayerNorm(hidden_size)
         self.layernorm3 = LayerNorm(hidden_size)
 
-        self.gcn1 = GCN(in_channels=hidden_size*3,
+        self.gcn1 = GCN(in_channels=hidden_size,
                         hidden_channels=hidden_size,
                         num_layers=psd_layers, 
                         out_channels=hidden_size,
@@ -123,7 +123,11 @@ class UnnamedKrigModelV3(BaseModel):
                         norm=norm,
                         act='tanh')
         
-        self.squeeze = MLP(input_size=hidden_size*2,
+        self.squeeze1 = MLP(input_size=hidden_size*2,
+                            hidden_size=hidden_size,
+                            output_size=hidden_size,
+                            activation=activation)
+        self.squeeze2 = MLP(input_size=hidden_size*3,
                             hidden_size=hidden_size,
                             output_size=hidden_size,
                             activation=activation)
@@ -353,6 +357,9 @@ class UnnamedKrigModelV3(BaseModel):
             rep_inv = self.expand_embs(b, rep_inv)
             rep_var = self.expand_embs(b, rep_var)
 
+            rep_inv = self.squeeze2(rep_inv)
+            rep_var = self.squeeze2(rep_var)
+
             rep_adj = dense_to_sparse(rep_adj.to(torch.float32))
 
             xh_inv_0 = self.gcn1(rep_inv, rep_adj[0], rep_adj[1])
@@ -389,9 +396,9 @@ class UnnamedKrigModelV3(BaseModel):
         xh_inv_3 = torch.cat([xh_inv_2, inv_sim], dim=-1)
         xh_var_3 = torch.cat([xh_var_2, var_sim], dim=-1)
         
-        xh_inv_3 = self.squeeze(xh_inv_3)
+        xh_inv_3 = self.squeeze1(xh_inv_3)
         xh_inv_3 = self.layernorm2(xh_inv_3)
-        xh_var_3 = self.squeeze(xh_var_3)
+        xh_var_3 = self.squeeze1(xh_var_3)
         xh_var_3 = self.layernorm2(xh_var_3)
 
         # xh_inv_3 = self.layernorm2(xh_inv_2 + inv_sim)
@@ -443,16 +450,16 @@ class UnnamedKrigModelV3(BaseModel):
             # emb_com_inv = sml_inv[:, :, grouped[i]]
             # emb_com_var = sml_var[:, :, grouped[i]]
 
-            emb_com_inv = vir_inv[:, :, grouped[0]]
-            emb_com_var = vir_inv[:, :, grouped[0]]
+            emb_com_inv = vir_inv[:, :, prev_group]
+            emb_com_var = vir_inv[:, :, prev_group]
 
             emb_tru_inv = vir_inv[:, :, grouped[i]]
             emb_tru_var = vir_var[:, :, grouped[i]]
 
-            emb_com_inv = rearrange(emb_com_inv, 'b t n d -> 1 (b t n) d')
-            emb_com_var = rearrange(emb_com_var, 'b t n d -> 1 (b t n) d')
-            emb_tru_inv = rearrange(emb_tru_inv, 'b t n d -> 1 (b t n) d')
-            emb_tru_var = rearrange(emb_tru_var, 'b t n d -> 1 (b t n) d')
+            emb_com_inv = rearrange(emb_com_inv, 'b t n d -> b (t n) d')
+            emb_com_var = rearrange(emb_com_var, 'b t n d -> b (t n) d')
+            emb_tru_inv = rearrange(emb_tru_inv, 'b t n d -> b (t n) d')
+            emb_tru_var = rearrange(emb_tru_var, 'b t n d -> b (t n) d')
 
             emb_com_inv = emb_com_inv.detach()
             emb_com_var = emb_com_var.detach()
@@ -474,7 +481,7 @@ class UnnamedKrigModelV3(BaseModel):
             
             seen_vars_l = rearrange(seen_vars, 'b t n d -> b (t n) d', b=b, t=t)
             s_rands = torch.randperm(seen_vars_l.shape[1])
-            rand_seen = seen_vars_l[:, s_rands, :].detach()
+            rand_seen = seen_vars_l[:, s_rands, :]
 
             rand_seen = rearrange(rand_seen, 'b (t n) d -> b t n d', t=t)
             fin_vars = torch.cat((seen_invr, rand_seen), dim=-1)
@@ -491,7 +498,7 @@ class UnnamedKrigModelV3(BaseModel):
         # Pad in the time dimension (dim=1) with zeros on both sides
         # Padding = (0, 0, 0, 0, 1, 1): pads nothing on dims/node, but 1 on time before and after
         pad = (0, 0, 0, 0, 1, 1)  # (D, N, T)
-        padded = F.pad(data, pad, mode='constant', value=0)
+        padded = F.pad(data, pad, mode='replicate')
         
         # t-1, t, t+1 embeddings
         t_minus_1 = padded[:, :-2]  # shape: (B, T, N, D)
