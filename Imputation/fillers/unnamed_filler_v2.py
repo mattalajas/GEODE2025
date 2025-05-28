@@ -118,12 +118,13 @@ class unKrigFillerV2(pl.LightningModule):
         keys = set()
         # iterate over outputs for each batch
         for res in outputs:
-            for k, v in res.items():
-                if k in keys:
-                    processed_res[k].append(v)
-                else:
-                    processed_res[k] = [v]
-                keys.add(k)
+            if res:
+                for k, v in res.items():
+                    if k in keys:
+                        processed_res[k].append(v)
+                    else:
+                        processed_res[k] = [v]
+                    keys.add(k)
         # concatenate results
         for k, v in processed_res.items():
             processed_res[k] = torch.cat(v, 0)
@@ -146,6 +147,9 @@ class unKrigFillerV2(pl.LightningModule):
         reverse[arrange] = torch.arange(len(arrange)).to(arrange.device)
         arrange = arrange.detach().cpu().numpy().tolist()
         known_set = known_set.detach().cpu().numpy().tolist()
+
+        if known_set == []:
+            return None
 
         batch_data["sub_entry_num"] = len(unknown_set)
         batch_data["masked_set"] = unknown_set.detach().cpu().numpy().tolist()
@@ -783,6 +787,9 @@ class UnnamedKrigFillerV2(unKrigFillerV2):
         reverse[arrange] = torch.arange(len(arrange)).to(arrange.device)
         arrange = arrange.detach().cpu().numpy().tolist()
         known_set = known_set.detach().cpu().numpy().tolist()
+
+        if known_set == []:
+            return None
 
         batch_data["sub_entry_num"] = len(unknown_set)
         #     else:
