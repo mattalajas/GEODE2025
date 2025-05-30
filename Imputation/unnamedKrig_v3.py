@@ -121,14 +121,14 @@ class UnnamedKrigModelV3(BaseModel):
                         dropout=dropout,
                         norm=None,
                         add_self_loops=None,
-                        act='tanh')
+                        act=activation)
         self.gcn2 = GCN(in_channels=hidden_size,
                         hidden_channels=hidden_size,
                         num_layers=gcn_layers, 
                         out_channels=hidden_size,
                         dropout=dropout,
                         norm=norm,
-                        act='tanh')
+                        act=activation)
         
         self.squeeze1 = MLP(input_size=hidden_size*2,
                             hidden_size=hidden_size,
@@ -171,14 +171,13 @@ class UnnamedKrigModelV3(BaseModel):
         device = x.device
 
         full_adj = torch.tensor(self.adj).to(device)
-        known_adj = full_adj[known_set, :]
-        known_adj = known_adj[:, known_set]
 
         if seened_set != []:
             o_adj = full_adj[seened_set, :]
             o_adj = o_adj[:, seened_set]
         else:
-            o_adj = known_adj
+            o_adj = full_adj[known_set, :]
+            o_adj = o_adj[:, known_set]
 
         edge_index, edge_weight = dense_to_sparse(o_adj)
         # ========================================
