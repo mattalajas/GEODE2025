@@ -50,21 +50,28 @@ class UnnamedKrigModelV3(BaseModel):
         self.att_heads = att_heads
         input_size += exog_size
 
-        self.gcn_layers_fwd = nn.ModuleList([GraphConv(input_size,
-                                        hidden_size,
-                                        root_weight=False,
-                                        norm='mean',
-                                        activation=activation)])
+        self.gcn_layers_fwd = GCN(in_channels=input_size,
+                                hidden_channels=hidden_size,
+                                out_channels=hidden_size,
+                                num_layers=enc_layers,
+                                norm=norm,
+                                act=activation)
+
+        # self.gcn_layers_fwd = nn.ModuleList([GraphConv(input_size,
+        #                                 hidden_size,
+        #                                 root_weight=False,
+        #                                 norm='mean',
+        #                                 activation=activation)])
         
-        if enc_layers > 1:
-            self.gcn_layers_fwd.extend([
-                            GraphConv(hidden_size, 
-                                      hidden_size, 
-                                      root_weight=False, 
-                                      norm='mean', 
-                                      activation=activation)
-                            for _ in range(gcn_layers - 1)
-                        ])
+        # if enc_layers > 1:
+        #     self.gcn_layers_fwd.extend([
+        #                     GraphConv(hidden_size, 
+        #                               hidden_size, 
+        #                               root_weight=False, 
+        #                               norm='mean', 
+        #                               activation=activation)
+        #                     for _ in range(gcn_layers - 1)
+        #                 ])
 
         self.skip_con_fwd = nn.Linear(input_size, hidden_size)
 
@@ -127,10 +134,10 @@ class UnnamedKrigModelV3(BaseModel):
                             hidden_size=hidden_size,
                             output_size=hidden_size,
                             activation=activation)
-        self.squeeze2 = MLP(input_size=hidden_size*3,
-                            hidden_size=hidden_size,
-                            output_size=hidden_size,
-                            activation=activation)
+        # self.squeeze2 = MLP(input_size=hidden_size*3,
+        #                     hidden_size=hidden_size,
+        #                     output_size=hidden_size,
+        #                     activation=activation)
 
         self.readout1 = nn.Linear(hidden_size, output_size)
         self.readout2 = nn.Linear(hidden_size, output_size)
@@ -183,8 +190,9 @@ class UnnamedKrigModelV3(BaseModel):
         x_fwd = rearrange(x, 'b t n d -> (b t) n d')
         
         out_f = x_fwd
-        for layer in self.gcn_layers_fwd:
-            out_f = layer(out_f, edge_index, edge_weight)
+        out_f = self.gcn_layers_fwd(out_f, edge_index, edge_weight)
+        # for layer in self.gcn_layers_fwd:
+        #     out_f = layer(out_f, edge_index, edge_weight)
         out_f = out_f + self.skip_con_fwd(x_fwd)
 
         # ========================================
@@ -354,11 +362,11 @@ class UnnamedKrigModelV3(BaseModel):
                 rep_var = xh_var_2.detach()
 
             # Concatenate t-1, t, t+1 into one vector then pass
-            rep_inv = self.expand_embs(b, rep_inv)
-            rep_var = self.expand_embs(b, rep_var)
+            # rep_inv = self.expand_embs(b, rep_inv)
+            # rep_var = self.expand_embs(b, rep_var)
 
-            rep_inv = self.squeeze2(rep_inv)
-            rep_var = self.squeeze2(rep_var)
+            # rep_inv = self.squeeze2(rep_inv)
+            # rep_var = self.squeeze2(rep_var)
 
             rep_adj = dense_to_sparse(rep_adj.to(torch.float32))
 
@@ -387,19 +395,20 @@ class UnnamedKrigModelV3(BaseModel):
         # ========================================
         # Append the most similar embedding
         # ========================================
-        inv_sim = self.get_sim(xh_inv_2, known_set)
-        var_sim = self.get_sim(xh_var_2, known_set)
+        inv_sim = self.get_sim(xh_inv_2, known_set, grouped)
+        # var_sim = self.get_sim(xh_var_2, known_set, grouped, invs=False)
 
         # xh_inv_3 = xh_inv_2
         # xh_var_3 = xh_var_2
 
         xh_inv_3 = torch.cat([xh_inv_2, inv_sim], dim=-1)
-        xh_var_3 = torch.cat([xh_var_2, var_sim], dim=-1)
+        xh_var_3 = xh_var_2
+        # xh_var_3 = torch.cat([xh_var_2, var_sim], dim=-1)
         
         xh_inv_3 = self.squeeze1(xh_inv_3)
         xh_inv_3 = self.layernorm2(xh_inv_3)
-        xh_var_3 = self.squeeze1(xh_var_3)
-        xh_var_3 = self.layernorm2(xh_var_3)
+        # xh_var_3 = self.squeeze1(xh_var_3)
+        # xh_var_3 = self.layernorm2(xh_var_3)
 
         # xh_inv_3 = self.layernorm2(xh_inv_2 + inv_sim)
         # xh_var_3 = self.layernorm2(xh_var_2 + var_sim)
@@ -511,7 +520,7 @@ class UnnamedKrigModelV3(BaseModel):
         expanded = rearrange(expanded, 'b t n d -> (b t) n d')
         return expanded
     
-    def get_sim(self, embs, knownset, invs=True, eps=1e-8):
+    def get_sim(self, embs, knownset, grouped, invs=True, eps=1e-8):
         # B*T N D
         Bt, N, D = embs.shape
         q = embs.clone() 
@@ -522,15 +531,31 @@ class UnnamedKrigModelV3(BaseModel):
         cos_sim = torch.bmm(q, k) / (torch.bmm(q_norm, k_norm) + eps) 
         cos_sim = (cos_sim + 1.) / 2.
 
-        idx = torch.arange(N, device=embs.device)
+        idx = torch.arange(len(knownset), N, device=embs.device)
+        grouped_ks = []
 
         if invs:
-            # cos_sim[:, idx, idx] = 0
-            # cos_sim[:, :len(knownset), :len(knownset)] = 0
-            cos_sim[:, len(knownset):, len(knownset):] = 0
+            cos_sim[:, idx, idx] = 0
+
+            for k in range(1, self.k+1):
+                # cos_sim[:, :len(knownset), :len(knownset)] = 0
+
+                for ks in range(k, self.k+1):
+                    grouped_ks.extend(grouped[ks])
+
+                if len(grouped[k]) != 0 or len(grouped_ks) != 0:
+                    rows_t = torch.tensor(grouped[k], dtype=torch.long, device=embs.device)
+                    cols_t = torch.tensor(grouped_ks, dtype=torch.long, device=embs.device)
+
+                    rows, cols = torch.meshgrid(rows_t, cols_t, indexing='ij')
+                    cos_sim[:, rows, cols] = 0
+                
+                grouped_ks = []
+                
             cos_sim_val, cos_sim_ind = torch.max(cos_sim, dim=1)
+
         else:
-            # cos_sim[:, idx, idx] = torch.inf
+            cos_sim[:, idx, idx] = torch.inf
             # cos_sim[:, :len(knownset), :len(knownset)] = torch.inf
             cos_sim[:, len(knownset):, len(knownset):] = torch.inf
             cos_sim_val, cos_sim_ind = torch.min(cos_sim, dim=1)
