@@ -26,12 +26,14 @@ from baselines.IGNNK import IGNNK
 from fillers.KITS_filler import GCNCycVirtualFiller
 from fillers.unnamed_filler import UnnamedKrigFiller
 from fillers.unnamed_filler_v2 import UnnamedKrigFillerV2
+from fillers.unnamed_filler_v4 import UnnamedKrigFillerV4
 from unnamedKrig import UnnamedKrigModel
 from unnamedKrig_v2 import UnnamedKrigModelV2
 from unnamedKrig_v3 import UnnamedKrigModelV3
+from unnamedKrig_v4 import UnnamedKrigModelV4
 from utils import classical_mds_with_inf
 
-MODELS = ['kits', 'unkrig', 'kcn', 'unkrigv2', 'unkrigv3', 'ignnk']
+MODELS = ['kits', 'unkrig', 'kcn', 'unkrigv2', 'unkrigv3', 'unkrigv4', 'ignnk']
 
 def get_model_class(model_str):
     if model_str == 'rnni':
@@ -52,6 +54,8 @@ def get_model_class(model_str):
         model = UnnamedKrigModelV2
     elif model_str == 'unkrigv3':
         model = UnnamedKrigModelV3
+    elif model_str == 'unkrigv4':
+        model = UnnamedKrigModelV4
     elif model_str == 'ignnk':
         model = IGNNK
     else:
@@ -184,6 +188,8 @@ def run_imputation(cfg: DictConfig):
         model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
     elif cfg.model.name == 'unkrigv3':
         model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
+    elif cfg.model.name == 'unkrigv4':
+        model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
     elif cfg.model.name == 'ignnk':
         model_kwargs = dict(z=cfg.model.z, h=cfg.window, K=cfg.model.K)
     elif cfg.model.name == 'kcn':
@@ -198,7 +204,7 @@ def run_imputation(cfg: DictConfig):
 
     if cfg.model.name == 'kcn':
         loss_fn = torch_metrics.MaskedMSE()
-    elif cfg.model.name == 'unkrig' or cfg.model.name == 'unkrigv2' or cfg.model.name == 'unkrigv3':
+    elif cfg.model.name == 'unkrig' or cfg.model.name == 'unkrigv2' or cfg.model.name == 'unkrigv3' or cfg.model.name == 'unkrigv4':
         loss_fn = [torch_metrics.MaskedMAE(), torch_metrics.MaskedMSE()]
     elif cfg.model.name == 'ignnk':
         loss_fn = torch_metrics.MaskedMSE()
@@ -275,6 +281,25 @@ def run_imputation(cfg: DictConfig):
                             gradient_clip_algorithm=cfg.grad_clip_alg,
                             known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
                             **cfg.model.regs)
+    elif cfg.model.name == "unkrigv4":
+        imputer = UnnamedKrigFillerV4(model_class=model_cls,
+                            model_kwargs=model_kwargs,
+                            optim_class=[getattr(torch.optim, cfg.optimizer.name_1), 
+                                         getattr(torch.optim, cfg.optimizer.name_2)],
+                            optim_kwargs=[dict(cfg.optimizer.hparams_1),
+                                          dict(cfg.optimizer.hparams_2)],
+                            loss_fn=loss_fn,
+                            scaled_target=cfg.scale_target,
+                            whiten_prob=cfg.whiten_prob,
+                            pred_loss_weight=cfg.prediction_loss_weight,
+                            warm_up=cfg.warm_up_steps,
+                            metrics=log_metrics,
+                            scheduler_class=scheduler_class,
+                            scheduler_kwargs=scheduler_kwargs,
+                            gradient_clip_val=cfg.grad_clip_val,
+                            gradient_clip_algorithm=cfg.grad_clip_alg,
+                            known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
+                            **cfg.model.regs)
     else:
         imputer = Imputer(model_class=model_cls,
                         model_kwargs=model_kwargs,
@@ -322,7 +347,8 @@ def run_imputation(cfg: DictConfig):
     )
     checkpoint_callback.CHECKPOINT_NAME_LAST = "{epoch}-last"
 
-    if cfg.model.name =='kits' or cfg.model.name =='unkrig' or cfg.model.name =='unkrigv2' or cfg.model.name == 'unkrigv3':
+    if cfg.model.name =='kits' or cfg.model.name =='unkrig' or \
+        cfg.model.name =='unkrigv2' or cfg.model.name == 'unkrigv3' or cfg.model.name == 'unkrigv4':
         trainer = Trainer(
             max_epochs=cfg.epochs,
             default_root_dir=cfg.run.dir,

@@ -291,10 +291,7 @@ class KITS(BaseModel):
                 else:
                     adj_aug = adj
             adj = adj_aug.detach()
-        else:
-            if known_set is not None:
-                adj = adj[known_set, :]
-                adj = adj[:, known_set] 
+            
 
         supp = SpatialConvOrderK.compute_support(adj)
 

@@ -25,7 +25,7 @@ def ensure_list(obj):
     else:
         return [obj]
 
-class unKrigFillerV2(pl.LightningModule):
+class unKrigFillerV4(pl.LightningModule):
     def __init__(self,
                  model_class,
                  model_kwargs,
@@ -51,7 +51,7 @@ class unKrigFillerV2(pl.LightningModule):
         :param scheduler_class: Scheduler class.
         :param scheduler_kwargs: Scheduler's keyword arguments.
         """
-        super(unKrigFillerV2, self).__init__()
+        super(unKrigFillerV4, self).__init__()
         self.save_hyperparameters(ignore=['loss_fn_1'], logger=False)
         self.save_hyperparameters(ignore=['loss_fn_2'], logger=False)
         self.model_cls = model_class
@@ -341,7 +341,7 @@ class unKrigFillerV2(pl.LightningModule):
 
         return cfgs
 
-class UnnamedKrigFillerV2(unKrigFillerV2):
+class UnnamedKrigFillerV4(unKrigFillerV4):
     def __init__(self,
                  model_class,
                  model_kwargs,
@@ -358,11 +358,11 @@ class UnnamedKrigFillerV2(unKrigFillerV2):
                  inductive=True,
                  gradient_clip_val=None,
                  gradient_clip_algorithm=None,
-                 known_set=[],
+                 known_set=None,
                  y1 = 1,
                  y2 = 1,
                  dloss = 'mmd'):
-        super(UnnamedKrigFillerV2, self).__init__(model_class=model_class,
+        super(UnnamedKrigFillerV4, self).__init__(model_class=model_class,
                                                   model_kwargs=model_kwargs,
                                                   optim_class=optim_class,
                                                   optim_kwargs=optim_kwargs,
@@ -472,20 +472,15 @@ class UnnamedKrigFillerV2(unKrigFillerV2):
         opt1, opt2 = self.optimizers()
         batch_data, batch_preprocessing = self._unpack_batch(batch)
 
-        batch_data["known_set"] = self.known_set
-
         x = batch_data["x"]
-        mask = batch_data["mask"]
         y = batch_data.pop("y")
-        batch_data.pop("eval_mask")  # drop this, we will re-create a new eval_mask (=mask during training)
+        batch_data.pop("eval_mask")
         batch_data.pop("edge_index", None)
 
-        # x = x[:, :, train_set, :]  # b s n1 d, n1 = num of known entries
-        # mask = mask[:, :, train_set, :]  # b s n1 d
-        # y = y[:, :, train_set, :]  # b s n1 d
-
+        mask = batch_data["mask"]
         mask_r = rearrange(mask, "b s n 1 -> (b s) n")
         mask_sum = mask_r.sum(0)  # n
+
         if self.known_set is None:
             known_set = torch.where(mask_sum > 0)[0].detach().cpu().numpy().tolist()
             ratio = float(len(known_set) / mask_sum.shape[0])
@@ -495,9 +490,20 @@ class UnnamedKrigFillerV2(unKrigFillerV2):
             ratio = float(len(known_set) / mask_sum.shape[0])
             self.ratio = ratio
 
+        # else:
+        #     known_set = list(range(batch_data['mask'].shape[2]))
+        # else:
+        #     known_set = self.known_set
+
+        batch_data["known_set"] = known_set
+
+        # x = x[:, :, train_set, :]  # b s n1 d, n1 = num of known entries
+        # mask = mask[:, :, train_set, :]  # b s n1 d
+        # y = y[:, :, train_set, :]  # b s n1 d
+
         sub_entry_num = 0
         batch_data["reset"] = self.inductive
-   
+
         # Create randomised model here
         if self.inductive:
             cur_entry_num = mask.size(2)
@@ -522,7 +528,7 @@ class UnnamedKrigFillerV2(unKrigFillerV2):
         # print(seened_indx)
 
         # Arrange the indexes to b s (seen, masked) d
-        x = x[:, :, seened_indx, :] # Input x will just be the seen nodes
+        x = x[:, :, full, :]
         y = y[:, :, full, :]
         mask = mask[:, :, full, :]
         b, s, n, d = mask.size()
@@ -533,8 +539,6 @@ class UnnamedKrigFillerV2(unKrigFillerV2):
             y = torch.cat([y, sub_entry], dim=2)  # b s n2 d
 
         # Mask the training masks too
-        train_mask = mask.clone()
-        train_mask[:, :, len(seened_indx):] = 0.
         batch_data["seened_set"] = seened_indx
         batch_data["masked_set"] = masked_indx
 
@@ -542,16 +546,13 @@ class UnnamedKrigFillerV2(unKrigFillerV2):
         # eval_mask[:, :, :len(seened_indx)] = 0.
 
         batch_data["x"] = x  # b s seen d
-        batch_data["mask"] = train_mask  # b s n' 1
+        batch_data["mask"] = mask  # b s n' 1
         batch_data["sub_entry_num"] = sub_entry_num  # number
         batch_data["training"] = True
 
         # Compute predictions and compute loss
         res, _, _ = self.predict_batch(batch, preprocess=False, postprocess=False)
         finpreds, finrecos, fin_irm_all_s = res[0], res[1], res[2]
-        # finrecos = torch.cat(finrecos)
-        # finpreds = torch.cat(finpreds)
-        # fin_irm_all_s = torch.cat(fin_irm_all_s)
 
         b = x.shape[0]
         if self.scaled_target:
@@ -562,14 +563,11 @@ class UnnamedKrigFillerV2(unKrigFillerV2):
             finpreds = self._postprocess(finpreds, batch_preprocessing)
             fin_irm_all_s = self._postprocess(fin_irm_all_s, batch_preprocessing)
 
-        # fin_irm_all_s = rearrange(fin_irm_all_s, '(a b s) t n d -> a s b t n d', b=b, a=2)
-        # fin_target = torch.cat([target, target])
-
         opt1.zero_grad()
 
         # IRM Loss
-        irm_target = target[:, :, :len(seened_indx)]
-        irm_mask = mask[:, :, :len(seened_indx)]
+        irm_target = target[:, :, :len(known_set)]
+        irm_mask = mask[:, :, :len(known_set)]
         steps = self.model.steps
         env_loss = torch.tensor([]).to(x.device)
         for i in range(steps):
@@ -606,18 +604,11 @@ class UnnamedKrigFillerV2(unKrigFillerV2):
                 cr_batch = torch.repeat_interleave(batches, repeats=(cr_nt))
 
                 cmds = torch.cat([cmds, torch.clamp(cmd(inv_emb_tru, inv_emb_vir, \
-                                                        og_batch, cr_batch).mean(), min=0).unsqueeze(0)])
+                                                        og_batch, cr_batch, n_moments=2).mean(), min=0).unsqueeze(0)])
                 # cmds = torch.cat([cmds, torch.clamp(cmd(reco[1].squeeze(0), reco[3].squeeze(0), \
                 #                                         og_batch, cr_batch).mean(), min=0).unsqueeze(0)])
 
             recon_loss = cmds.mean()
-
-        # mmds = torch.tensor([]).to(x.device)
-        # true_embs = finrecos.pop(0)
-        # for reco in finrecos:
-        #     # MMD for inv 
-        #     mmds = torch.cat([mmds, torch.clamp(mmd_loss(true_embs[0], reco[0]), min=0).unsqueeze(0)])
-        #     mmds = torch.cat([mmds, torch.clamp(mmd_loss(true_embs[1], reco[1]), min=0).unsqueeze(0)])
 
         main_loss = self.loss_fn_1(finpreds, target, eval_mask.bool()) 
         loss = main_loss + self.y1 * recon_loss + self.y2 * irm_loss
@@ -655,13 +646,6 @@ class UnnamedKrigFillerV2(unKrigFillerV2):
                  on_epoch=True,
                  logger=True,
                  prog_bar=False)
-        
-        # self.log('Similarity score', 
-        #          sim,                  
-        #          on_step=False,
-        #          on_epoch=True,
-        #          logger=True,
-        #          prog_bar=False)
 
         # Store every randomised graphs here
         self.train_metrics.update(imputation.detach(), y, eval_mask)
@@ -690,16 +674,11 @@ class UnnamedKrigFillerV2(unKrigFillerV2):
 
         x = batch_data["x"]
         mask = batch_data["mask"]
-        eval_mask = batch_data.pop("eval_mask", None)
+        eval_mask = batch_data.pop("eval_mask")
         y = batch_data.pop('y')
 
         unknown_set = [i for i in range(mask.shape[2]) if i not in known_set]
-
-        # eval_mask = mask.clone()
-        # mask[:, :, self.val_set, :] = 0
-        # eval_mask[:, :, self.train_set, :] = 0
-        # x[:, :, self.val_set, :] = 0
-
+        
         # if self.known_set is None:
             # Get observed entries (nonzero masks across time)
             # if self.inductive:
@@ -715,7 +694,7 @@ class UnnamedKrigFillerV2(unKrigFillerV2):
         batch_data["known_set"] = known_set
         batch_data["masked_set"] = unknown_set
         
-        mask = mask[:, :, known_set, :]
+        mask = mask[:, :, full, :]
         eval_mask = eval_mask[:, :, full, :]
         batch_data["mask"] = mask
         y = y[:, :, full, :]

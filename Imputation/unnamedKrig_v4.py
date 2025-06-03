@@ -23,7 +23,7 @@ from utils import closest_distances_unweighted
 
 EPSILON = 1e-8
 
-class UnnamedKrigModelV3(BaseModel):
+class UnnamedKrigModelV4(BaseModel):
     def __init__(self,
                  input_size,
                  hidden_size,
@@ -41,7 +41,7 @@ class UnnamedKrigModelV3(BaseModel):
                  mmd_sample_ratio=1.,
                  k=5,
                  att_heads=8):
-        super(UnnamedKrigModelV3, self).__init__()
+        super(UnnamedKrigModelV4, self).__init__()
 
         self.steps = intervention_steps
         self.horizon = horizon
@@ -122,6 +122,7 @@ class UnnamedKrigModelV3(BaseModel):
                         norm=None,
                         add_self_loops=None,
                         act=activation)
+        
         self.gcn2 = GCN(in_channels=hidden_size,
                         hidden_channels=hidden_size,
                         num_layers=gcn_layers, 
@@ -153,8 +154,8 @@ class UnnamedKrigModelV3(BaseModel):
                 x,
                 mask,
                 known_set,
+                masked_set=[],
                 seened_set=[],
-                masked_set=[], 
                 sub_entry_num=0,
                 edge_weight=None,
                 training=False,
@@ -171,10 +172,11 @@ class UnnamedKrigModelV3(BaseModel):
         device = x.device
 
         full_adj = torch.tensor(self.adj).to(device)
-
         if seened_set != []:
-            o_adj = full_adj[seened_set, :]
-            o_adj = o_adj[:, seened_set]
+            full = seened_set + masked_set
+
+            o_adj = full_adj[full, :]
+            o_adj = o_adj[:, full]
         else:
             o_adj = full_adj[known_set, :]
             o_adj = o_adj[:, known_set]
@@ -190,8 +192,6 @@ class UnnamedKrigModelV3(BaseModel):
         
         out_f = x_fwd
         out_f = self.gcn_layers_fwd(out_f, edge_index, edge_weight)
-        # for layer in self.gcn_layers_fwd:
-        #     out_f = layer(out_f, edge_index, edge_weight)
         out_f = out_f + self.skip_con_fwd(x_fwd)
 
         # ========================================
@@ -225,13 +225,6 @@ class UnnamedKrigModelV3(BaseModel):
         # ========================================
         # Create new adjacency matrix 
         # ========================================
-        # Get two graphs, one with one hop connections, another with two hop connections
-        if seened_set != []:
-            arrange = seened_set + masked_set
-
-            o_adj = full_adj[arrange, :]
-            o_adj = o_adj[:, arrange]
-
         if training:
             # inductive
             if reset:
@@ -241,12 +234,6 @@ class UnnamedKrigModelV3(BaseModel):
 
                 init_hops = closest_distances_unweighted(numpy_graph, source_nodes, target_nodes)
                 adj_aug, level_hops = self.get_new_adj(o_adj, self.k, n_add=sub_entry_num, init_hops=init_hops)
-
-                # up_graph = nx.from_numpy_array(adj_aug.cpu().numpy())
-                # new_dict = closest_distances_unweighted(up_graph, list(range(o_adj.shape[0]+sub_entry_num)), target_nodes)
-                # if new_dict == level_hops:
-                #     diff = [k for k in new_dict if k in level_hops and new_dict[k] != level_hops[k]]
-                #     breakpoint()
             else:
                 if self.adj_n1 is None:
                     adj_aug = o_adj
@@ -254,7 +241,7 @@ class UnnamedKrigModelV3(BaseModel):
                     adj_aug = self.adj_n1
 
                 numpy_graph = nx.from_numpy_array(adj_aug.cpu().numpy())
-                target_nodes = list(range(adj_aug.shape[0]))[:len(seened_set)]
+                target_nodes = list(range(adj_aug.shape[0]))[:len(known_set)]
                 source_nodes = list(range(adj_aug.shape[0]))
                 level_hops = closest_distances_unweighted(numpy_graph, source_nodes, target_nodes)
 
@@ -284,13 +271,8 @@ class UnnamedKrigModelV3(BaseModel):
         # for adj in adjs:
         bt, _, d = output_invars.shape
 
-        if seened_set != []:
-            add_nodes = len(masked_set) + sub_entry_num
-        else:
-            add_nodes = sub_entry_num
-
-        if add_nodes != 0:
-            sub_entry = torch.zeros(bt, add_nodes, d).to(device)
+        if sub_entry_num != 0:
+            sub_entry = torch.zeros(bt, sub_entry_num, d).to(device)
 
             xh_inv = torch.cat([output_invars, sub_entry], dim=1)  # b*t n2 d
             # xh_var = torch.cat([output_vars, sub_entry], dim=1)
@@ -405,6 +387,9 @@ class UnnamedKrigModelV3(BaseModel):
         # ========================================
         # Append the most similar embedding
         # ========================================
+        # if seened_set != []:
+        #     inv_sim = self.get_sim(xh_inv_2, seened_set, grouped)
+        # else:
         inv_sim = self.get_sim(xh_inv_2, known_set, grouped)
         # var_sim = self.get_sim(xh_var_2, known_set, grouped, invs=False)
 
@@ -454,7 +439,7 @@ class UnnamedKrigModelV3(BaseModel):
             # sml_var = xh_var_sim[indx]
 
             vir_inv = xh_inv_3[indx]
-            # vir_var = xh_var_3[indx]
+            vir_var = xh_var_3[indx]
         
         finrecos = []
         for i in range(1, self.k+1):
@@ -483,7 +468,7 @@ class UnnamedKrigModelV3(BaseModel):
             emb_com_inv = emb_com_inv.detach()
             # emb_com_var = emb_com_var.detach()
 
-            if emb_tru_inv.numel() == 0: #or emb_tru_var.numel() == 0:
+            if emb_tru_inv.numel() == 0:
                 continue
             else:
                 finrecos.append([s_batch, emb_com_inv, emb_tru_inv])
@@ -495,11 +480,8 @@ class UnnamedKrigModelV3(BaseModel):
         # Get IRM loss
         fin_irm_all = []
         for _ in range(self.steps):
+            seen_invr = xh_inv_3[:, :, :len(known_set)]
             seen_vars = xh_var_3
-            if seened_set != []:
-                seen_invr = xh_inv_3[:, :, :len(seened_set)]
-            else:
-                seen_invr = xh_inv_3[:, :, :len(known_set)]
             
             seen_vars_l = rearrange(seen_vars, '(b t) n d -> b (t n) d', b=b, t=t)
             s_rands = torch.randperm(seen_vars_l.shape[1])
@@ -694,100 +676,3 @@ class UnnamedKrigModelV3(BaseModel):
         output_var = self.out_proj(output_var.transpose(1, 2).contiguous().view(B, T, D))
 
         return output_invar, output_var
-
-# from Grin import get_dataset
-# from tsl.data import ImputationDataset, SpatioTemporalDataModule
-# from tsl.data.preprocessing import StandardScaler
-# from tsl.transforms import MaskInput
-
-# if __name__ == '__main__':
-#     mask_s = [5]
-#     known_set = list(range(5))
-#     dataset = get_dataset('air_auckland', p_noise=0.5, masked_s=mask_s)
-#     # covariates = {'u': dataset.datetime_encoded('day').values}
-#     adj = dataset.get_connectivity(method='distance', threshold=1, include_self=False, layout='dense', force_symmetric=True)
-#     adj_list = dataset.get_connectivity(method='distance', threshold=1, include_self=False, force_symmetric=True)
-
-#     adj_weights = torch.tensor(adj_list[1])
-#     adj_list_t = torch.tensor(adj_list[0])
-#     adj = torch.tensor(adj)
-
-#     torch_dataset = ImputationDataset(target=dataset.dataframe(),
-#                                         mask=dataset.training_mask,
-#                                         eval_mask=dataset.eval_mask,
-#                                     #   covariates=covariates,
-#                                         transform=MaskInput(),
-#                                         connectivity=adj,
-#                                         window=12,
-#                                         stride=1)
-
-#     scalers = {'target': StandardScaler(axis=(0, 1))}
-
-#     dm = SpatioTemporalDataModule(
-#         dataset=torch_dataset,
-#         scalers=scalers,
-#         splitter=dataset.get_splitter(val_len= 0.1, test_len= 0.2),
-#         batch_size=64,
-#         workers=0)
-#     dm.setup(stage='fit')
-
-#     batch = next(iter(dm.train_dataloader()))
-
-#     input_size = 1
-#     hidden_size = 128
-#     output_size = 1
-#     horizon = 12
-#     exog_size = 0
-#     enc_layers = 2
-#     gcn_layers = 2
-#     dropout=0.4
-#     S=3
-
-#     model = UnnamedKrigModel(input_size=input_size,
-#                         hidden_size=hidden_size,
-#                         output_size=output_size,
-#                         exog_size=exog_size,
-#                         enc_layers=enc_layers,
-#                         gcn_layers=gcn_layers,
-#                         adj=adj,
-#                         dropout=0.4,
-#                         intervention_steps=S).to(device='cuda:3')
-    
-#     x = batch['x'][:, :, known_set, :].to(device='cuda:3')
-#     mask = batch['mask'][:, :, known_set, :].to(device='cuda:3')
-#     sub_entry_num = 1
-
-#     b, s, n, d = mask.shape
-#     sub_entry = torch.zeros(b, s, sub_entry_num, d).to(x.device)
-#     mask = torch.cat([mask, sub_entry], dim=2).byte() 
-
-#     finrecos, finpreds, fin_irm_all_s, output_invars_s, output_vars_s = model(x=x, edge_weight=None, sub_entry_num=sub_entry_num,
-#                                               mask=mask, known_set=known_set, training=True, reset=True)
-    
-#     finrecos = torch.cat(finrecos)
-#     finpreds = torch.cat(finpreds)
-#     fin_irm_all_s = torch.cat(fin_irm_all_s)
-
-#     optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
-
-#     # Forward pass
-#     target = torch.ones_like(fin_irm_all_s)
-#     loss = F.mse_loss(fin_irm_all_s, target)
-#     # loss = F.mse_loss(output_invars_s[0][:n], output_invars_s[1][:n])
-
-#     # Backward pass
-#     loss.backward()
-#     optimizer.step()
-
-#     # ✅ Check
-#     print("Loss:", loss.item())
-#     for name, param in model.named_parameters():
-#         print(param.grad)
-#         try:
-#             if torch.isnan(param.grad).any():
-#                 print(f"❌ NaNs in gradient for {name}")
-#             else:
-#                 print(f"✅ {name} gradient OK")
-#         except:
-#             print(f"{name} NoneType")
-    
