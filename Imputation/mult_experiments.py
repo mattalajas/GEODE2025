@@ -1,4 +1,6 @@
 import argparse
+import csv
+import os
 import torch
 from omegaconf import DictConfig
 from pytorch_lightning import Trainer
@@ -495,6 +497,12 @@ def run_imputation(cfg: DictConfig):
              val_mape=numpy_metrics.mape(y_hat, y_true, mask),
              val_mse=numpy_metrics.mse(y_hat, y_true, mask),
              val_rmse=numpy_metrics.rmse(y_hat, y_true, mask)))
+    res.update(
+        dict(model=cfg.model.name,
+             db=cfg.dataset.name,
+             seed=cfg.seed,
+             mode=cfg.dataset.mode)
+    )
 
     return res
 
@@ -505,3 +513,13 @@ if __name__ == '__main__':
     print(exp)
     res = exp.run()
     logger.info(res)
+
+    mode = res.pop('mode')
+    csv_path = f"/data/mala711/Thesis/GNNthesis/{res['model']}-{mode}.csv"
+    file_exists = os.path.exists(csv_path)
+
+    with open(csv_path, mode="a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=res.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(res)

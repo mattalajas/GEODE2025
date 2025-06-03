@@ -28,7 +28,7 @@ logger: tensorboard
 
 #### Windowing params #########################################################
 window: 24
-stride: 1
+stride: 12
 
 #### Training params ##########################################################
 epochs: 100

@@ -1,5 +1,5 @@
 #### Dataset params ###########################################################
-name: nrel
+name: nrel-al
 # Point
 mode: 'region'
 p_fault: 0.

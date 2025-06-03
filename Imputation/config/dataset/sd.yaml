@@ -1,0 +1,17 @@
+#### Dataset params ###########################################################
+name: sd
+# Point
+mode: 'region'
+p_fault: 0.
+p_noise: 0.25
+
+# Block
+# p_fault: 0.0015
+# p_noise : 0.05
+splitting:
+  val_len: 0.1
+  test_len: 0.2
+connectivity:
+  method: precomputed
+  threshold: 0.1
+  include_self: False

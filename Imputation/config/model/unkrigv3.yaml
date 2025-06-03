@@ -7,10 +7,9 @@ hparams:
   psd_layers: 1
   dropout: 0.4
   intervention_steps: 2
-  mmd_sample_ratio: 0.4
+  mmd_sample_ratio: 0.2
   k: 3
 regs:
   dloss: 'mmd'
   y1: 0.8 # SS-MMD Loss
   y2: 1 # IRM Loss
-  y3: 0.8 # Similarity Loss
