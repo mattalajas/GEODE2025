@@ -507,11 +507,13 @@ class UnnamedKrigFillerV4(unKrigFillerV4):
         # Create randomised model here
         if self.inductive:
             cur_entry_num = mask.size(2)
-            dynamic_ratio = self.ratio + 0.2 * np.random.random()  # ratio + 0.1
-            aug_entry_num = max(int(cur_entry_num / dynamic_ratio), cur_entry_num + 1)
+            dynamic_ratio = self.ratio + 0.1 * np.random.random()  # ratio + 0.1
+            aug_entry_num = int(cur_entry_num / dynamic_ratio)
             sub_entry_num = aug_entry_num - cur_entry_num  # n2 - n1
             # sub_entry_num = min(aug_entry_num - cur_entry_num, mask.size(2) - cur_entry_num)  # n2 - n1
-            trn_entry_num = min(int(sub_entry_num // 2), int(cur_entry_num//2)) # Max split is half, unseen nodes cannot be more than seened nodes
+
+            dynamic_ratio = 0.5 + ((0.4 * np.random.random())-0.2)  # ratio + 0.1
+            trn_entry_num = int(len(known_set)*dynamic_ratio)
 
             assert sub_entry_num > 0, "The augmented data should have more entries than original data."
             self.sub_entry_num = sub_entry_num
