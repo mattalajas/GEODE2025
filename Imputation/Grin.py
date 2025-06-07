@@ -35,7 +35,7 @@ from unnamedKrig import UnnamedKrigModel
 from unnamedKrig_v2 import UnnamedKrigModelV2
 from unnamedKrig_v3 import UnnamedKrigModelV3
 from unnamedKrig_v4 import UnnamedKrigModelV4
-from utils import classical_mds_with_inf
+from utils import month_splitter
 
 MODELS = ['kits', 'unkrig', 'kcn', 'unkrigv2', 'unkrigv3', 'unkrigv4', 'ignnk', 'dida']
 
@@ -182,7 +182,7 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-0
                                   mode=mode)
     
     if dataset_name == 'sd':
-        return add_missing_sensors(LargeST(subset='SD', year=[2019]),
+        return add_missing_sensors(LargeST(subset='SD', year=[2019, 2020]),
                                   p_fault=p_fault,
                                   p_noise=p_noise,
                                   min_seq=12,
@@ -233,6 +233,10 @@ def run_imputation(cfg: DictConfig):
                             location=cfg.dataset.get('location'),
                             connectivity=cfg.dataset.get('connectivity'),
                             mode=cfg.dataset.get('mode'))
+
+    if cfg.dataset.get('shift', False):
+        dataset.get_splitter = month_splitter
+
     print(f'Masked sensors: {masked_sensors}')
 
     # encode time of the day and use it as exogenous variable
@@ -267,6 +271,9 @@ def run_imputation(cfg: DictConfig):
         batch_size=cfg.batch_size,
         workers=cfg.workers)
     dm.setup(stage='fit')
+
+    print(f'train_times: {np.unique(dataset.dataframe().iloc[dm.train_dataloader().dataset.indices].index.year)}, \
+          test_times: {np.unique(dataset.dataframe().iloc[dm.test_dataloader().dataset.indices].index.year)}')
 
     if cfg.get('in_sample', False):
         dm.trainset = list(range(len(torch_dataset)))

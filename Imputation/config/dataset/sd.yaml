@@ -1,7 +1,11 @@
 #### Dataset params ###########################################################
 name: sd
+
+# temporal shift
+shift: false
+
 # Point
-mode: 'region'
+mode: region
 p_fault: 0.
 p_noise: 0.25
 
@@ -11,6 +15,8 @@ p_noise: 0.25
 splitting:
   val_len: 0.1
   test_len: 0.2
+  gran: year
+  test_times: [2020]
 connectivity:
   method: precomputed
   threshold: 0.1

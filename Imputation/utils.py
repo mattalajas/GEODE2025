@@ -1,12 +1,12 @@
-import numpy as np
-import torch
-import ot
 import copy
+
 import networkx as nx
+import numpy as np
+import ot
 import scipy
+import torch
 from einops import rearrange
 from torch_scatter import scatter
-
 
 """
 Tree Mover's Distance solver
@@ -185,3 +185,94 @@ def degree_distribution(adj_matrix):
     distribution = degree_counts / degree_counts.sum()
 
     return distribution
+
+from typing import Sequence
+
+from tsl.data.datamodule.splitters import Splitter, disjoint_months
+from tsl.data.synch_mode import HORIZON, WINDOW
+from tsl.utils.python_utils import ensure_list
+
+def disjoint_year(dataset, years=None, synch_mode=WINDOW):
+    idxs = np.arange(len(dataset))
+    years = ensure_list(years)
+    # divide indices according to window or horizon
+    if synch_mode is WINDOW:
+        start = 0
+        end = dataset.window - 1
+    elif synch_mode is HORIZON:
+        start = dataset.horizon_offset
+        end = dataset.horizon_offset + dataset.horizon - 1
+    else:
+        raise ValueError("synch_mode can only be one of "
+                         f"{[WINDOW, HORIZON]}")
+    # after idxs
+    indices = np.asarray(dataset._indices)
+    start_in_years = np.in1d(dataset.index[indices + start].year, years)
+    end_in_years = np.in1d(dataset.index[indices + end].year, years)
+    idxs_in_years = start_in_years & end_in_years
+    after_idxs = idxs[idxs_in_years]
+    # previous idxs
+    min_y = dataset.index.min().year
+    max_y = dataset.index.max().year
+
+    years = np.setdiff1d(np.arange(min_y, max_y), years)
+    start_in_years = np.in1d(dataset.index[indices + start].year, years)
+    end_in_years = np.in1d(dataset.index[indices + end].year, years)
+    idxs_in_years = start_in_years & end_in_years
+    prev_idxs = idxs[idxs_in_years]
+    return prev_idxs, after_idxs
+
+class MonthYearSplitter(Splitter):
+    def __init__(self, 
+                 val_len: int = None,
+                 gran: str = 'month',
+                 test_times: Sequence = (3, 6, 9, 12)):
+        
+        super(MonthYearSplitter, self).__init__()
+        self._val_len = val_len
+        self.test_times = test_times
+
+        assert gran in ['year', 'month']
+        self.gran = gran
+        
+    def fit(self, dataset):
+        if self.gran == 'month':
+            nontest_idxs, test_idxs = disjoint_months(dataset,
+                                                months=self.test_times,
+                                                synch_mode=WINDOW)
+        elif self.gran == 'year':
+            nontest_idxs, test_idxs = disjoint_year(dataset,
+                                                years=self.test_times,
+                                                synch_mode=WINDOW)
+        else:
+            raise
+
+        val_len = self._val_len
+        if val_len < 1:
+            val_len = int(val_len * len(nontest_idxs))
+        val_len = val_len // len(self.test_times)
+
+        delta = np.diff(test_idxs)
+        delta_idxs = np.flatnonzero(delta > delta.min())
+        end_month_idxs = test_idxs[1:][delta_idxs]
+        if len(end_month_idxs) < len(self.test_times):
+            end_month_idxs = np.insert(end_month_idxs, 0, test_idxs[0])
+
+        month_val_idxs = [
+            np.arange(v_idx - val_len, v_idx) - dataset.window
+            for v_idx in end_month_idxs
+        ]
+
+        val_idxs = np.concatenate(month_val_idxs) % len(dataset)
+        # remove overlapping indices from training set
+        ovl_idxs, _ = dataset.overlapping_indices(nontest_idxs,
+                                                  val_idxs,
+                                                  synch_mode=HORIZON,
+                                                  as_mask=True)
+        train_idxs = nontest_idxs[~ovl_idxs]
+        self.set_indices(train_idxs, val_idxs, test_idxs)
+
+def month_splitter(val_len: int = None, gran = 'month', test_times: Sequence = (3, 6, 9, 12), *args, **kwargs):
+    return MonthYearSplitter(test_times=test_times,
+                             gran=gran,
+                             val_len=val_len)
