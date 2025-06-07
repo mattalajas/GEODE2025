@@ -530,6 +530,12 @@ def run_imputation(cfg: DictConfig):
              val_mape=numpy_metrics.mape(y_hat, y_true, mask),
              val_mse=numpy_metrics.mse(y_hat, y_true, mask),
              val_rmse=numpy_metrics.rmse(y_hat, y_true, mask)))
+    res.update(
+        dict(model=cfg.model.name,
+             db=cfg.dataset.name,
+             seed=cfg.seed,
+             mode=cfg.dataset.mode)
+    )
 
     return res
 
