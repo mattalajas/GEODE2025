@@ -272,8 +272,8 @@ def run_imputation(cfg: DictConfig):
         workers=cfg.workers)
     dm.setup(stage='fit')
 
-    print(f'train_times: {np.unique(dataset.dataframe().iloc[dm.train_dataloader().dataset.indices].index.year)}, \
-          test_times: {np.unique(dataset.dataframe().iloc[dm.test_dataloader().dataset.indices].index.year)}')
+    print(f'train_times: {np.unique(dataset.dataframe().iloc[dm.train_dataloader().dataset.indices].index.month)}, \
+          test_times: {np.unique(dataset.dataframe().iloc[dm.test_dataloader().dataset.indices].index.month)}')
 
     if cfg.get('in_sample', False):
         dm.trainset = list(range(len(torch_dataset)))
