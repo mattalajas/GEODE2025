@@ -26,18 +26,20 @@ from my_datasets import AirQualitySmaller, AirQualityAuckland, AirQualityKrig, a
 from baselines.KITS import KITS
 from baselines.IGNNK import IGNNK
 from baselines.DIDA import DGNN
+from baselines.CauSTG import CauSTG
 from fillers.KITS_filler import GCNCycVirtualFiller
 from fillers.unnamed_filler import UnnamedKrigFiller
 from fillers.unnamed_filler_v2 import UnnamedKrigFillerV2
 from fillers.unnamed_filler_v4 import UnnamedKrigFillerV4
 from fillers.DIDA_filler import DidaFiller
+from fillers.CauSTG_filler import CauSTGFiller
 from unnamedKrig import UnnamedKrigModel
 from unnamedKrig_v2 import UnnamedKrigModelV2
 from unnamedKrig_v3 import UnnamedKrigModelV3
 from unnamedKrig_v4 import UnnamedKrigModelV4
 from utils import month_splitter
 
-MODELS = ['kits', 'unkrig', 'kcn', 'unkrigv2', 'unkrigv3', 'unkrigv4', 'ignnk', 'dida']
+MODELS = ['kits', 'unkrig', 'kcn', 'unkrigv2', 'unkrigv3', 'unkrigv4', 'ignnk', 'caustg', 'dida']
 
 def get_model_class(model_str):
     if model_str == 'rnni':
@@ -64,6 +66,8 @@ def get_model_class(model_str):
         model = IGNNK
     elif model_str == 'dida':
         model = DGNN
+    elif model_str == 'caustg':
+        model = CauSTG
     else:
         raise NotImplementedError(f'Model "{model_str}" not available.')
     return model
@@ -299,6 +303,8 @@ def run_imputation(cfg: DictConfig):
     elif cfg.model.name == 'dida':
         model_kwargs = dict(nfeat=dm.n_channels, output_size=dm.n_channels, 
                             num_nodes=adj.shape[0], args=cfg.model.hparams)
+    elif cfg.model.name == 'caustg':
+        model_kwargs = dict(in_dim=dm.n_channels, out_dim=cfg.window, args=cfg.model.hparams)
     elif cfg.model.name == 'kcn':
         pass
     else:
@@ -427,6 +433,25 @@ def run_imputation(cfg: DictConfig):
                             adj=adj,
                             horizon=cfg.window,
                             **cfg.model.regs)
+    elif cfg.model.name == "caustg":
+        imputer = CauSTGFiller(model_class=model_cls,
+                            model_kwargs=model_kwargs,
+                            optim_class=getattr(torch.optim, cfg.optimizer.name),
+                            optim_kwargs=dict(cfg.optimizer.hparams),
+                            loss_fn=loss_fn,
+                            scaled_target=cfg.scale_target,
+                            whiten_prob=cfg.whiten_prob,
+                            pred_loss_weight=cfg.prediction_loss_weight,
+                            warm_up=cfg.warm_up_steps,
+                            metrics=log_metrics,
+                            scheduler_class=scheduler_class,
+                            scheduler_kwargs=scheduler_kwargs,
+                            gradient_clip_val=cfg.grad_clip_val,
+                            gradient_clip_algorithm=cfg.grad_clip_alg,
+                            known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
+                            adj=adj,
+                            device=cfg.device,
+                            **cfg.model.regs)
     else:
         imputer = Imputer(model_class=model_cls,
                         model_kwargs=model_kwargs,
@@ -474,9 +499,7 @@ def run_imputation(cfg: DictConfig):
     )
     checkpoint_callback.CHECKPOINT_NAME_LAST = "{epoch}-last"
 
-    if cfg.model.name =='kits' or cfg.model.name =='unkrig' or \
-        cfg.model.name =='unkrigv2' or cfg.model.name == 'unkrigv3' or \
-        cfg.model.name == 'unkrigv4' or cfg.model.name == 'dida':
+    if cfg.model.name in MODELS:
         trainer = Trainer(
             max_epochs=cfg.epochs,
             default_root_dir=cfg.run.dir,
