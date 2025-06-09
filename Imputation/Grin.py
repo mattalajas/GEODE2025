@@ -74,7 +74,8 @@ def get_model_class(model_str):
 
 
 def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-01', '2022-12-01'],
-                masked_s=None, agg_func = 'mean', test_month=[5], location='Auckland', connectivity=None, mode='road'):
+                masked_s=None, agg_func = 'mean', test_month=[5], location='Auckland', connectivity=None, mode='road',
+                spatial_shift=False, order=0, node_features='c_centrality'):
     if dataset_name == 'air':
         return AirQualityKrig(impute_nans=True, small=True, masked_sensors=masked_s, p=p_noise), masked_s
     if dataset_name == 'air_smaller':
@@ -98,7 +99,10 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-0
                                   max_seq=12 * 4, 
                                   masked_sensors=masked_s,
                                   connect=connectivity,
-                                  mode=mode)
+                                  mode=mode,
+                                  spatial_shift=spatial_shift,
+                                  order=order,
+                                  node_features=node_features)
 
     if dataset_name == 'aqism':
         return add_missing_sensors(AirQuality(small=True),
@@ -108,7 +112,10 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-0
                                   max_seq=12 * 4, 
                                   masked_sensors=masked_s,
                                   connect=connectivity,
-                                  mode=mode)
+                                  mode=mode,
+                                  spatial_shift=spatial_shift,
+                                  order=order,
+                                  node_features=node_features)
     
     if dataset_name == 'metrla':
         return add_missing_sensors(MetrLA(freq='5T'),
@@ -118,7 +125,10 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-0
                                   max_seq=12 * 4, 
                                   masked_sensors=masked_s,
                                   connect=connectivity,
-                                  mode=mode)
+                                  mode=mode,
+                                  spatial_shift=spatial_shift,
+                                  order=order,
+                                  node_features=node_features)
     if dataset_name == 'pem07':
         pems = PeMS07()
 
@@ -132,7 +142,10 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-0
                                   max_seq=12 * 4,
                                   masked_sensors=masked_s,
                                   connect=connectivity,
-                                  mode=mode)
+                                  mode=mode,
+                                  spatial_shift=spatial_shift,
+                                  order=order,
+                                  node_features=node_features)
     
     if dataset_name == 'pem04':
         pems = PeMS04()
@@ -147,7 +160,10 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-0
                                   max_seq=12 * 4,
                                   masked_sensors=masked_s,
                                   connect=connectivity,
-                                  mode=mode)
+                                  mode=mode,
+                                  spatial_shift=spatial_shift,
+                                  order=order,
+                                  node_features=node_features)
 
     if dataset_name == 'nrel-al':
         pv_us = PvUS(zones='east')
@@ -165,7 +181,10 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-0
                                   max_seq=12 * 4,
                                   masked_sensors=masked_s,
                                   connect=connectivity,
-                                  mode=mode)
+                                  mode=mode,
+                                  spatial_shift=spatial_shift,
+                                  order=order,
+                                  node_features=node_features)
 
     if dataset_name == 'nrel-md':
         pv_us = PvUS(zones='east')
@@ -183,7 +202,10 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-0
                                   max_seq=12 * 4,
                                   masked_sensors=masked_s,
                                   connect=connectivity,
-                                  mode=mode)
+                                  mode=mode,
+                                  spatial_shift=spatial_shift,
+                                  order=order,
+                                  node_features=node_features)
     
     if dataset_name == 'sd':
         return add_missing_sensors(LargeST(subset='SD', year=[2019, 2020]),
@@ -193,7 +215,10 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-0
                                   max_seq=12 * 4,
                                   masked_sensors=masked_s,
                                   connect=connectivity,
-                                  mode=mode)
+                                  mode=mode,
+                                  spatial_shift=spatial_shift,
+                                  order=order,
+                                  node_features=node_features)
 
     if dataset_name == 'electricity':
         df = ElectricityBenchmark()
@@ -217,7 +242,8 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-0
                                   max_seq=12 * 4,
                                   masked_sensors=masked_s,
                                   connect=connectivity,
-                                  mode=mode)
+                                  mode=mode,
+                                  )
 
     raise ValueError(f"Dataset {dataset_name} not available in this setting.")
 
@@ -236,7 +262,10 @@ def run_imputation(cfg: DictConfig):
                             test_month=cfg.dataset.get('test_month'),
                             location=cfg.dataset.get('location'),
                             connectivity=cfg.dataset.get('connectivity'),
-                            mode=cfg.dataset.get('mode'))
+                            mode=cfg.dataset.get('mode'),
+                            spatial_shift=cfg.dataset.get('spatial_shift'),
+                            order=cfg.dataset.get('order'),
+                            node_features=cfg.dataset.get('node_features'))
 
     if cfg.dataset.get('shift', False):
         dataset.get_splitter = month_splitter

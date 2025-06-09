@@ -1,6 +1,8 @@
 import os
 from typing import List, Optional, Sequence
 
+import math
+import networkx as nx
 import numpy as np
 import pandas as pd
 import random
@@ -24,6 +26,9 @@ def add_missing_sensors(dataset: TabularDataset,
                        inplace=True,
                        masked_sensors = [],
                        connect = None,
+                       spatial_shift = False, 
+                       order = 0,
+                       node_features = 'c_centrality',
                        mode='road'):
     if seed is None:
         seed = np.random.randint(1e9)
@@ -33,18 +38,23 @@ def add_missing_sensors(dataset: TabularDataset,
     # Compute evaluation mask
     shape = (dataset.length, dataset.n_nodes, dataset.n_channels)
     if masked_sensors is None:
-        eval_mask = sample_mask(shape,
-                            p=p_fault,
-                            p_noise=p_noise,
-                            mode=mode,
-                            adj=dataset.get_connectivity(**connect, layout='dense'))
-        
-        dataset.p_fault = p_fault
-        dataset.p_noise = p_noise
-        dataset.min_seq = min_seq
-        dataset.max_seq = max_seq
-        dataset.seed = seed
-        dataset.random = random
+        if spatial_shift:
+            eval_mask = shift_mask(shape, feature=node_features, order=order, 
+                                   adj=dataset.get_connectivity(**connect, layout='dense'))
+            dataset.seed = seed
+        else:
+            eval_mask = sample_mask(shape,
+                                p=p_fault,
+                                p_noise=p_noise,
+                                mode=mode,
+                                adj=dataset.get_connectivity(**connect, layout='dense'))
+            
+            dataset.p_fault = p_fault
+            dataset.p_noise = p_noise
+            dataset.min_seq = min_seq
+            dataset.max_seq = max_seq
+            dataset.seed = seed
+            dataset.random = random
 
         # mask = rearrange(eval_mask, "b n 1 -> b n")
         mask_sum = eval_mask.sum(0)  # n
@@ -62,6 +72,29 @@ def add_missing_sensors(dataset: TabularDataset,
 
     # Store evaluation mask params in dataset
     return dataset, masked_sensors
+
+def shift_mask(shape, feature, order, adj):
+    mask = np.zeros(shape).astype(bool)
+    G = nx.from_numpy_array(adj)
+
+    parts = math.ceil(adj.shape[0] / 3)
+
+    if feature == 'c_centrality':
+        # Compute closeness centrality
+        closeness = nx.closeness_centrality(G)
+
+        # Sort nodes by closeness centrality in descending order
+        sorted_nodes = sorted(closeness.items(), key=lambda x: x[1])
+        ord_nodes = [x for x, _ in sorted_nodes]
+
+        f_nodes = ord_nodes[parts*order:parts*(order+1)]
+        f_nodes_mask = np.zeros(shape).astype(bool)
+        f_nodes_mask[:, f_nodes] = True
+        mask |= f_nodes_mask
+    else:
+        raise f"{feature} not implemented"
+    
+    return mask.astype('uint8')
 
 class AirQualitySplitter(Splitter):
 

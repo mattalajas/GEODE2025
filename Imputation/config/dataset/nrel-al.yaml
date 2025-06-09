@@ -4,6 +4,11 @@ name: nrel-al
 # temporal shift
 shift: false
 
+# spatial shift
+spatial_shift: false
+order: 0
+node_features: c_centrality
+
 # Point
 mode: region
 p_fault: 0.
