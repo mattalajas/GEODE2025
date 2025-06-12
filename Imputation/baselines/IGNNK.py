@@ -4,6 +4,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from tsl.nn.models.base_model import BaseModel
 
 class D_GCN(nn.Module):
     """
@@ -219,7 +220,7 @@ class GAT(nn.Module):
 Buitld the GNN
 '''
 
-class IGNNK(nn.Module):
+class IGNNK(BaseModel):
     """
     GNN on ST datasets to reconstruct the datasets
    x_s
@@ -240,19 +241,20 @@ class IGNNK(nn.Module):
         self.GNN2 = D_GCN(self.hidden_dimnesion, self.hidden_dimnesion, self.order)
         self.GNN3 = D_GCN(self.hidden_dimnesion, self.time_dimension, self.order, activation = 'linear')
 
-    def forward(self, X, A_q, A_h):
+    def forward(self, x, A_q, A_h, transform):
         """
         :param X: Input data of shape (batch_size, num_timesteps, num_nodes)
         :A_q: The forward random walk matrix (num_nodes, num_nodes)
         :A_h: The backward random walk matrix (num_nodes, num_nodes)
         :return: Reconstructed X of shape (batch_size, num_timesteps, num_nodes)
         """  
-        X_S = X.permute(0, 2, 1) # to correct the input dims 
+        x = x.squeeze(-1)
+        X_S = x.permute(0, 2, 1) # to correct the input dims 
         
         X_s1 = self.GNN1(X_S, A_q, A_h)
         X_s2 = self.GNN2(X_s1, A_q, A_h) + X_s1 #num_nodes, rank
         X_s3 = self.GNN3(X_s2, A_q, A_h) 
 
         X_res = X_s3.permute(0, 2, 1)
-               
+        X_res = X_res.unsqueeze(-1)
         return X_res

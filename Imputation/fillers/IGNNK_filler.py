@@ -1,21 +1,301 @@
 import inspect
+import random
 import warnings
 from copy import deepcopy
+from einops import rearrange
 
 import numpy as np
 import pytorch_lightning as pl
 import torch
-from active_learning import GraphStorage
-from einops import rearrange
-from KITS_filler import Filler
+from other_exp_utils import calculate_random_walk_matrix
 from pytorch_lightning.utilities import move_data_to_device
-from other_exp_utils import load_metr_la_rdata, get_normalized_adj, get_Laplace, calculate_random_walk_matrix,test_error
+from torchmetrics import MetricCollection
 from tsl import logger
-import random
+from tsl.metrics.torch import MaskedMetric
 
 warnings.filterwarnings("ignore")
 
 NCL = 10
+
+class Filler(pl.LightningModule):
+    def __init__(self,
+                 model_class,
+                 model_kwargs,
+                 optim_class,
+                 optim_kwargs,
+                 loss_fn,
+                 scaled_target=False,
+                 whiten_prob=0.05,
+                 metrics=None,
+                 scheduler_class=None,
+                 scheduler_kwargs=None,
+                 adj=None):
+        """
+        PL module to implement hole fillers.
+
+        :param model_class: Class of pytorch nn.Module implementing the imputer.
+        :param model_kwargs: Model's keyword arguments.
+        :param optim_class: Optimizer class.
+        :param optim_kwargs: Optimizer's keyword arguments.
+        :param loss_fn: Loss function used for training.
+        :param scaled_target: Whether to scale target before computing loss using batch processing information.
+        :param whiten_prob: Probability of removing a value and using it as ground truth for imputation.
+        :param metrics: Dictionary of type {'metric1_name':metric1_fn, 'metric2_name':metric2_fn ...}.
+        :param scheduler_class: Scheduler class.
+        :param scheduler_kwargs: Scheduler's keyword arguments.
+        """
+        super(Filler, self).__init__()
+        self.save_hyperparameters(ignore=['loss_fn'], logger=False)
+        self.model_cls = model_class
+        self.model_kwargs = model_kwargs
+        self.optim_class = optim_class
+        self.optim_kwargs = optim_kwargs
+        self.scheduler_class = scheduler_class
+        self.automatic_optimization = False
+        self.adj = adj
+
+        if scheduler_kwargs is None:
+            self.scheduler_kwargs = dict()
+        else:
+            self.scheduler_kwargs = scheduler_kwargs
+
+        if loss_fn is not None:
+            self.loss_fn = self._check_metric(loss_fn, on_step=True)
+        else:
+            self.loss_fn = None
+
+        self.scaled_target = scaled_target
+
+        # during training whiten ground-truth values with this probability
+        assert 0. <= whiten_prob <= 1.
+        self.keep_prob = 1. - whiten_prob
+
+        if metrics is None:
+            metrics = dict()
+        self._set_metrics(metrics)
+        # instantiate model
+        self.model = self.model_cls(**self.model_kwargs)
+
+    def reset_model(self):
+        self.model = self.model_cls(**self.model_kwargs)
+
+    @property
+    def trainable_parameters(self):
+        return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+
+    def forward(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+
+    def collate_prediction_outputs(self, outputs):
+        """
+        Collate the outputs of the :meth:`predict_step` method.
+
+        Args:
+            outputs: Collated outputs of the :meth:`predict_step` method.
+
+        Returns:
+            The collated outputs.
+        """
+        # iterate over results
+        processed_res = dict()
+        keys = set()
+        # iterate over outputs for each batch
+        for res in outputs:
+            if res:
+                for k, v in res.items():
+                    if k in keys:
+                        processed_res[k].append(v)
+                    else:
+                        processed_res[k] = [v]
+                    keys.add(k)
+        # concatenate results
+        for k, v in processed_res.items():
+            processed_res[k] = torch.cat(v, 0)
+        return processed_res
+    
+    def predict_step(self, batch, batch_idx, dataloader_idx=None):
+        batch_data, batch_preprocessing = self._unpack_batch(batch)
+
+        # Extract mask and target
+        eval_mask = batch_data.pop('eval_mask', None)
+        batch_data.pop('mask')
+        y = batch_data.pop('y')
+        _ = batch_data.pop("edge_index")
+
+        A_q = torch.from_numpy((calculate_random_walk_matrix(self.adj).T).astype('float32'))
+        A_h = torch.from_numpy((calculate_random_walk_matrix(self.adj.T).T).astype('float32'))
+
+        A_q = torch.tensor(A_q).to(y.device)
+        A_h = torch.tensor(A_h).to(y.device)
+
+        batch_data["A_q"] = A_q  # number
+        batch_data["A_h"] = A_h
+
+        # Compute outputs and rescale
+        imputation = self.predict_batch(batch, preprocess=False, postprocess=True)
+        output = dict(y=y,
+                      y_hat=imputation,
+                      eval_mask=eval_mask)
+        return output
+
+    @staticmethod
+    def _check_metric(metric, on_step=False):
+        if not isinstance(metric, MaskedMetric):
+            if 'reduction' in inspect.getfullargspec(metric).args:
+                metric_kwargs = {'reduction': 'none'}
+            else:
+                metric_kwargs = dict()
+            return MaskedMetric(metric, compute_on_step=on_step, metric_kwargs=metric_kwargs)
+        return deepcopy(metric)
+
+    def on_after_backward(self):
+        for name, param in self.named_parameters():
+            if param.grad is not None:
+                self.log(f'grad_mean/{name}', param.grad.mean(), on_step=True)
+                self.log(f'grad_max/{name}', param.grad.max(), on_step=True)
+                self.log(f'grad_min/{name}', param.grad.min(), on_step=True)      
+
+    def _set_metrics(self, metrics):
+        self.train_metrics = MetricCollection(
+            metrics={k: self._check_metric(m)
+                     for k, m in metrics.items()},
+            prefix='train_')
+        self.val_metrics = MetricCollection(
+            metrics={k: self._check_metric(m)
+                     for k, m in metrics.items()},
+            prefix='val_', compute_groups=False)
+        self.test_metrics = MetricCollection(
+            metrics={k: self._check_metric(m)
+                     for k, m in metrics.items()},
+            prefix='test_')
+
+    def _preprocess(self, data, batch_preprocessing):
+        """
+        Perform preprocessing of a given input.
+
+        :param data: pytorch tensor of shape [batch, steps, nodes, features] to preprocess
+        :param batch_preprocessing: dictionary containing preprocessing data
+        :return: preprocessed data
+        """
+        for key, trans in batch_preprocessing.items():
+            if key in data:
+                data[key] = trans.transform(data[key])
+        return data
+
+    def _postprocess(self, data, batch_preprocessing):
+        """
+        Perform postprocessing (inverse transform) of a given input.
+
+        :param data: pytorch tensor of shape [batch, steps, nodes, features] to trasform
+        :param batch_preprocessing: dictionary containing preprocessing data
+        :return: inverse transformed data
+        """
+        trans = batch_preprocessing.get('y')
+        if trans is not None:
+            data = trans.inverse_transform(data)
+        return data
+
+    def predict_batch(self, batch, preprocess=False, postprocess=True, return_target=False):
+        """
+        This method takes as an input a batch as a two dictionaries containing tensors and outputs the predictions.
+        Prediction should have a shape [batch, nodes, horizon]
+
+        :param batch: list dictionary following the structure [data:
+                                                                {'x':[...], 'y':[...], 'u':[...], ...},
+                                                              preprocessing:
+                                                                {'bias': ..., 'scale': ..., 'x_trend':[...], 'y_trend':[...]}]
+        :param preprocess: whether the data need to be preprocessed (note that inputs are by default preprocessed before creating the batch)
+        :param postprocess: whether to postprocess the predictions (if True we assume that the model has learned to predict the trasformed signal)
+        :param return_target: whether to return the prediction target y_true and the prediction mask
+        :return: (y_true), y_hat, (mask)
+        """
+        batch_data, batch_preprocessing = self._unpack_batch(batch)
+        if preprocess:
+            x = batch_data.pop('x')
+            x = self._preprocess(x, batch_preprocessing)
+            y_hat = self.forward(x, **batch_data)
+        else:
+            y_hat = self.forward(**batch_data)
+        # Rescale outputs
+        if postprocess:
+            y_hat = self._postprocess(y_hat, batch_preprocessing)
+        if return_target:
+            y = batch_data.get('y')
+            mask = batch_data.get('mask', None)
+            return y, y_hat, mask
+        return y_hat
+
+    def predict_loader(self, loader, preprocess=False, postprocess=True, return_mask=True):
+        """
+        Makes predictions for an input dataloader. Returns both the predictions and the predictions targets.
+
+        :param loader: torch dataloader
+        :param preprocess: whether to preprocess the data
+        :param postprocess: whether to postprocess the data
+        :param return_mask: whether to return the valid mask (if it exists)
+        :return: y_true, y_hat
+        """
+        targets, imputations, masks = [], [], []
+        for batch in loader:
+            batch = move_data_to_device(batch, self.device)
+            batch_data, batch_preprocessing = self._unpack_batch(batch)
+            # Extract mask and target
+            eval_mask = batch_data.pop('eval_mask', None)
+            batch_data.pop('mask')
+            y = batch_data.pop('y')
+            _ = batch_data.pop("edge_index")
+
+            A_q = torch.from_numpy((calculate_random_walk_matrix(self.adj).T).astype('float32'))
+            A_h = torch.from_numpy((calculate_random_walk_matrix(self.adj.T).T).astype('float32'))
+
+            A_q = torch.tensor(A_q).to(y.device)
+            A_h = torch.tensor(A_h).to(y.device)
+            batch_data["A_q"] = A_q  # number
+            batch_data["A_h"] = A_h
+
+            y_hat = self.predict_batch(batch, preprocess=preprocess, postprocess=postprocess)
+
+            if isinstance(y_hat, (list, tuple)):
+                y_hat = y_hat[0]
+
+            targets.append(y)
+            imputations.append(y_hat)
+            masks.append(eval_mask)
+
+        y = torch.cat(targets, 0)
+        y_hat = torch.cat(imputations, 0)
+        if return_mask:
+            mask = torch.cat(masks, 0) if masks[0] is not None else None
+            return y, y_hat, mask
+        return y, y_hat
+
+    def _unpack_batch(self, batch):
+        """
+        Unpack a batch into data and preprocessing dictionaries.
+
+        :param batch: the batch
+        :return: batch_data, batch_preprocessing
+        """
+        batch_preprocessing = batch.get('transform')
+        return batch, batch_preprocessing
+
+    def on_train_epoch_start(self) -> None:
+        optimizers = ensure_list(self.optimizers())
+        for i, optimizer in enumerate(optimizers):
+            lr = optimizer.optimizer.param_groups[0]['lr']
+            self.log(f'lr_{i}', lr, on_step=False, on_epoch=True, logger=True, prog_bar=False)
+
+    def configure_optimizers(self):
+        cfg = dict()
+        optimizer = self.optim_class(self.parameters(), **self.optim_kwargs)
+        cfg['optimizer'] = optimizer
+        if self.scheduler_class is not None:
+            metric = self.scheduler_kwargs.pop('monitor', None)
+            scheduler = self.scheduler_class(optimizer, **self.scheduler_kwargs)
+            cfg['lr_scheduler'] = scheduler
+            if metric is not None:
+                cfg['monitor'] = metric
+        return cfg
 
 
 def ensure_list(obj):
@@ -25,7 +305,7 @@ def ensure_list(obj):
         return [obj]
 
 
-class GCNCycVirtualFiller(Filler):
+class IGNNKFiller(Filler):
     def __init__(self,
                  model_class,
                  model_kwargs,
@@ -41,36 +321,28 @@ class GCNCycVirtualFiller(Filler):
                  scheduler_kwargs=None,
                  gradient_clip_val=None,
                  gradient_clip_algorithm=None,
-                 known_nodes=None,
-                 individual_reg=0,
-                 n_o_n_m=150,
-                 max_value=50,
-                 val_ratio=0.1):
-        super(GCNCycVirtualFiller, self).__init__(model_class=model_class,
-                                                  model_kwargs=model_kwargs,
-                                                  optim_class=optim_class,
-                                                  optim_kwargs=optim_kwargs,
-                                                  loss_fn=loss_fn,
-                                                  scaled_target=scaled_target,
-                                                  whiten_prob=whiten_prob,
-                                                  metrics=metrics,
-                                                  scheduler_class=scheduler_class,
-                                                  scheduler_kwargs=scheduler_kwargs)
+                 known_set=None,
+                 adj=None, 
+                 n_o_n_m=150):
+        super(IGNNKFiller, self).__init__(model_class=model_class,
+                                        model_kwargs=model_kwargs,
+                                        optim_class=optim_class,
+                                        optim_kwargs=optim_kwargs,
+                                        loss_fn=loss_fn,
+                                        scaled_target=scaled_target,
+                                        whiten_prob=whiten_prob,
+                                        metrics=metrics,
+                                        scheduler_class=scheduler_class,
+                                        scheduler_kwargs=scheduler_kwargs,
+                                        adj=adj)
         
         self.tradeoff = pred_loss_weight
         self.trimming = (warm_up, warm_up)
         self.n_o_m_n = n_o_n_m
-        self.max_value = max_value
-        self.known_set = None
+        self.known_set = known_set
         self.gradient_clip_val = gradient_clip_val
         self.gradient_clip_algorithm = gradient_clip_algorithm
-
-        self.cur_epo = -1
-        self.indiv_reg = individual_reg
-
-        self.train_set = known_nodes[:-1]
-        self.val_set = [known_nodes[-1]]
-        self.e_start = True
+        self.adj = adj
 
     def trim_seq(self, *seq):
         seq = [s[:, self.trimming[0]:s.size(1) - self.trimming[1]] for s in seq]
@@ -122,96 +394,77 @@ class GCNCycVirtualFiller(Filler):
                  prog_bar=False,
                  **kwargs)
 
-    def on_train_batch_start(self, batch, batch_idx):
-        if self.e_start:
-            batch_data, batch_preprocessing = self._unpack_batch(batch)
-
-            # To make the model inductive
-            # => remove unobserved entries from input data and adjacency matrix
-            # if self.known_set is None:
-                # Get observed entries (nonzero masks across time)
-            mask = batch_data["mask"]
-            mask = rearrange(mask, "b s n 1 -> (b s) n")
-            mask_sum = mask.sum(0)  # n
-            known_set = torch.where(mask_sum > 0)[0]
-            ratio = float(len(known_set) / mask_sum.shape[0])
-            self.ratio = ratio / 2
-
-            dynamic_ratio = self.ratio + 0.2 * np.random.random()
-            val_len = int(dynamic_ratio*len(known_set))
-            arrange = torch.randperm(len(known_set), device=mask.device)
-            val_set = known_set[arrange[:val_len]].detach().cpu().numpy().tolist()
-            train_set = known_set[arrange[val_len:]].detach().cpu().numpy().tolist()
-
-            self.train_set = train_set
-            self.val_set = val_set
-            self.e_start = False
-
     def training_step(self, batch, batch_idx):
         # Unpack batch
         opt = self.optimizers()
         batch_data, batch_preprocessing = self._unpack_batch(batch)
-
-        train_set = self.train_set
-        batch_data["known_set"] = train_set
+        known_set = self.known_set
 
         x = batch_data["x"]
-        mask = batch_data["mask"]
+        mask = batch_data.pop("mask")
         y = batch_data.pop("y")
         _ = batch_data.pop("eval_mask")  # drop this, we will re-create a new eval_mask (=mask during training)
+        _ = batch_data.pop("edge_index")
 
-        x = x[:, 0, train_set, :]  # b s n1 d, n1 = num of observed entries
-        mask = mask[:, 0, train_set, :]  # b s n1 d
-        y = y[:, 0, train_set, :]  # b s n1 d
-        og_adj = self.model.adj.clone().to(device=x.device)
-        A_s = og_adj[:, train_set]
-        A_s = A_s[train_set, :]
+        ratio = float(len(known_set) / mask.shape[2])
+        dy_ratio = ratio + 0.1 * np.random.random()
+        n_m = int(len(known_set)*dy_ratio)
+
+        x = x[:, :, known_set, :]  # b s n1 d, n1 = num of observed entries
+        mask = mask[:, :, known_set, :]  # b s n1 d
+        y = y[:, :, known_set, :]  # b s n1 d
+
+        og_adj = self.adj
+        A_s = og_adj[:, known_set]
+        A_s = A_s[known_set, :]
 
         b,t,n,_ = x.shape
-        batch_data["reset"] = self.inductive
 
-        t_random = np.random.randint(0, high=(b - t), size=b, dtype='l')
-        know_mask = set(random.sample(range(0,n), self.n_o_m_n)) #sample n_o + n_m nodes
-        feed_batch = []
-        for j in range(b):
-            feed_batch.append(x[t_random[j]: t_random[j] + t, :][:, list(know_mask)]) #generate 8 time batches
+        # x = rearrange(x, 'b t n d -> (b t) n d')
+        # t_random = np.random.randint(0, high=(b - t), size=b, dtype='l')
+        # know_mask = set(random.sample(range(0,n), n_m)) #sample n_o + n_m nodes
+        # feed_batch = []
+        # for j in range(b):
+        #     feed_batch.append(x[t_random[j]: t_random[j] + t, :][:, list(know_mask)]) #generate 8 time batches
         
-        inputs = torch.stack(feed_batch).to(x.device)
-        inputs_omask = torch.ones_like(inputs).to(x.device)
-        inputs_omask[inputs == 0] = 0           # We found that there are irregular 0 values for METR-LA, so we treat those 0 values as missing data,
-                                                # For other datasets, it is not necessary to mask 0 values
+        # inputs = torch.stack(feed_batch).to(x.device)
+        # inputs_omask = torch.ones_like(inputs).to(x.device)
+        # inputs_omask[inputs == 0] = 0           # We found that there are irregular 0 values for METR-LA, so we treat those 0 values as missing data,
+        #                                         # For other datasets, it is not necessary to mask 0 values
                                                 
-        missing_index = torch.ones_like(inputs).to(x.device)
+        missing_index = torch.ones_like(x).to(x.device)
         for j in range(b):
-            missing_mask = random.sample(range(0,self.n_o_m_n),len(self.val_set)) #Masked locations
+            missing_mask = random.sample(range(0,len(known_set)), len(known_set) - n_m) #Masked locations
             missing_index[j, :, missing_mask] = 0
             
-        Mf_inputs = inputs * inputs_omask * missing_index / self.max_value #normalize the value according to experience
-        mask = inputs_omask  #The reconstruction errors on irregular 0s are not used for training
+        Mf_inputs = x * missing_index
+
+        # mask = inputs_omask  #The reconstruction errors on irregular 0s are not used for training
         
-        A_dynamic = A_s[list(know_mask), :][:, list(know_mask)]   #Obtain the dynamic adjacent matrix
+        A_dynamic = A_s   #Obtain the dynamic adjacent matrix
         A_q = torch.from_numpy((calculate_random_walk_matrix(A_dynamic).T).astype('float32'))
         A_h = torch.from_numpy((calculate_random_walk_matrix(A_dynamic.T).T).astype('float32'))
-        
-        y = inputs/self.max_value #The label
+
+        A_q = torch.tensor(A_q).to(x.device)
+        A_h = torch.tensor(A_h).to(x.device)
         # X, A_q, A_h
-        batch_data["X"] = Mf_inputs  # b s n2 d
+        batch_data["x"] = Mf_inputs  # b s n2 d
         batch_data["A_q"] = A_q  # number
         batch_data["A_h"] = A_h
 
         # Compute predictions and compute loss
-        X_res = self.predict_batch(batch, preprocess=False, postprocess=False)
+        imputation = self.predict_batch(batch, preprocess=False, postprocess=False)
 
         if self.scaled_target:
             target = batch.transform['y'].transform(y)
         else:
             target = y
-            X_res = self._postprocess(X_res, batch_preprocessing)
+            imputation = self._postprocess(imputation, batch_preprocessing)
 
         # partial loss + cycle loss
         opt.zero_grad()
 
-        loss = self.loss_fn(X_res, target, mask)
+        loss = self.loss_fn(imputation, target, mask)
         
         self.manual_backward(loss)
 
@@ -237,37 +490,27 @@ class GCNCycVirtualFiller(Filler):
     def validation_step(self, batch, batch_idx):
         # Unpack batch
         batch_data, batch_preprocessing = self._unpack_batch(batch)
-        batch_data["training"] = False
 
         # Extract mask and target
         x = batch_data["x"]
-        mask = batch_data.get('mask')
-        _ = batch_data.pop('eval_mask', None)
+        mask = batch_data.pop('mask')
+        eval_mask = batch_data.pop('eval_mask', None)
+        _ = batch_data.pop("edge_index")
         # test = torch.sum(eval_mask, dim=(0, 1))
         # inds = torch.where(test > 0)
         y = batch_data.pop('y')
-    
-        eval_mask = mask.clone()
-        mask[:, :, self.val_set, :] = 0
-        eval_mask[:, :, self.train_set, :] = 0
-        x[:, :, self.val_set, :] = 0
+        A_q = torch.from_numpy((calculate_random_walk_matrix(self.adj).T).astype('float32'))
+        A_h = torch.from_numpy((calculate_random_walk_matrix(self.adj.T).T).astype('float32'))
 
-        known_set = self.train_set + self.val_set
-        x = x[:, :, known_set, :]  # b s n1 d, n1 = num of observed entries
-        mask = mask[:, :, known_set, :]  # b s n1 d
-        eval_mask = eval_mask[:, :, known_set, :]
-        y = y[:, :, known_set, :]  # b s n1 d
+        A_q = torch.tensor(A_q).to(x.device)
+        A_h = torch.tensor(A_h).to(x.device)
 
         batch_data["x"] = x  # b s n2 d
-        batch_data["mask"] = mask  # b s n' 1
-        batch_data["known_set"] = known_set
-        # print(self.val_set)
+        batch_data["A_q"] = A_q  # number
+        batch_data["A_h"] = A_h
 
         # Compute predictions and compute loss
         imputation = self.predict_batch(batch, preprocess=False, postprocess=False)
-
-        # trim to imputation horizon len
-        imputation, mask, eval_mask, y = self.trim_seq(imputation, mask, eval_mask, y)
 
         if self.scaled_target:
             target = batch.transform['y'].transform(y)
@@ -293,11 +536,21 @@ class GCNCycVirtualFiller(Filler):
     def test_step(self, batch, batch_idx):
         # Unpack batch
         batch_data, batch_preprocessing = self._unpack_batch(batch)
-        batch_data["training"] = False
 
         # Extract mask and target
         eval_mask = batch_data.pop('eval_mask', None)
+        mask = batch_data.pop('mask')
         y = batch_data.pop('y')
+        _ = batch_data.pop("edge_index")
+
+        A_q = torch.from_numpy((calculate_random_walk_matrix(self.adj).T).astype('float32'))
+        A_h = torch.from_numpy((calculate_random_walk_matrix(self.adj.T).T).astype('float32'))
+
+        A_q = torch.tensor(A_q).to(y.device)
+        A_h = torch.tensor(A_h).to(y.device)
+
+        batch_data["A_q"] = A_q  # number
+        batch_data["A_h"] = A_h
 
         # Compute outputs and rescale
         imputation = self.predict_batch(batch, preprocess=False, postprocess=True)

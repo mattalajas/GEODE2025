@@ -13,7 +13,7 @@ hydra:
     dir: logs/${now:%Y-%m-%d-%H-%M-%S}
     subdir: ${model.name}/${dataset.name}/${hydra.job.num}
 
-seed: 420  # automatically set everywhere the seed
+# seed: 420  # automatically set everywhere the seed
 tags:
   - ${model.name}
   - ${dataset.name}
@@ -30,8 +30,8 @@ window: 24
 stride: 1
 
 #### Training params ##########################################################
-epochs: 300
-patience: 200
+epochs: 100
+patience: 100
 batch_size: 64
 grad_clip_val: 1
 grad_clip_alg: 'norm'

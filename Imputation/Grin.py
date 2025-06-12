@@ -27,19 +27,23 @@ from baselines.KITS import KITS
 from baselines.IGNNK import IGNNK
 from baselines.DIDA import DGNN
 from baselines.CauSTG import CauSTG
+from baselines.IGNNK import IGNNK
 from fillers.KITS_filler import GCNCycVirtualFiller
 from fillers.unnamed_filler import UnnamedKrigFiller
 from fillers.unnamed_filler_v2 import UnnamedKrigFillerV2
 from fillers.unnamed_filler_v4 import UnnamedKrigFillerV4
+from fillers.unnamed_filler_v5 import UnnamedKrigFillerV5
 from fillers.DIDA_filler import DidaFiller
 from fillers.CauSTG_filler import CauSTGFiller
+from fillers.IGNNK_filler import IGNNKFiller
 from unnamedKrig import UnnamedKrigModel
 from unnamedKrig_v2 import UnnamedKrigModelV2
 from unnamedKrig_v3 import UnnamedKrigModelV3
 from unnamedKrig_v4 import UnnamedKrigModelV4
+from unnamedKrig_v5 import UnnamedKrigModelV5
 from utils import month_splitter
 
-MODELS = ['kits', 'unkrig', 'kcn', 'unkrigv2', 'unkrigv3', 'unkrigv4', 'ignnk', 'caustg', 'dida']
+MODELS = ['kits', 'unkrig', 'kcn', 'unkrigv2', 'unkrigv3', 'unkrigv4', 'unkrigv5', 'ignnk', 'caustg', 'dida']
 
 def get_model_class(model_str):
     if model_str == 'rnni':
@@ -62,6 +66,8 @@ def get_model_class(model_str):
         model = UnnamedKrigModelV3
     elif model_str == 'unkrigv4':
         model = UnnamedKrigModelV4
+    elif model_str == 'unkrigv5':
+        model = UnnamedKrigModelV5
     elif model_str == 'ignnk':
         model = IGNNK
     elif model_str == 'dida':
@@ -267,9 +273,6 @@ def run_imputation(cfg: DictConfig):
                             order=cfg.dataset.get('order'),
                             node_features=cfg.dataset.get('node_features'))
 
-    if cfg.dataset.get('shift', False):
-        dataset.get_splitter = month_splitter
-
     print(f'Masked sensors: {masked_sensors}')
 
     # encode time of the day and use it as exogenous variable
@@ -297,12 +300,24 @@ def run_imputation(cfg: DictConfig):
 
     scalers = {'target': StandardScaler(axis=(0, 1))}
 
-    dm = SpatioTemporalDataModule(
-        dataset=torch_dataset,
-        scalers=scalers,
-        splitter=dataset.get_splitter(**cfg.dataset.splitting),
-        batch_size=cfg.batch_size,
-        workers=cfg.workers)
+    if cfg.dataset.get('shift', False):
+        dataset.get_splitter = month_splitter
+
+        dm = SpatioTemporalDataModule(
+            dataset=torch_dataset,
+            scalers=scalers,
+            splitter=dataset.get_splitter(**cfg.dataset.splitting),
+            batch_size=cfg.batch_size,
+            workers=cfg.workers)
+    else:
+        val_len = cfg.dataset.splitting.get('val_len')
+        test_len = cfg.dataset.splitting.get('test_len')
+        dm = SpatioTemporalDataModule(
+            dataset=torch_dataset,
+            scalers=scalers,
+            splitter=dataset.get_splitter(val_len=val_len, test_len=test_len),
+            batch_size=cfg.batch_size,
+            workers=cfg.workers)
     dm.setup(stage='fit')
 
     print(f'train_times: {np.unique(dataset.dataframe().iloc[dm.train_dataloader().dataset.indices].index.month)}, \
@@ -327,8 +342,10 @@ def run_imputation(cfg: DictConfig):
         model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
     elif cfg.model.name == 'unkrigv4':
         model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
+    elif cfg.model.name == 'unkrigv5':
+        model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
     elif cfg.model.name == 'ignnk':
-        model_kwargs = dict(z=cfg.model.z, h=cfg.window, K=cfg.model.K)
+        model_kwargs = dict(h=cfg.window)
     elif cfg.model.name == 'dida':
         model_kwargs = dict(nfeat=dm.n_channels, output_size=dm.n_channels, 
                             num_nodes=adj.shape[0], args=cfg.model.hparams)
@@ -346,13 +363,14 @@ def run_imputation(cfg: DictConfig):
 
     if cfg.model.name == 'kcn':
         loss_fn = torch_metrics.MaskedMSE()
-    elif cfg.model.name == 'unkrig' or cfg.model.name == 'unkrigv2' \
-        or cfg.model.name == 'unkrigv3' or cfg.model.name == 'unkrigv4':
+    elif cfg.model.name in ['unkrig', 'unkrigv2', 'unkrigv3', 'unkrigv4']:
         loss_fn = [torch_metrics.MaskedMAE(), torch_metrics.MaskedMSE()]
     elif cfg.model.name == 'ignnk':
         loss_fn = torch_metrics.MaskedMSE()
-    else:
+    elif cfg.model.name in ['kits', 'unkrigv5']:
         loss_fn = torch_metrics.MaskedMAE()
+    else:
+        raise f'{cfg.model.name} not implemented'
 
     log_metrics = {
         'mae': torch_metrics.MaskedMAE(),
@@ -443,6 +461,23 @@ def run_imputation(cfg: DictConfig):
                             gradient_clip_algorithm=cfg.grad_clip_alg,
                             known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
                             **cfg.model.regs)
+    elif cfg.model.name == "unkrigv5":
+        imputer = UnnamedKrigFillerV5(model_class=model_cls,
+                            model_kwargs=model_kwargs,
+                            optim_class=getattr(torch.optim, cfg.optimizer.name),
+                            optim_kwargs=dict(cfg.optimizer.hparams),
+                            loss_fn=loss_fn,
+                            scaled_target=cfg.scale_target,
+                            whiten_prob=cfg.whiten_prob,
+                            pred_loss_weight=cfg.prediction_loss_weight,
+                            warm_up=cfg.warm_up_steps,
+                            metrics=log_metrics,
+                            scheduler_class=scheduler_class,
+                            scheduler_kwargs=scheduler_kwargs,
+                            gradient_clip_val=cfg.grad_clip_val,
+                            gradient_clip_algorithm=cfg.grad_clip_alg,
+                            known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
+                            **cfg.model.regs)
     elif cfg.model.name == "dida":
         imputer = DidaFiller(model_class=model_cls,
                             model_kwargs=model_kwargs,
@@ -481,6 +516,24 @@ def run_imputation(cfg: DictConfig):
                             adj=adj,
                             device=cfg.device,
                             **cfg.model.regs)
+    elif cfg.model.name == "ignnk":
+        imputer = IGNNKFiller(model_class=model_cls,
+                            model_kwargs=model_kwargs,
+                            optim_class=getattr(torch.optim, cfg.optimizer.name),
+                            optim_kwargs=dict(cfg.optimizer.hparams),
+                            loss_fn=loss_fn,
+                            scaled_target=cfg.scale_target,
+                            whiten_prob=cfg.whiten_prob,
+                            pred_loss_weight=cfg.prediction_loss_weight,
+                            warm_up=cfg.warm_up_steps,
+                            metrics=log_metrics,
+                            scheduler_class=scheduler_class,
+                            scheduler_kwargs=scheduler_kwargs,
+                            gradient_clip_val=cfg.grad_clip_val,
+                            gradient_clip_algorithm=cfg.grad_clip_alg,
+                            known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
+                            adj=adj,
+                            n_o_n_m=cfg.model.n_o_n_m)
     else:
         imputer = Imputer(model_class=model_cls,
                         model_kwargs=model_kwargs,
