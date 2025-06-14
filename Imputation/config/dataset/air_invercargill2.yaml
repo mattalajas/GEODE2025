@@ -1,13 +1,29 @@
 #### Dataset params ###########################################################
 name: air_invercargill2
-masked_sensors: [5]
+
+# Shifts
+shift: false
+spatial_shift: false
+order: 0
+node_features: c_centrality
+
+# Point
+mode: road
+p_fault: 0.
+p_noise: 0.25
+
+# masked_sensors: [5]
 test_month: [6]
+
 agg_func: 'mean'
 location: 'Invercargill2'
 t_range: ['2023-08-01', '2023-10-01']
+
 splitting:
   val_len: 0.1
   test_len: 0.2
+  gran: month
+  test_times: [6]
 connectivity:
   method: distance
   threshold: 1e-4

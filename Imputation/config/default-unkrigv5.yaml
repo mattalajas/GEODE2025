@@ -2,23 +2,24 @@ defaults:
   - _self_
   - logger: null
   - dataset: metrla
-  - model: dida
+  - model: unkrigv5
 
 #### Experiment params ########################################################
 hydra:
   run:
-    # dir: logs/kits/air/2025-05-03/12-20-42
+    # dir: logs/unkrigv3/air/2025-05-25/16-43-23
     dir: logs/${model.name}/${dataset.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
   sweep:
     dir: logs/${now:%Y-%m-%d-%H-%M-%S}
     subdir: ${model.name}/${dataset.name}/${hydra.job.num}
 
-# seed: 420  # automatically set everywhere the seed
+# seed: 87654321  # automatically set everywhere the seed
 tags:
   - ${model.name}
   - ${dataset.name}
 
 # Replace with the last ckpt file to resume training
+# call_path: logs/unkrigv2/metrla/2025-05-19/12-17-11/epoch=4-last.ckpt
 call_path: null
 workers: 0
 num_threads: 1  # limit the number of pytorch threads spawn
@@ -31,8 +32,8 @@ stride: 1
 
 #### Training params ##########################################################
 epochs: 100
-patience: 100
-batch_size: 32
+patience: 50
+batch_size: 64
 grad_clip_val: 1
 grad_clip_alg: 'norm'
 scale_target: True
@@ -40,7 +41,7 @@ whiten_prob: 0.05
 prediction_loss_weight: 1
 impute_only_missing: False
 warm_up_steps: 0
-device: [1]
+device: [0]
 
 detrend: False
 scale: True

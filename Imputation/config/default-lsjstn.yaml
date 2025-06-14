@@ -2,7 +2,7 @@ defaults:
   - _self_
   - logger: null
   - dataset: metrla
-  - model: dida
+  - model: lsjstn
 
 #### Experiment params ########################################################
 hydra:
@@ -32,7 +32,7 @@ stride: 1
 #### Training params ##########################################################
 epochs: 100
 patience: 100
-batch_size: 32
+batch_size: 64
 grad_clip_val: 1
 grad_clip_alg: 'norm'
 scale_target: True
@@ -40,16 +40,17 @@ whiten_prob: 0.05
 prediction_loss_weight: 1
 impute_only_missing: False
 warm_up_steps: 0
-device: [1]
+device: [0]
 
 detrend: False
 scale: True
 scaling_axis: 'global'  # ['channels', 'global']
 
+
 optimizer:
   name: Adam
   hparams:
-    lr: 0.0002
+    lr: 0.001
     weight_decay: 0.
 
 lr_scheduler:
