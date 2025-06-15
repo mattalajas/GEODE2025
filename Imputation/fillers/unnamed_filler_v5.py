@@ -506,7 +506,7 @@ class UnnamedKrigFillerV5(unKrigFillerV5):
         batch_data["masked_set"] = masked_indx
 
         eval_mask = mask  # eval_mask = mask, during training
-        # eval_mask[:, :, :len(seened_indx)] = 0.
+        eval_mask[:, :, :len(seened_indx)] = 0.
 
         batch_data["x"] = x  # b s seen d
         batch_data["mask"] = mask  # b s n' 1
