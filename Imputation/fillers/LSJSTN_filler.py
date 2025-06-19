@@ -1,31 +1,25 @@
 import inspect
+import random
 import warnings
 from copy import deepcopy
+from einops import rearrange
 
 import numpy as np
 import pytorch_lightning as pl
 import torch
-from active_learning import GraphStorage
-from einops import rearrange
-from pytorch_lightning.utilities import move_data_to_device, grad_norm
+import scipy.sparse as sp
+from other_exp_utils import calculate_random_walk_matrix
+from pytorch_lightning.utilities import move_data_to_device
+from torch_geometric.utils import dense_to_sparse
 from torchmetrics import MetricCollection
 from tsl import logger
 from tsl.metrics.torch import MaskedMetric
-from tsl.metrics.torch.functional import mre
-from utils import mmd_loss, mmd_loss_single, cmd_time, cmd
 
 warnings.filterwarnings("ignore")
 
 NCL = 10
 
-
-def ensure_list(obj):
-    if isinstance(obj, (list, tuple)):
-        return list(obj)
-    else:
-        return [obj]
-
-class unKrigFillerV5(pl.LightningModule):
+class Filler(pl.LightningModule):
     def __init__(self,
                  model_class,
                  model_kwargs,
@@ -36,7 +30,8 @@ class unKrigFillerV5(pl.LightningModule):
                  whiten_prob=0.05,
                  metrics=None,
                  scheduler_class=None,
-                 scheduler_kwargs=None):
+                 scheduler_kwargs=None,
+                 adj=None):
         """
         PL module to implement hole fillers.
 
@@ -51,7 +46,7 @@ class unKrigFillerV5(pl.LightningModule):
         :param scheduler_class: Scheduler class.
         :param scheduler_kwargs: Scheduler's keyword arguments.
         """
-        super(unKrigFillerV5, self).__init__()
+        super(Filler, self).__init__()
         self.save_hyperparameters(ignore=['loss_fn'], logger=False)
         self.model_cls = model_class
         self.model_kwargs = model_kwargs
@@ -59,6 +54,7 @@ class unKrigFillerV5(pl.LightningModule):
         self.optim_kwargs = optim_kwargs
         self.scheduler_class = scheduler_class
         self.automatic_optimization = False
+        self.adj = adj
 
         if scheduler_kwargs is None:
             self.scheduler_kwargs = dict()
@@ -90,15 +86,29 @@ class unKrigFillerV5(pl.LightningModule):
         return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
 
     def forward(self, *args, **kwargs):
-        return self.model(*args, **kwargs)\
+        return self.model(*args, **kwargs)
+
+    def calculate_normalized_laplacian(self, adj):
+        """
+        # L = D^-1/2 (D-A) D^-1/2 = I - D^-1/2 A D^-1/2
+        # D = diag(A 1)
+        :param adj:
+        :return:
+        """
+        adj = sp.coo_matrix(adj)
+        d = np.array(adj.sum(1))
+        d_inv_sqrt = np.power(d, -0.5).flatten()
+        d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
+        d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
+        normalized_laplacian = sp.eye(adj.shape[0]) - adj.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt).tocoo()
+        return normalized_laplacian.toarray()
     
-    def on_after_backward(self):
-        for name, param in self.named_parameters():
-            if param.grad is not None:
-                self.log(f'grad_mean/{name}', param.grad.mean(), on_step=True)
-                self.log(f'grad_max/{name}', param.grad.max(), on_step=True)
-                self.log(f'grad_min/{name}', param.grad.min(), on_step=True)      
-                self.log(f'grad_norm/{name}', param.grad.norm(), on_step=True)      
+    def norm_adj(self, A):
+    # random walk matrix
+        if type(A) == list:
+            return [torch.from_numpy(self.calculate_normalized_laplacian(adj)).to(device=self.device, dtype=torch.float32) for adj in A]
+        else:
+            return  torch.from_numpy(self.calculate_normalized_laplacian(A)).to(device=self.device, dtype=torch.float32)
 
     def collate_prediction_outputs(self, outputs):
         """
@@ -129,66 +139,43 @@ class unKrigFillerV5(pl.LightningModule):
     
     def predict_step(self, batch, batch_idx, dataloader_idx=None):
         batch_data, batch_preprocessing = self._unpack_batch(batch)
-        batch_data["training"] = False
-
-        # if self.known_set is None:
-            # Get observed entries (nonzero masks across time)
-        # if self.inductive:
-        emask = batch_data["eval_mask"]
-        emask = rearrange(emask, "b s n 1 -> (b s) n")
-        mask_sum = emask.sum(0)  # n
-        known_set = torch.where(mask_sum == 0)[0]
-        unknown_set = torch.where(mask_sum > 0)[0]
-        arrange = torch.cat((known_set, unknown_set))
-        reverse = torch.empty_like(arrange)
-        reverse[arrange] = torch.arange(len(arrange)).to(arrange.device)
-        arrange = arrange.detach().cpu().numpy().tolist()
-        known_set = known_set.detach().cpu().numpy().tolist()
-
-        if known_set == []:
-            return None
-        
-        batch_data["sub_entry_num"] = len(unknown_set)
-        batch_data["masked_set"] = unknown_set.detach().cpu().numpy().tolist()
-        #     else:
-        #         known_set = list(range(batch_data['mask'].shape[2]))
-        # else:
-        #     known_set = self.known_set
-
-        batch_data["known_set"] = known_set
-        x = batch_data["x"]
-        batch_data["x"] = x[:, :, known_set, :]
-
-        mask = batch_data["mask"]
-        mask = mask[:, :, arrange, :]
-        batch_data["mask"] = mask
 
         # Extract mask and target
+        x = batch_data["x"]
+        mask = batch_data.pop('mask')
         eval_mask = batch_data.pop('eval_mask', None)
+        _ = batch_data.pop("edge_index")
         y = batch_data.pop('y')
-        batch_data.pop("edge_index", None)
 
-        # Compute outputs and rescale
-        # finpreds, _, inv_adj, var_adj, sum_out = self.predict_batch(batch, preprocess=False, postprocess=True)
-        finpreds, _, _ = self.predict_batch(batch, preprocess=False, postprocess=True)
-        # inv_adj = inv_adj[:, reverse, :]
-        # inv_adj = inv_adj[:, :, reverse]
-        # var_adj = var_adj[:, reverse, :]
-        # var_adj = var_adj[:, :, reverse]
+        adj = np.copy(self.adj)
 
-        finpreds = finpreds[:, :, reverse, :]
-        mask = mask[:, :, reverse, :]
+        adjs = [adj, adj.T]
+        predefined_A = self.norm_adj([adjs[0], adjs[1]])
+        predefined_A = (predefined_A[0].to(self.device) + predefined_A[1].to(self.device)) / 2
 
-        
+        # times = mask.shape[1]
+        # eval_mask = eval_mask[:, 1:]
+        # y = y[:, 1:]
+
+        time_step = np.random.randint(1, mask.shape[1]-1)
+        x = x[:, :time_step, :, :]  # b s n1 d, n1 = num of observed entries
+        eval_mask = eval_mask[:, time_step, :, :]  # b s n1 d
+        y = y[:, time_step, :, :]  # b s n1 d
+
+        # imputation = []
+        # for time in range(1, times):
+        #     # Compute predictions and compute loss
+        #     batch_data["x"] = x[:, :time, ]  # b s n2 d
+
+        batch_data["x"] = x  # b s n2 d
+        batch_data["predefined_A"] = predefined_A  # b s n' 1
+        _, _, imputation, _ = self.predict_batch(batch, preprocess=False, postprocess=True)
+            # imputation.append(output)
+        # imputation = torch.stack(imputation, 1).to(x.device)
+
         output = dict(y=y,
-                      y_hat=finpreds,
-                      mask=mask,
+                      y_hat=imputation,
                       eval_mask=eval_mask)
-                    #   invars=output_invars_s[0],
-                    #   vars=output_vars_s[0],
-                    #   inv_adj=inv_adj,
-                    #   var_adj=var_adj)
-                    #   sum_out=sum_out)
         return output
 
     @staticmethod
@@ -200,6 +187,13 @@ class unKrigFillerV5(pl.LightningModule):
                 metric_kwargs = dict()
             return MaskedMetric(metric, compute_on_step=on_step, metric_kwargs=metric_kwargs)
         return deepcopy(metric)
+
+    def on_after_backward(self):
+        for name, param in self.named_parameters():
+            if param.grad is not None:
+                self.log(f'grad_mean/{name}', param.grad.mean(), on_step=True)
+                self.log(f'grad_max/{name}', param.grad.max(), on_step=True)
+                self.log(f'grad_min/{name}', param.grad.min(), on_step=True)      
 
     def _set_metrics(self, metrics):
         self.train_metrics = MetricCollection(
@@ -264,12 +258,17 @@ class unKrigFillerV5(pl.LightningModule):
             y_hat = self.forward(**batch_data)
         # Rescale outputs
         if postprocess:
-            y_hat = self._postprocess(y_hat, batch_preprocessing)
+            gat_output, gru_output, imputation, atten_scores = y_hat
+            gat_output = self._postprocess(gat_output, batch_preprocessing).squeeze(0)
+            gru_output = self._postprocess(gru_output, batch_preprocessing).squeeze(0)
+            imputation = self._postprocess(imputation, batch_preprocessing).squeeze(0)
+
+            y_hat = [gat_output, gru_output, imputation, atten_scores]
         if return_target:
             y = batch_data.get('y')
             mask = batch_data.get('mask', None)
             return y, y_hat, mask
-        return y_hat, None, None
+        return y_hat
 
     def predict_loader(self, loader, preprocess=False, postprocess=True, return_mask=True):
         """
@@ -285,36 +284,38 @@ class unKrigFillerV5(pl.LightningModule):
         for batch in loader:
             batch = move_data_to_device(batch, self.device)
             batch_data, batch_preprocessing = self._unpack_batch(batch)
-
-            eval_mask = batch_data.pop('eval_mask', None)
-            emask = rearrange(eval_mask, "b s n 1 -> (b s) n")
-            mask_sum = emask.sum(0)  # n
-            known_set = torch.where(mask_sum == 0)[0]
-            unknown_set = torch.where(mask_sum > 0)[0]
-            arrange = torch.cat((known_set, unknown_set))
-            reverse = torch.empty_like(arrange)
-            reverse[arrange] = torch.arange(len(arrange)).to(arrange.device)
-            arrange = arrange.detach().cpu().numpy().tolist()
-            known_set = known_set.detach().cpu().numpy().tolist()
+            
             # Extract mask and target
-
-            batch_data["sub_entry_num"] = len(unknown_set)
-            batch_data["masked_set"] = unknown_set.detach().cpu().numpy().tolist()
-
-            batch_data["known_set"] = known_set
             x = batch_data["x"]
-            batch_data["x"] = x[:, :, known_set, :]
-
-            mask = batch_data["mask"]
-            mask = mask[:, :, arrange, :]
-            batch_data["mask"] = mask
-
-            # Extract mask and target
+            mask = batch_data.pop('mask')
             eval_mask = batch_data.pop('eval_mask', None)
+            _ = batch_data.pop("edge_index")
             y = batch_data.pop('y')
-            batch_data.pop("edge_index", None)
 
-            y_hat, _, _ = self.predict_batch(batch, preprocess=preprocess, postprocess=postprocess)
+            adj = np.copy(self.adj)
+
+            adjs = [adj, adj.T]
+            predefined_A = self.norm_adj([adjs[0], adjs[1]])
+            predefined_A = (predefined_A[0].to(self.device) + predefined_A[1].to(self.device)) / 2
+
+            # times = mask.shape[1]
+            # eval_mask = eval_mask[:, 1:]
+            # y = y[:, 1:]
+
+            time_step = np.random.randint(1, mask.shape[1]-1)
+            x = x[:, :time_step, :, :]  # b s n1 d, n1 = num of observed entries
+            eval_mask = eval_mask[:, time_step, :, :]  # b s n1 d
+            y = y[:, time_step, :, :]  # b s n1 d
+
+            # y_hat = []
+            # for time in range(1, times):
+            #     # Compute predictions and compute loss
+            #     batch_data["x"] = x[:, :time, ]  # b s n2 d
+            batch_data["x"] = x  # b s n2 d
+            batch_data["predefined_A"] = predefined_A  # b s n' 1
+            _, _, y_hat, _ = self.predict_batch(batch, preprocess=preprocess, postprocess=postprocess)
+            # y_hat.append(output)
+            # y_hat = torch.stack(y_hat, 1).to(x.device)
 
             if isinstance(y_hat, (list, tuple)):
                 y_hat = y_hat[0]
@@ -358,7 +359,15 @@ class unKrigFillerV5(pl.LightningModule):
                 cfg['monitor'] = metric
         return cfg
 
-class UnnamedKrigFillerV5(unKrigFillerV5):
+
+def ensure_list(obj):
+    if isinstance(obj, (list, tuple)):
+        return list(obj)
+    else:
+        return [obj]
+
+
+class LSJSTNFiller(Filler):
     def __init__(self,
                  model_class,
                  model_kwargs,
@@ -372,38 +381,38 @@ class UnnamedKrigFillerV5(unKrigFillerV5):
                  metrics=None,
                  scheduler_class=None,
                  scheduler_kwargs=None,
-                 inductive=True,
                  gradient_clip_val=None,
                  gradient_clip_algorithm=None,
                  known_set=None,
-                 y1 = 1,
-                 y2 = 1,
-                 dloss = 'mmd'):
-        super(UnnamedKrigFillerV5, self).__init__(model_class=model_class,
-                                                  model_kwargs=model_kwargs,
-                                                  optim_class=optim_class,
-                                                  optim_kwargs=optim_kwargs,
-                                                  loss_fn=loss_fn,
-                                                  scaled_target=scaled_target,
-                                                  whiten_prob=whiten_prob,
-                                                  metrics=metrics,
-                                                  scheduler_class=scheduler_class,
-                                                  scheduler_kwargs=scheduler_kwargs)
+                 adj=None):
         
         self.tradeoff = pred_loss_weight
         self.trimming = (warm_up, warm_up)
-
         self.known_set = known_set
-        self.inductive = inductive
         self.gradient_clip_val = gradient_clip_val
         self.gradient_clip_algorithm = gradient_clip_algorithm
-        self.y1 = y1
-        self.y2 = y2
         
-        assert dloss in ['mmd', 'cmd']
-        self.dloss = dloss
-        
-        # self.ratio = 0.
+        self.adj = adj
+        TGN_param = {
+            'layer1': {'dims_TGN': [-1, 8], 'depth_TGN': 3},
+            'layer2': {'dims_TGN': [8, 16], 'depth_TGN': 3},
+            'layer3': {'dims_TGN': [16, 32], 'depth_TGN': 3},
+        }
+        hyperGCN_param = {'dims_hyper': [-1, 16], 'depth_GCN': 1}
+        model_kwargs['hyperGCN_param'] = hyperGCN_param
+        model_kwargs['TGN_param'] = TGN_param
+
+        super(LSJSTNFiller, self).__init__(model_class=model_class,
+                                        model_kwargs=model_kwargs,
+                                        optim_class=optim_class,
+                                        optim_kwargs=optim_kwargs,
+                                        loss_fn=loss_fn,
+                                        scaled_target=scaled_target,
+                                        whiten_prob=whiten_prob,
+                                        metrics=metrics,
+                                        scheduler_class=scheduler_class,
+                                        scheduler_kwargs=scheduler_kwargs,
+                                        adj=adj)
 
     def trim_seq(self, *seq):
         seq = [s[:, self.trimming[0]:s.size(1) - self.trimming[1]] for s in seq]
@@ -457,19 +466,15 @@ class UnnamedKrigFillerV5(unKrigFillerV5):
 
     def training_step(self, batch, batch_idx):
         # Unpack batch
-        opt1 = self.optimizers()
+        opt = self.optimizers()
         batch_data, batch_preprocessing = self._unpack_batch(batch)
 
-        x = batch_data["x"]
-        y = batch_data.pop("y")
-        batch_data.pop("eval_mask")
-        batch_data.pop("edge_index", None)
-
         mask = batch_data["mask"]
-        mask_r = rearrange(mask, "b s n 1 -> (b s) n")
-        mask_sum = mask_r.sum(0)  # n
-
+        mask = rearrange(mask, "b s n 1 -> (b s) n")
+        mask_sum = mask.sum(0)  # n
+        
         if self.known_set is None:
+            # Get observed entries (nonzero masks across time)
             known_set = torch.where(mask_sum > 0)[0].detach().cpu().numpy().tolist()
             ratio = float(len(known_set) / mask_sum.shape[0])
             self.ratio = ratio
@@ -478,165 +483,70 @@ class UnnamedKrigFillerV5(unKrigFillerV5):
             ratio = float(len(known_set) / mask_sum.shape[0])
             self.ratio = ratio
 
-        # else:
-        #     known_set = list(range(batch_data['mask'].shape[2]))
-        # else:
-        #     known_set = self.known_set
+        # batch_data["known_set"] = known_set
 
-        batch_data["known_set"] = known_set
+        x = batch_data.pop("x")
+        mask = batch_data.pop("mask")
+        y = batch_data.pop("y")
+        _ = batch_data.pop("eval_mask")  # drop this, we will re-create a new eval_mask (=mask during training)
+        _ = batch_data.pop("edge_index")
+        adj = np.copy(self.adj)
 
-        # x = x[:, :, train_set, :]  # b s n1 d, n1 = num of known entries
-        # mask = mask[:, :, train_set, :]  # b s n1 d
-        # y = y[:, :, train_set, :]  # b s n1 d
-
-        sub_entry_num = 0
-        batch_data["reset"] = self.inductive
-
-        # Create randomised model here
-        cur_entry_num = mask.size(2)
-        dynamic_ratio = self.ratio + 0.1 * np.random.random()  # ratio + 0.1
-        aug_entry_num = max(int(cur_entry_num / dynamic_ratio), cur_entry_num + 1)
-        sub_entry_num = aug_entry_num - cur_entry_num  # n2 - n1
-        # sub_entry_num = min(aug_entry_num - cur_entry_num, mask.size(2) - cur_entry_num)  # n2 - n1
-
-        train_ratio = (1 - self.ratio) + 0.1 * np.random.random() 
-        trn_entry_num = min(max(int(train_ratio * cur_entry_num), 1), len(known_set)//2)
-
-        assert sub_entry_num > 0, "The augmented data should have more entries than original data."
-        self.sub_entry_num = sub_entry_num
-
-        arrange = torch.randperm(len(known_set))
-        t_set = torch.tensor(known_set)
-        masked_indx = t_set[arrange[-trn_entry_num:]].numpy().tolist()
-        seened_indx = t_set[arrange[:-trn_entry_num]].numpy().tolist()
-        full = seened_indx + masked_indx
-        # print(self.val_set)
-        # print(sub_entry_num, cur_entry_num)
-        # print(masked_indx)
-        # print(seened_indx)
-
-        # Arrange the indexes to b s (seen, masked) d
-        x = x[:, :, seened_indx, :]
-        y = y[:, :, full, :]
-        mask = mask[:, :, full, :]
+        # # Create randomised model here
+        # if self.inductive:
         b, s, n, d = mask.size()
 
-        if self.inductive:
-            sub_entry = torch.zeros(b, s, sub_entry_num, d).to(x.device)
-            mask = torch.cat([mask, sub_entry], dim=2).byte()  # b s n2 d
-            y = torch.cat([y, sub_entry], dim=2)  # b s n2 d
+        time_step = np.random.randint(1, s-1)
 
-        # Mask the training masks too
-        batch_data["seened_set"] = seened_indx
-        batch_data["masked_set"] = masked_indx
+        x = x[:, :time_step, known_set, :]  # b s n1 d, n1 = num of observed entries
+        mask = mask[:, time_step, known_set, :]  # b s n1 d
+        y = y[:, time_step, known_set, :]  # b s n1 d
 
-        eval_mask = mask  # eval_mask = mask, during training
-        eval_mask[:, :, :len(seened_indx)] = 0.
+        adj = adj[:, known_set]
+        adj = adj[known_set, :]
 
-        batch_data["x"] = x  # b s seen d
-        batch_data["mask"] = mask  # b s n' 1
-        batch_data["sub_entry_num"] = sub_entry_num  # number
-        batch_data["training"] = True
+        adjs = [adj, adj.T]
+        predefined_A = self.norm_adj([adjs[0], adjs[1]])
+        predefined_A = (predefined_A[0].to(self.device) + predefined_A[1].to(self.device)) / 2
+
+        # pre_A = dense_to_sparse(adj)
+
+        batch_data["x"] = x  # b s n2 d
+        batch_data["predefined_A"] = predefined_A  # b s n' 1
 
         # Compute predictions and compute loss
-        res, _, _ = self.predict_batch(batch, preprocess=False, postprocess=False)
-        finpreds, finrecos, fin_irm_all_s = res[0], res[1], res[2]
+        gat_output, gru_output, imputation, atten_scores = self.predict_batch(batch, preprocess=False, postprocess=False)
 
-        b = x.shape[0]
         if self.scaled_target:
-            target = batch.transform['y'].transform(y)
+            target = batch.transform['y'].transform(y).squeeze(0)
         else:
             target = y
-            # finrecos = self._postprocess(finrecos, batch_preprocessing)
-            finpreds = self._postprocess(finpreds, batch_preprocessing)
-            fin_irm_all_s = self._postprocess(fin_irm_all_s, batch_preprocessing)
+            gat_output = self._postprocess(gat_output, batch_preprocessing).squeeze(0)
+            gru_output = self._postprocess(gru_output, batch_preprocessing).squeeze(0)
+            imputation = self._postprocess(imputation, batch_preprocessing).squeeze(0)
 
-        opt1.zero_grad()
+        # partial loss + cycle loss
+        opt.zero_grad()
 
-        # IRM Loss
-        irm_target = target[:, :, :len(known_set)]
-        irm_mask = eval_mask[:, :, :len(known_set)]
-        steps = self.model.steps
-        env_loss = torch.tensor([]).to(x.device)
-        for i in range(steps):
-            env_loss = torch.cat(
-                        [env_loss,
-                         self.loss_fn(fin_irm_all_s[i], irm_target, irm_mask.bool()).unsqueeze(0)])
-        env_mean = env_loss.mean()
-        env_var = torch.var(env_loss * steps)
-        irm_loss = env_var + env_mean
+        long_MAE = self.loss_fn(imputation, target, mask)
+        long_short_MAE = self.loss_fn(gat_output, target, mask)
+        loss_mid_MAE = self.loss_fn(gru_output, target, mask)
 
-        if self.dloss == 'mmd':
-            # MMD Loss
-            mmds = torch.tensor([]).to(x.device)
-            for reco in finrecos:
-                # MMD for inv 
-                s_batch = reco.pop(0)
-                mmds = torch.cat([mmds, torch.clamp(mmd_loss(reco[0], reco[2]), min=0).unsqueeze(0)])
-                # mmds = torch.cat([mmds, torch.clamp(mmd_loss(reco[1], reco[3]), min=0).unsqueeze(0)])
-
-                recon_loss = mmds.mean()
-
-        elif self.dloss == 'cmd':
-            cmds = torch.tensor([]).to(x.device)
-            for reco in finrecos:
-                B = reco.pop(0)
-                inv_emb_tru = rearrange(reco[0], 'b t d -> (b t) d')
-                inv_emb_vir = rearrange(reco[1], 'b t d -> (b t) d')
-
-                og_nt = inv_emb_tru.size(0) // (B*s)
-                cr_nt = inv_emb_vir.size(0) // (B*s)
-
-                batches = torch.arange(0, B*s).to(device=x.device)
-                og_batch = torch.repeat_interleave(batches, repeats=(og_nt))
-                cr_batch = torch.repeat_interleave(batches, repeats=(cr_nt))
-
-                cmds = torch.cat([cmds, torch.clamp(cmd(inv_emb_tru, inv_emb_vir, \
-                                                        og_batch, cr_batch, n_moments=2).mean(), min=0).unsqueeze(0)])
-                # cmds = torch.cat([cmds, torch.clamp(cmd(reco[1].squeeze(0), reco[3].squeeze(0), \
-                #                                         og_batch, cr_batch).mean(), min=0).unsqueeze(0)])
-
-            recon_loss = cmds.mean()
-
-        main_loss = self.loss_fn(finpreds, target, eval_mask.bool()) 
-        loss = main_loss + self.y1 * recon_loss + self.y2 * irm_loss
+        loss = long_MAE + long_short_MAE + loss_mid_MAE
         
         self.manual_backward(loss)
 
         if self.gradient_clip_algorithm and self.gradient_clip_val:
-            self.clip_gradients(opt1, gradient_clip_val=self.gradient_clip_val, gradient_clip_algorithm=self.gradient_clip_algorithm)
+            self.clip_gradients(opt, gradient_clip_val=self.gradient_clip_val, gradient_clip_algorithm=self.gradient_clip_algorithm)
 
-        opt1.step()
+        opt.step()
 
         # Logging
         if self.scaled_target:
-            imputation = self._postprocess(finpreds, batch_preprocessing)
-        else:
-            imputation = finpreds
-
-        self.log('Main loss', 
-                 main_loss,                  
-                 on_step=False,
-                 on_epoch=True,
-                 logger=True,
-                 prog_bar=False)
-
-        self.log('Reconstruction error', 
-                 recon_loss,                  
-                 on_step=False,
-                 on_epoch=True,
-                 logger=True,
-                 prog_bar=False)
-    
-        self.log('IRM error', 
-                 irm_loss,                  
-                 on_step=False,
-                 on_epoch=True,
-                 logger=True,
-                 prog_bar=False)
+            imputation = self._postprocess(imputation, batch_preprocessing).squeeze(0)
 
         # Store every randomised graphs here
-        self.train_metrics.update(imputation.detach(), y, eval_mask)
+        self.train_metrics.update(imputation.detach(), y, mask)
         self.log_metrics(self.train_metrics, batch_size=batch.batch_size)
         self.log_loss('train', loss, batch_size=batch.batch_size)
 
@@ -648,64 +558,46 @@ class UnnamedKrigFillerV5(unKrigFillerV5):
     def validation_step(self, batch, batch_idx):
         # Unpack batch
         batch_data, batch_preprocessing = self._unpack_batch(batch)
-        batch_data["training"] = False
-        batch_data.pop("edge_index", None)
 
-        if self.known_set is None:
-            # Get observed entries (nonzero masks across time)
-            mask = batch_data["mask"]
-            mask = rearrange(mask, "b s n 1 -> (b s) n")
-            mask_sum = mask.sum(0)  # n
-            known_set = torch.where(mask_sum > 0)[0].detach().cpu().numpy().tolist()
-        else:
-            known_set = self.known_set
-
+        # Extract mask and target
         x = batch_data["x"]
-        mask = batch_data["mask"]
-        eval_mask = batch_data.pop("eval_mask")
+        mask = batch_data.pop('mask')
+        eval_mask = batch_data.pop('eval_mask', None)
+        _ = batch_data.pop("edge_index")
         y = batch_data.pop('y')
 
-        unknown_set = [i for i in range(mask.shape[2]) if i not in known_set]
-        
-        # if self.known_set is None:
-            # Get observed entries (nonzero masks across time)
-            # if self.inductive:
-                # mask = batch_data["mask"]
-                # mask = rearrange(mask, "b s n 1 -> (b s) n")
-                # mask_sum = mask.sum(0)  # n
-        full = known_set + unknown_set
-        # reverse = torch.empty_like(torch.tensor(known_set))
-        # reverse[known_set] = torch.arange(len(known_set))
+        adj = np.copy(self.adj)
 
-        batch_data["x"] = x[:, :, known_set, :]
-        batch_data["sub_entry_num"] = len(unknown_set)
-        batch_data["known_set"] = known_set
-        batch_data["masked_set"] = unknown_set
-        
-        mask = mask[:, :, full, :]
-        eval_mask = eval_mask[:, :, full, :]
-        batch_data["mask"] = mask
-        y = y[:, :, full, :]
+        adjs = [adj, adj.T]
+        predefined_A = self.norm_adj([adjs[0], adjs[1]])
+        predefined_A = (predefined_A[0].to(self.device) + predefined_A[1].to(self.device)) / 2
+        # pre_A = dense_to_sparse(adj)
+        # times = mask.shape[1]
+        # eval_mask = eval_mask[:, 1:]
+        # y = y[:, 1:]
+
+        time_step = np.random.randint(1, mask.shape[1]-1)
+        x = x[:, :time_step, :, :]  # b s n1 d, n1 = num of observed entries
+        eval_mask = eval_mask[:, time_step, :, :]  # b s n1 d
+        y = y[:, time_step, :, :]  # b s n1 d
 
         # Compute predictions and compute loss
-        imputation, _, _ = self.predict_batch(batch, preprocess=False, postprocess=False)
-        # reverse = reverse.to(imputation.device)
-        # imputation = imputation[:, :, reverse, :]
+        batch_data["x"] = x  # b s n2 d
+        batch_data["predefined_A"] = predefined_A  # b s n' 1
+        _, _, imputation, _ = self.predict_batch(batch, preprocess=False, postprocess=False)
+        # imputation = torch.stack(imputation, 1).to(x.device)
 
-        # trim to imputation horizon len
-        # imputation, mask, eval_mask, y = self.trim_seq(imputation, mask, eval_mask, y)
-        
         if self.scaled_target:
-            target = batch.transform['y'].transform(y)
+            target = batch.transform['y'].transform(y).squeeze(0)
         else:
             target = y
-            imputation = self._postprocess(imputation, batch_preprocessing)
+            imputation = self._postprocess(imputation, batch_preprocessing).squeeze(0)
 
-        val_loss = self.loss_fn(imputation, target, eval_mask)
+        val_loss = self.loss_fn(imputation, target, eval_mask.bool())
 
         # Logging
         if self.scaled_target:
-            imputation = self._postprocess(imputation, batch_preprocessing)
+            imputation = self._postprocess(imputation, batch_preprocessing).squeeze(0)
 
         self.val_metrics.update(imputation.detach(), y, eval_mask)
         self.log_metrics(self.val_metrics, batch_size=batch.batch_size)
@@ -719,49 +611,43 @@ class UnnamedKrigFillerV5(unKrigFillerV5):
     def test_step(self, batch, batch_idx):
         # Unpack batch
         batch_data, batch_preprocessing = self._unpack_batch(batch)
-        batch_data["training"] = False
-        batch_data.pop("edge_index", None)
-        
-
-        # if self.known_set is None:
-        #     # Get observed entries (nonzero masks across time)
-        #     if self.inductive:
-        mask = batch_data["mask"]
-        mask = rearrange(mask, "b s n 1 -> (b s) n")
-        # mask_sum = mask.sum(0)  # n
-        known_set = torch.tensor(self.known_set)
-        unknown_set = torch.tensor([i for i in range(mask.shape[-1]) if i not in known_set])
-        arrange = torch.cat((known_set, unknown_set))
-        reverse = torch.empty_like(arrange)
-        reverse[arrange] = torch.arange(len(arrange)).to(arrange.device)
-        arrange = arrange.detach().cpu().numpy().tolist()
-        known_set = known_set.detach().cpu().numpy().tolist()
-
-        if known_set == []:
-            return None
-
-        batch_data["sub_entry_num"] = len(unknown_set)
-        #     else:
-        #         known_set = list(range(batch_data['mask'].shape[2]))
-        # else:
-        #     known_set = self.known_set
-
-        batch_data["known_set"] = known_set
-        x = batch_data["x"]
-        batch_data["x"] = x[:, :, known_set, :]
-        batch_data["masked_set"] = unknown_set.detach().cpu().numpy().tolist()
-
-        mask = batch_data["mask"]
-        mask = mask[:, :, arrange, :]
-        batch_data["mask"] = mask
 
         # Extract mask and target
+        x = batch_data["x"]
+        mask = batch_data.pop('mask')
         eval_mask = batch_data.pop('eval_mask', None)
+        _ = batch_data.pop("edge_index")
         y = batch_data.pop('y')
 
-        # Compute outputs and rescale
-        imputation, _, _ = self.predict_batch(batch, preprocess=False, postprocess=True)
-        imputation = imputation[:, :, reverse, :]
+        adj = np.copy(self.adj)
+
+        adjs = [adj, adj.T]
+        predefined_A = self.norm_adj([adjs[0], adjs[1]])
+        predefined_A = (predefined_A[0].to(self.device) + predefined_A[1].to(self.device)) / 2
+
+        batch_data["predefined_A"] = predefined_A  # b s n' 1
+
+        # pre_A = dense_to_sparse(adj)
+        # times = mask.shape[1]
+        # eval_mask = eval_mask[:, 1:]
+        # y = y[:, 1:]
+
+        time_step = np.random.randint(1, mask.shape[1]-1)
+        x = x[:, :time_step, :, :]  # b s n1 d, n1 = num of observed entries
+        eval_mask = eval_mask[:, time_step, :, :]  # b s n1 d
+        y = y[:, time_step, :, :]  # b s n1 d
+
+        # imputation = []
+        # for time in range(1, times):
+            # Compute predictions and compute loss
+            # batch_data["x"] = x[:, :time, ]  # b s n2 d
+
+        batch_data["x"] = x  # b s n2 d
+        batch_data["predefined_A"] = predefined_A  # b s n' 1
+        _, _, imputation, _ = self.predict_batch(batch, preprocess=False, postprocess=True)
+        # imputation.append(output)
+        # imputation = torch.stack(imputation, 1).to(x.device)
+
         test_loss = self.loss_fn(imputation, y, eval_mask)
 
         # Logging

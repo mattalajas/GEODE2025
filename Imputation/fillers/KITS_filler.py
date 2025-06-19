@@ -106,12 +106,13 @@ class Filler(pl.LightningModule):
         keys = set()
         # iterate over outputs for each batch
         for res in outputs:
-            for k, v in res.items():
-                if k in keys:
-                    processed_res[k].append(v)
-                else:
-                    processed_res[k] = [v]
-                keys.add(k)
+            if res:
+                for k, v in res.items():
+                    if k in keys:
+                        processed_res[k].append(v)
+                    else:
+                        processed_res[k] = [v]
+                    keys.add(k)
         # concatenate results
         for k, v in processed_res.items():
             processed_res[k] = torch.cat(v, 0)
@@ -124,6 +125,15 @@ class Filler(pl.LightningModule):
         # Extract mask and target
         eval_mask = batch_data.pop('eval_mask', None)
         y = batch_data.pop('y')
+
+        mask = batch_data["mask"]
+        mask = rearrange(mask, "b s n 1 -> (b s) n")
+        mask_sum = mask.sum(0)  # n
+        known_set = torch.where(mask_sum > 0)[0]
+        known_set = known_set.detach().cpu().numpy().tolist()
+
+        if known_set == []:
+            return None
 
         # Compute outputs and rescale
         imputation = self.predict_batch(batch, preprocess=False, postprocess=True)
@@ -675,6 +685,15 @@ class GCNCycVirtualFiller(Filler):
         # Unpack batch
         batch_data, batch_preprocessing = self._unpack_batch(batch)
         batch_data["training"] = False
+
+        mask = batch_data["mask"]
+        mask = rearrange(mask, "b s n 1 -> (b s) n")
+        mask_sum = mask.sum(0)  # n
+        known_set = torch.where(mask_sum > 0)[0]
+        known_set = known_set.detach().cpu().numpy().tolist()
+
+        if known_set == []:
+            return None
 
         # Extract mask and target
         eval_mask = batch_data.pop('eval_mask', None)
