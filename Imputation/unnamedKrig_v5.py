@@ -99,25 +99,6 @@ class UnnamedKrigModelV5(BaseModel):
         self.layernorm2 = LayerNorm(hidden_size)
         self.layernorm3 = LayerNorm(hidden_size)
 
-        # self.gcn1 = GCN(in_channels=hidden_size,
-        #                 hidden_channels=hidden_size,
-        #                 num_layers=psd_layers, 
-        #                 out_channels=hidden_size,
-        #                 dropout=dropout,
-        #                 norm=None,
-        #                 add_self_loops=None,
-        #                 act=activation)
-        
-        # self.gcn2 = GCN(in_channels=hidden_size,
-        #                 hidden_channels=hidden_size,
-        #                 num_layers=gcn_layers, 
-        #                 out_channels=hidden_size,
-        #                 dropout=dropout,
-        #                 norm=norm,
-        #                 # norm=None,
-        #                 # add_self_loops=None,
-        #                 act=activation)
-
         self.gcn1 = DiffConv(in_channels=hidden_size,
                             out_channels=hidden_size,
                             k=psd_layers,
@@ -253,7 +234,7 @@ class UnnamedKrigModelV5(BaseModel):
             xh_var = torch.cat([output_vars, sub_entry], dim=2)
         else:
             xh_inv = output_invars
-            # xh_var = output_vars
+            xh_var = output_vars
 
         # ========================================
         # Curriculum based pseudo-labelling
@@ -307,12 +288,6 @@ class UnnamedKrigModelV5(BaseModel):
 
             alt_adj = adj.clone()
 
-            # Remove the edges connecting to each unseen
-            # rows_t = torch.tensor(grouped[kh], dtype=torch.long, device=device)
-            # cols_t = torch.tensor(grouped[kh], dtype=torch.long, device=device)
-            # rows, cols = torch.meshgrid(rows_t, cols_t, indexing='ij')
-            # alt_adj[rows, cols] = 0
-
             if kh < self.k:
                 rep_adj = alt_adj[:, rep_indices]
                 rep_adj = rep_adj[rep_indices, :]
@@ -362,24 +337,23 @@ class UnnamedKrigModelV5(BaseModel):
         # ========================================
         # Append the most similar embedding
         # ========================================
-        if seened_set != []:
-            inv_sim = self.get_sim(xh_inv_2, seened_set, grouped)
-            var_sim = self.get_sim(xh_var_2, seened_set, grouped)
-        else:
-            inv_sim = self.get_sim(xh_inv_2, known_set, grouped)
-            var_sim = self.get_sim(xh_var_2, known_set, grouped)
+        # if seened_set != []:
+        #     inv_sim = self.get_sim(xh_inv_2, seened_set, grouped)
+        #     var_sim = self.get_sim(xh_var_2, seened_set, grouped)
+        # else:
+        #     inv_sim = self.get_sim(xh_inv_2, known_set, grouped)
+        #     var_sim = self.get_sim(xh_var_2, known_set, grouped)
 
-        # xh_inv_3 = xh_inv_2
-        # xh_var_3 = xh_var_2
+        xh_inv_3 = xh_inv_2
+        xh_var_3 = xh_var_2
 
-        xh_inv_3 = torch.cat([xh_inv_2, inv_sim], dim=-1)
-        # xh_var_3 = xh_var_2
-        xh_var_3 = torch.cat([xh_var_2, var_sim], dim=-1)
+        # xh_inv_3 = torch.cat([xh_inv_2, inv_sim], dim=-1)
+        # xh_var_3 = torch.cat([xh_var_2, var_sim], dim=-1)
         
-        xh_inv_3 = self.squeeze1(xh_inv_3)
-        xh_inv_3 = self.layernorm2(xh_inv_3)
-        xh_var_3 = self.squeeze1(xh_var_3)
-        xh_var_3 = self.layernorm2(xh_var_3)
+        # xh_inv_3 = self.squeeze1(xh_inv_3)
+        # xh_inv_3 = self.layernorm2(xh_inv_3)
+        # xh_var_3 = self.squeeze1(xh_var_3)
+        # xh_var_3 = self.layernorm2(xh_var_3)
 
         # xh_inv_3 = self.layernorm2(xh_inv_2 + inv_sim)
         # xh_var_3 = self.layernorm2(xh_var_2 + var_sim)
@@ -450,7 +424,7 @@ class UnnamedKrigModelV5(BaseModel):
                 finrecos.append([s_batch, emb_com_inv, emb_tru_inv])
 
         # ========================================
-        # IRM model
+        # Disentanglement module
         # ========================================
         # Predict the real nodes by propagating back using both variant and invariant features
         # Get IRM loss
@@ -491,7 +465,7 @@ class UnnamedKrigModelV5(BaseModel):
 
         # if invs:
         cos_sim[:, idx, idx] = 0
-        cos_sim[:, :len(knownset), :len(knownset)] = 0
+        # cos_sim[:, :len(knownset), :len(knownset)] = 0
         # cos_sim[:, len(knownset):, len(knownset):] = 0
 
         for k in range(1, self.k+1):

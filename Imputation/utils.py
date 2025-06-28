@@ -1,4 +1,5 @@
 import copy
+import math
 
 import networkx as nx
 import numpy as np
@@ -7,35 +8,7 @@ import scipy
 import torch
 from einops import rearrange
 from torch_scatter import scatter
-
-"""
-Tree Mover's Distance solver
-"""
-# Author: Ching-Yao Chuang <cychuang@mit.edu>
-# License: MIT License
-def get_neighbors(g):
-    '''
-    get neighbor indexes for each node
-
-    Parameters
-    ----------
-    g : input torch_geometric graph
-
-
-    Returns
-    ----------
-    adj: a dictionary that store the neighbor indexes
-
-    '''
-    adj = {}
-    for i in range(len(g.edge_index[0])):
-        node1 = g.edge_index[0][i].item()
-        node2 = g.edge_index[1][i].item()
-        if node1 in adj.keys():
-            adj[node1].append(node2)
-        else:
-            adj[node1] = [node2]
-    return adj
+from tsl.metrics import numpy as numpy_metrics
 
 def kernel(X, mul_fac=2.0, n_ker=3, eps=1e-8):
     L2_distances = torch.cdist(X, X) ** 2
@@ -276,3 +249,116 @@ def month_splitter(val_len: int = None, gran = 'month', test_times: Sequence = (
     return MonthYearSplitter(test_times=test_times,
                              gran=gran,
                              val_len=val_len)
+
+def test_wise_eval(y_hat, y_true, mask, known_nodes, adj, mode, num_groups=4, alpha = 0.20):
+    numpy_graph = nx.from_numpy_array(adj)
+    k_nodes = np.array(known_nodes)
+    u_nodes = np.array([i for i in range(adj.shape[0]) if i not in known_nodes])
+    m_adj = (adj > 0).astype(float)
+    group_size = u_nodes.shape[0] // num_groups
+
+    # LPS
+    n = adj.shape[-1]
+
+    A_hat = m_adj
+    idx = np.arange(n)
+    A_hat[idx, idx] = 1
+    D = np.diag(np.sum(A_hat, axis=1))
+
+    D_inv_sqrt = np.linalg.inv(np.sqrt(D))
+    A_norm = D_inv_sqrt @ A_hat @ D_inv_sqrt
+    I = np.eye(n)
+
+    P = np.linalg.inv((I - (1-alpha)*A_norm))
+    T = np.zeros((n, n))
+    T[k_nodes, k_nodes] = 1
+    ones = np.ones((n,))
+
+    LPS = P @ T @ ones
+
+    sorted_lps = sorted(u_nodes, key=lambda i: LPS[i])
+    lps_gr = [sorted_lps[i*group_size : (i+1)*group_size] for i in range(num_groups)]
+    remainder = len(sorted_lps) % num_groups
+    if remainder:
+        lps_gr[-1].extend(sorted_lps[-remainder:])
+
+    # CC
+    closeness = nx.closeness_centrality(numpy_graph)
+
+    sorted_cls = sorted(u_nodes, key=lambda i: closeness[i])
+    # sorted_cls = [x for x, _ in sorted_cls]
+    cls_gr = [sorted_cls[i*group_size : (i+1)*group_size] for i in range(num_groups)]
+    remainder = len(sorted_cls) % num_groups
+    if remainder:
+        cls_gr[-1].extend(sorted_cls[-remainder:])
+
+    # ND
+    degrees = dict(nx.degree(numpy_graph))
+
+    sorted_nd = sorted(u_nodes, key=lambda i: degrees[i])
+    # sorted_nd = [x for x, _ in sorted_nd]
+    nd_gr = [sorted_nd[i*group_size : (i+1)*group_size] for i in range(num_groups)]
+    remainder = len(sorted_nd) % num_groups
+    if remainder:
+        nd_gr[-1].extend(sorted_nd[-remainder:])
+
+    # KHR
+    khr_grouped = closest_distances_unweighted(numpy_graph, u_nodes, k_nodes)
+    khr_gr = [[] for _ in range(num_groups)]
+
+    for key, pos in khr_grouped.items():
+        value = pos-1
+        if value < num_groups:
+            khr_gr[value].append(key)
+        else:
+            khr_gr[num_groups-1].append(key)
+
+    # Evaluate
+    group_dict = {'LPS': lps_gr,
+                'CC': cls_gr,
+                'ND': nd_gr,
+                'KHR': khr_gr}
+    res = {f'{mode}_mae': numpy_metrics.mae(y_hat, y_true, mask),
+               f'{mode}_mre': numpy_metrics.mre(y_hat, y_true, mask),
+               f'{mode}_rmse': numpy_metrics.rmse(y_hat, y_true, mask)}
+
+    for key, groups in group_dict.items():
+        results = {'mae':[], 'mre':[], 'rmse':[]}
+        for group in groups:
+            node_mask = np.zeros_like(mask, dtype=bool)
+            node_mask[:, :, group] = True
+            masked_adj = mask * node_mask
+
+            # nonzero_mask = masked_adj != 0  # shape: D x T x N
+            # active_n = np.any(nonzero_mask, axis=(0, 1, 3))  # shape: N
+            # nonzero_n_indices = np.where(active_n)[0]
+            # print(nonzero_n_indices)
+
+            results['mae'].append(numpy_metrics.mae(y_hat, y_true, masked_adj))
+            results['mre'].append(numpy_metrics.mre(y_hat, y_true, masked_adj))
+            results['rmse'].append(numpy_metrics.rmse(y_hat, y_true, masked_adj))
+
+        for metric, val in results.items():
+            wdp_num = 0
+            wsd_num = 0
+            ntotal = u_nodes.shape[0]
+
+            for ind, a1 in enumerate(val):
+                if math.isnan(a1) or a1 == 0:
+                    a1 = 0
+
+                n1 = len(groups[ind])
+                wdp_num += (n1 * np.abs(a1 - res[f'{mode}_{metric}']))
+                wsd_num += (n1 * (a1 - res[f'{mode}_{metric}'])**2)
+
+            wdp = wdp_num / ntotal
+            wsd = np.sqrt(wsd_num / ntotal)
+            wcv = wsd/res[f'{mode}_{metric}']
+
+            res[f'max_{metric}_{key}_{mode}'] = max(val)
+            res[f'min_{metric}_{key}_{mode}'] = min(val)
+            res[f'wdp_{metric}_{key}_{mode}'] = wdp
+            res[f'wsd_{metric}_{key}_{mode}'] = wsd
+            res[f'wcv_{metric}_{key}_{mode}'] = wcv
+    
+    return res    

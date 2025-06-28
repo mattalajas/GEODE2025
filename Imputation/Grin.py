@@ -1,5 +1,6 @@
 import argparse
 import torch
+import math
 from omegaconf import DictConfig
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
@@ -10,7 +11,7 @@ import numpy as np
 from tsl import logger
 from tsl.data import ImputationDataset, SpatioTemporalDataModule
 from tsl.data.preprocessing import StandardScaler
-from tsl.datasets import AirQuality, MetrLA, PeMS07, PvUS, LargeST, ElectricityBenchmark, PeMS04, Elergone
+from tsl.datasets import AirQuality, MetrLA, PeMS07, PvUS, LargeST, ElectricityBenchmark, PeMS04, Elergone, PemsBay
 from tsl.datasets.prototypes import casting
 from tsl.engines import Imputer
 from tsl.experiment import Experiment
@@ -28,6 +29,7 @@ from baselines.IGNNK import IGNNK
 from baselines.DIDA import DGNN
 from baselines.CauSTG import CauSTG
 from baselines.IGNNK import IGNNK
+from baselines.LSJSTN import LSJSTN
 from fillers.KITS_filler import GCNCycVirtualFiller
 from fillers.unnamed_filler import UnnamedKrigFiller
 from fillers.unnamed_filler_v2 import UnnamedKrigFillerV2
@@ -36,14 +38,15 @@ from fillers.unnamed_filler_v5 import UnnamedKrigFillerV5
 from fillers.DIDA_filler import DidaFiller
 from fillers.CauSTG_filler import CauSTGFiller
 from fillers.IGNNK_filler import IGNNKFiller
+from fillers.LSJSTN_filler import LSJSTNFiller
 from unnamedKrig import UnnamedKrigModel
 from unnamedKrig_v2 import UnnamedKrigModelV2
 from unnamedKrig_v3 import UnnamedKrigModelV3
 from unnamedKrig_v4 import UnnamedKrigModelV4
 from unnamedKrig_v5 import UnnamedKrigModelV5
-from utils import month_splitter
+from utils import month_splitter, test_wise_eval
 
-MODELS = ['kits', 'unkrig', 'kcn', 'unkrigv2', 'unkrigv3', 'unkrigv4', 'unkrigv5', 'ignnk', 'caustg', 'dida']
+MODELS = ['kits', 'unkrig', 'kcn', 'unkrigv2', 'unkrigv3', 'unkrigv4', 'unkrigv5', 'ignnk', 'lsjstn', 'caustg', 'dida']
 
 def get_model_class(model_str):
     if model_str == 'rnni':
@@ -74,6 +77,8 @@ def get_model_class(model_str):
         model = DGNN
     elif model_str == 'caustg':
         model = CauSTG
+    elif model_str == 'lsjstn':
+        model = LSJSTN
     else:
         raise NotImplementedError(f'Model "{model_str}" not available.')
     return model
@@ -85,11 +90,25 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-0
     if dataset_name == 'air':
         return AirQualityKrig(impute_nans=True, small=True, masked_sensors=masked_s, p=p_noise), masked_s
     if dataset_name == 'air_smaller':
-        return AirQualitySmaller('../../AirData/AQI/Stations', impute_nans=True, masked_sensors=masked_s), masked_s
+        return AirQualitySmaller('data', impute_nans=True, masked_sensors=masked_s), masked_s
     if dataset_name == 'air_auckland' or dataset_name == 'air_invercargill1' or dataset_name == 'air_invercargill2':
-        return AirQualityAuckland('../../AirData/Niwa', t_range=t_range, masked_sensors=masked_s, 
+        air_data = AirQualityAuckland('data', t_range=t_range, masked_sensors=masked_s, 
                                   agg_func=agg_func, test_months=test_month,
-                                  location=location, p=p_noise), masked_s
+                                  location=location, p=p_noise)
+        
+        return add_missing_sensors(air_data,
+                            p_fault=p_fault,
+                            p_noise=p_noise,
+                            min_seq=12,
+                            max_seq=12 * 4, 
+                            masked_sensors=masked_s,
+                            connect=connectivity,
+                            mode=mode,
+                            spatial_shift=spatial_shift,
+                            order=order,
+                            node_features=node_features)
+        
+
     if dataset_name.endswith('_point'):
         p_fault, p_noise = 0., 0.25
         dataset_name = dataset_name[:-6]
@@ -137,6 +156,23 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-0
                                   node_features=node_features)
     if dataset_name == 'pem07':
         pems = PeMS07()
+
+        masks = np.ones((pems.target.shape[0], pems.target.shape[1], 1))
+        pems.set_mask(masks)
+        
+        return add_missing_sensors(pems,
+                                  p_fault=p_fault,
+                                  p_noise=p_noise,
+                                  min_seq=12,
+                                  max_seq=12 * 4,
+                                  masked_sensors=masked_s,
+                                  connect=connectivity,
+                                  mode=mode,
+                                  spatial_shift=spatial_shift,
+                                  order=order,
+                                  node_features=node_features)
+    if dataset_name == 'pemsbay':
+        pems = PemsBay()
 
         masks = np.ones((pems.target.shape[0], pems.target.shape[1], 1))
         pems.set_mask(masks)
@@ -258,6 +294,7 @@ def run_imputation(cfg: DictConfig):
     # data module                          #
     ########################################
     torch.set_float32_matmul_precision('high')
+    assert cfg.eval_setting in ['train_wise', 'test_wise']
 
     dataset, masked_sensors = get_dataset(cfg.dataset.name,
                             p_fault=cfg.dataset.get('p_fault'),
@@ -351,6 +388,8 @@ def run_imputation(cfg: DictConfig):
                             num_nodes=adj.shape[0], args=cfg.model.hparams)
     elif cfg.model.name == 'caustg':
         model_kwargs = dict(in_dim=dm.n_channels, out_dim=cfg.window, args=cfg.model.hparams)
+    elif cfg.model.name == 'lsjstn':
+        model_kwargs = dict(in_dim=dm.n_channels)
     elif cfg.model.name == 'kcn':
         pass
     else:
@@ -367,7 +406,7 @@ def run_imputation(cfg: DictConfig):
         loss_fn = [torch_metrics.MaskedMAE(), torch_metrics.MaskedMSE()]
     elif cfg.model.name == 'ignnk':
         loss_fn = torch_metrics.MaskedMSE()
-    elif cfg.model.name in ['kits', 'unkrigv5']:
+    elif cfg.model.name in ['kits', 'unkrigv5', 'lsjstn', 'dida', 'caustg']:
         loss_fn = torch_metrics.MaskedMAE()
     else:
         raise f'{cfg.model.name} not implemented'
@@ -534,6 +573,23 @@ def run_imputation(cfg: DictConfig):
                             known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
                             adj=adj,
                             n_o_n_m=cfg.model.n_o_n_m)
+    elif cfg.model.name == "lsjstn":
+        imputer = LSJSTNFiller(model_class=model_cls,
+                            model_kwargs=model_kwargs,
+                            optim_class=getattr(torch.optim, cfg.optimizer.name),
+                            optim_kwargs=dict(cfg.optimizer.hparams),
+                            loss_fn=loss_fn,
+                            scaled_target=cfg.scale_target,
+                            whiten_prob=cfg.whiten_prob,
+                            pred_loss_weight=cfg.prediction_loss_weight,
+                            warm_up=cfg.warm_up_steps,
+                            metrics=log_metrics,
+                            scheduler_class=scheduler_class,
+                            scheduler_kwargs=scheduler_kwargs,
+                            gradient_clip_val=cfg.grad_clip_val,
+                            gradient_clip_algorithm=cfg.grad_clip_alg,
+                            known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
+                            adj=adj)
     else:
         imputer = Imputer(model_class=model_cls,
                         model_kwargs=model_kwargs,
@@ -618,32 +674,47 @@ def run_imputation(cfg: DictConfig):
     output = torch_to_numpy(output)
     y_hat, y_true, mask = (output['y_hat'], output['y'],
                            output.get('eval_mask', None))
-    res = dict(test_mae=numpy_metrics.mae(y_hat, y_true, mask),
-               test_mre=numpy_metrics.mre(y_hat, y_true, mask),
-               test_mape=numpy_metrics.mape(y_hat, y_true, mask),
-               test_mse=numpy_metrics.mse(y_hat, y_true, mask),
-               test_rmse=numpy_metrics.rmse(y_hat, y_true, mask))
+    
+    if cfg.eval_setting == 'train_wise':
+        res = dict(test_mae=numpy_metrics.mae(y_hat, y_true, mask),
+                test_mre=numpy_metrics.mre(y_hat, y_true, mask),
+                test_mape=numpy_metrics.mape(y_hat, y_true, mask),
+                test_mse=numpy_metrics.mse(y_hat, y_true, mask),
+                test_rmse=numpy_metrics.rmse(y_hat, y_true, mask))
+    elif cfg.eval_setting == 'test_wise':
+        res = test_wise_eval(y_hat, y_true, mask, 
+                             known_nodes=[i for i in range(adj.shape[0]) if i not in masked_sensors],
+                             adj=adj,
+                             mode='test')
 
     output = trainer.predict(imputer, dataloaders=dm.val_dataloader())
     output = imputer.collate_prediction_outputs(output)
     output = torch_to_numpy(output)
     y_hat, y_true, mask = (output['y_hat'], output['y'],
                            output.get('eval_mask', None))
-    res.update(
-        dict(val_mae=numpy_metrics.mae(y_hat, y_true, mask),
-             val_mre=numpy_metrics.mre(y_hat, y_true, mask),
-             val_mape=numpy_metrics.mape(y_hat, y_true, mask),
-             val_mse=numpy_metrics.mse(y_hat, y_true, mask),
-             val_rmse=numpy_metrics.rmse(y_hat, y_true, mask)))
+    
+    if cfg.eval_setting == 'train_wise':
+        res.update(
+            dict(val_mae=numpy_metrics.mae(y_hat, y_true, mask),
+                val_mre=numpy_metrics.mre(y_hat, y_true, mask),
+                val_mape=numpy_metrics.mape(y_hat, y_true, mask),
+                val_mse=numpy_metrics.mse(y_hat, y_true, mask),
+                val_rmse=numpy_metrics.rmse(y_hat, y_true, mask)))
+    elif cfg.eval_setting == 'test_wise':
+        res.update(test_wise_eval(y_hat, y_true, mask, 
+                    known_nodes=[i for i in range(adj.shape[0]) if i not in masked_sensors],
+                    adj=adj, mode='val'))
+    
     res.update(
         dict(model=cfg.model.name,
              db=cfg.dataset.name,
              seed=cfg.seed,
-             mode=cfg.dataset.mode)
+             mode=cfg.dataset.mode,
+             spatial=cfg.dataset.spatial_shift,
+             eval_setting=cfg.eval_setting)
     )
 
     return res
-
 
 if __name__ == '__main__':
     # with torch.autograd.set_detect_anomaly(True):

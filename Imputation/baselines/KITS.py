@@ -8,6 +8,7 @@ from einops import rearrange
 from torch import nn
 
 from tsl.nn.models.base_model import BaseModel
+from tsl.nn.layers.graph_convs import DiffConv
 
 EPSILON = 1e-8
 

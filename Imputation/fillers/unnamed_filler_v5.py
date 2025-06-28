@@ -36,7 +36,8 @@ class unKrigFillerV5(pl.LightningModule):
                  whiten_prob=0.05,
                  metrics=None,
                  scheduler_class=None,
-                 scheduler_kwargs=None):
+                 scheduler_kwargs=None,
+                 known_set=None):
         """
         PL module to implement hole fillers.
 
@@ -59,6 +60,7 @@ class unKrigFillerV5(pl.LightningModule):
         self.optim_kwargs = optim_kwargs
         self.scheduler_class = scheduler_class
         self.automatic_optimization = False
+        self.known_set = known_set
 
         if scheduler_kwargs is None:
             self.scheduler_kwargs = dict()
@@ -135,10 +137,9 @@ class unKrigFillerV5(pl.LightningModule):
             # Get observed entries (nonzero masks across time)
         # if self.inductive:
         emask = batch_data["eval_mask"]
-        emask = rearrange(emask, "b s n 1 -> (b s) n")
-        mask_sum = emask.sum(0)  # n
-        known_set = torch.where(mask_sum == 0)[0]
-        unknown_set = torch.where(mask_sum > 0)[0]
+        # mask_sum = emask.sum(0)  # n
+        known_set = torch.tensor(self.known_set).to(dtype=int)
+        unknown_set = torch.tensor([i for i in range(emask.shape[2]) if i not in known_set]).to(dtype=int)
         arrange = torch.cat((known_set, unknown_set))
         reverse = torch.empty_like(arrange)
         reverse[arrange] = torch.arange(len(arrange)).to(arrange.device)
@@ -286,11 +287,10 @@ class unKrigFillerV5(pl.LightningModule):
             batch = move_data_to_device(batch, self.device)
             batch_data, batch_preprocessing = self._unpack_batch(batch)
 
-            eval_mask = batch_data.pop('eval_mask', None)
-            emask = rearrange(eval_mask, "b s n 1 -> (b s) n")
-            mask_sum = emask.sum(0)  # n
-            known_set = torch.where(mask_sum == 0)[0]
-            unknown_set = torch.where(mask_sum > 0)[0]
+            emask = batch_data["eval_mask"]
+            # mask_sum = emask.sum(0)  # n
+            known_set = torch.tensor(self.known_set).to(dtype=int)
+            unknown_set = torch.tensor([i for i in range(emask.shape[2]) if i not in known_set]).to(dtype=int)
             arrange = torch.cat((known_set, unknown_set))
             reverse = torch.empty_like(arrange)
             reverse[arrange] = torch.arange(len(arrange)).to(arrange.device)
@@ -388,7 +388,8 @@ class UnnamedKrigFillerV5(unKrigFillerV5):
                                                   whiten_prob=whiten_prob,
                                                   metrics=metrics,
                                                   scheduler_class=scheduler_class,
-                                                  scheduler_kwargs=scheduler_kwargs)
+                                                  scheduler_kwargs=scheduler_kwargs,
+                                                  known_set=known_set)
         
         self.tradeoff = pred_loss_weight
         self.trimming = (warm_up, warm_up)
@@ -727,10 +728,9 @@ class UnnamedKrigFillerV5(unKrigFillerV5):
         #     # Get observed entries (nonzero masks across time)
         #     if self.inductive:
         mask = batch_data["mask"]
-        mask = rearrange(mask, "b s n 1 -> (b s) n")
         # mask_sum = mask.sum(0)  # n
-        known_set = torch.tensor(self.known_set)
-        unknown_set = torch.tensor([i for i in range(mask.shape[-1]) if i not in known_set])
+        known_set = torch.tensor(self.known_set).to(dtype=int)
+        unknown_set = torch.tensor([i for i in range(mask.shape[2]) if i not in known_set]).to(dtype=int)
         arrange = torch.cat((known_set, unknown_set))
         reverse = torch.empty_like(arrange)
         reverse[arrange] = torch.arange(len(arrange)).to(arrange.device)

@@ -34,7 +34,7 @@ class UnnamedKrigModelV3(BaseModel):
                  gcn_layers,
                  psd_layers,
                  norm='LayerNorm',
-                 activation='tanh',
+                 activation='relu',
                  dropout=0,
                  intervention_steps=2,
                  horizon=24,
@@ -469,7 +469,7 @@ class UnnamedKrigModelV3(BaseModel):
             # emb_com_inv = sml_inv[:, :, grouped[i]]
             # emb_com_var = sml_var[:, :, grouped[i]]
 
-            emb_com_inv = vir_inv[:, :, prev_group]
+            emb_com_inv = vir_inv[:, :, grouped[0]]
             # emb_com_var = vir_inv[:, :, prev_group]
 
             emb_tru_inv = vir_inv[:, :, grouped[i]]

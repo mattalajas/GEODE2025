@@ -41,6 +41,7 @@ prediction_loss_weight: 1
 impute_only_missing: False
 warm_up_steps: 0
 device: [0]
+eval_setting: 'train_wise'
 
 detrend: False
 scale: True

@@ -31,8 +31,8 @@ stride: 1
 
 #### Training params ##########################################################
 epochs: 100
-patience: 100
-batch_size: 64
+patience: 50
+batch_size: 16
 grad_clip_val: 1
 grad_clip_alg: 'norm'
 scale_target: True
@@ -41,11 +41,11 @@ prediction_loss_weight: 1
 impute_only_missing: False
 warm_up_steps: 0
 device: [0]
+eval_setting: 'train_wise'
 
 detrend: False
 scale: True
 scaling_axis: 'global'  # ['channels', 'global']
-
 
 optimizer:
   name: Adam

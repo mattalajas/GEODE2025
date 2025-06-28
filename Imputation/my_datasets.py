@@ -77,7 +77,7 @@ def shift_mask(shape, feature, order, adj):
     mask = np.zeros(shape).astype(bool)
     G = nx.from_numpy_array(adj)
 
-    parts = math.ceil(adj.shape[0] / 3)
+    parts = math.ceil(adj.shape[0] / 4)
 
     if feature == 'c_centrality':
         # Compute closeness centrality
@@ -85,6 +85,18 @@ def shift_mask(shape, feature, order, adj):
 
         # Sort nodes by closeness centrality in descending order
         sorted_nodes = sorted(closeness.items(), key=lambda x: x[1])
+        ord_nodes = [x for x, _ in sorted_nodes]
+
+        f_nodes = ord_nodes[parts*order:parts*(order+1)]
+        f_nodes_mask = np.zeros(shape).astype(bool)
+        f_nodes_mask[:, f_nodes] = True
+        mask |= f_nodes_mask
+        
+    elif feature == 'degree':
+        degree = dict(nx.degree(G))
+
+        # Sort nodes by node degree in descending order
+        sorted_nodes = sorted(degree.items(), key=lambda x: x[1])
         ord_nodes = [x for x, _ in sorted_nodes]
 
         f_nodes = ord_nodes[parts*order:parts*(order+1)]

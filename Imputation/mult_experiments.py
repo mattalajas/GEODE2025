@@ -13,7 +13,15 @@ if __name__ == '__main__':
     logger.info(res)
 
     mode = res.pop('mode')
-    csv_path = f"/data/mala711/Thesis/GNNthesis/res/{res['model']}-{mode}.csv"
+    shift = res.pop('spatial')
+    eval_setting = res.pop('eval_setting')
+    if shift:
+        csv_path = f"/data/mala711/Thesis/GNNthesis/res/{res['model']}-{mode}-spatial.csv"
+    else:
+        if eval_setting == 'train_wise':
+            csv_path = f"/data/mala711/Thesis/GNNthesis/res/{res['model']}-{mode}.csv"
+        else:
+            csv_path = f"/data/mala711/Thesis/GNNthesis/res/{res['model']}-{mode}-testwise.csv"
     file_exists = os.path.exists(csv_path)
 
     with open(csv_path, mode="a", newline="") as f:
