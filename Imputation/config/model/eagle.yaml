@@ -1,0 +1,17 @@
+name: 'eagle'
+hparams:
+  n_layers: 2
+  n_factors: 8
+  delta_d: 20
+  maxiter: 4
+  use_RTE: 1
+  agg_param: 0.15
+  dropout: 0.2
+  d_for_cvae: 8
+  interv_size_ratio: 0.1
+  gen_ratio: 0.1
+regs:
+  int_times: 5
+  y1: 2
+  y2: 0.01
+  nbsz: 25

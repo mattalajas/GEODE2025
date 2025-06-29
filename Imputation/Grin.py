@@ -31,6 +31,9 @@ from baselines.CauSTG import CauSTG
 from baselines.IGNNK import IGNNK
 from baselines.LSJSTN import LSJSTN
 from baselines.EAGLE import EAGLE
+from baselines.DYSAT import DySAT
+from baselines.EVOLVEGCN import EvolveGCNModel
+from baselines.DCRNN import DCRNNModel
 from fillers.KITS_filler import GCNCycVirtualFiller
 from fillers.unnamed_filler import UnnamedKrigFiller
 from fillers.unnamed_filler_v2 import UnnamedKrigFillerV2
@@ -41,6 +44,8 @@ from fillers.CauSTG_filler import CauSTGFiller
 from fillers.IGNNK_filler import IGNNKFiller
 from fillers.LSJSTN_filler import LSJSTNFiller
 from fillers.EAGLE_filler import EAGLEfiller
+from fillers.DYSAT_filler import DYSATFiller
+from fillers.Standard_filler import StandardFiller
 from unnamedKrig import UnnamedKrigModel
 from unnamedKrig_v2 import UnnamedKrigModelV2
 from unnamedKrig_v3 import UnnamedKrigModelV3
@@ -48,7 +53,8 @@ from unnamedKrig_v4 import UnnamedKrigModelV4
 from unnamedKrig_v5 import UnnamedKrigModelV5
 from utils import month_splitter, test_wise_eval
 
-MODELS = ['kits', 'unkrig', 'unkrigv2', 'unkrigv3', 'unkrigv4', 'unkrigv5', 'ignnk', 'lsjstn', 'caustg', 'eagle', 'dida']
+MODELS = ['kits', 'unkrig', 'unkrigv2', 'unkrigv3', 'unkrigv4', 'unkrigv5', 'ignnk', 
+          'lsjstn', 'caustg', 'eagle', 'dida', 'dysat', 'evolvegcn', 'dcrnn']
 
 def get_model_class(model_str):
     if model_str == 'rnni':
@@ -83,6 +89,12 @@ def get_model_class(model_str):
         model = LSJSTN
     elif model_str == 'eagle':
         model = EAGLE
+    elif model_str == 'dysat':
+        model = DySAT
+    elif model_str == 'evolvegcn':
+        model = EvolveGCNModel
+    elif model_str == 'dcrnn':
+        model = DCRNNModel
     else:
         raise NotImplementedError(f'Model "{model_str}" not available.')
     return model
@@ -394,9 +406,15 @@ def run_imputation(cfg: DictConfig):
         model_kwargs = dict(in_dim=dm.n_channels, out_dim=cfg.window, args=cfg.model.hparams)
     elif cfg.model.name == 'lsjstn':
         model_kwargs = dict(in_dim=dm.n_channels)
+    elif cfg.model.name == 'dysat':
+        model_kwargs = dict(num_features=dm.n_channels, time_length=cfg.window)
     elif cfg.model.name == 'eagle':
         model_kwargs = dict(nfeat=dm.n_channels, output_size=dm.n_channels, 
                             num_nodes=adj.shape[0], args=cfg.model.hparams)
+    elif cfg.model.name == "dcrnn" or cfg.model.name == "evolvegcn":
+        model_kwargs = dict(input_size=torch_dataset.n_channels,
+                            output_size=dm.n_channels,
+                            horizon=cfg.window)
     else:
         model_kwargs = dict(n_nodes=torch_dataset.n_nodes,
                             input_size=torch_dataset.n_channels)
@@ -409,7 +427,9 @@ def run_imputation(cfg: DictConfig):
         loss_fn = [torch_metrics.MaskedMAE(), torch_metrics.MaskedMSE()]
     elif cfg.model.name == 'ignnk':
         loss_fn = torch_metrics.MaskedMSE()
-    elif cfg.model.name in ['kits', 'unkrigv5', 'lsjstn', 'dida', 'caustg', 'eagle']:
+    elif cfg.model.name in ['kits', 'unkrigv5', 'lsjstn', 'dida', 
+                            'caustg', 'eagle', 'dysat', 'evolvegcn',
+                            'dcrnn']:
         loss_fn = torch_metrics.MaskedMAE()
     else:
         raise f'{cfg.model.name} not implemented'
@@ -612,6 +632,38 @@ def run_imputation(cfg: DictConfig):
                             gradient_clip_algorithm=cfg.grad_clip_alg,
                             known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
                             adj=adj)
+    elif cfg.model.name == "dysat":
+        imputer = DYSATFiller(model_class=model_cls,
+                            model_kwargs=model_kwargs,
+                            optim_class=getattr(torch.optim, cfg.optimizer.name),
+                            optim_kwargs=dict(cfg.optimizer.hparams),
+                            loss_fn=loss_fn,
+                            scaled_target=cfg.scale_target,
+                            whiten_prob=cfg.whiten_prob,
+                            pred_loss_weight=cfg.prediction_loss_weight,
+                            warm_up=cfg.warm_up_steps,
+                            metrics=log_metrics,
+                            scheduler_class=scheduler_class,
+                            scheduler_kwargs=scheduler_kwargs,
+                            known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
+                            adj=adj,
+                            horizon=cfg.window)
+    elif cfg.model.name == "dcrnn" or cfg.model.name == "evolvegcn":
+        imputer = StandardFiller(model_class=model_cls,
+                                model_kwargs=model_kwargs,
+                                optim_class=getattr(torch.optim, cfg.optimizer.name),
+                                optim_kwargs=dict(cfg.optimizer.hparams),
+                                loss_fn=loss_fn,
+                                scaled_target=cfg.scale_target,
+                                whiten_prob=cfg.whiten_prob,
+                                pred_loss_weight=cfg.prediction_loss_weight,
+                                warm_up=cfg.warm_up_steps,
+                                metrics=log_metrics,
+                                scheduler_class=scheduler_class,
+                                scheduler_kwargs=scheduler_kwargs,
+                                known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
+                                adj=adj,
+                                horizon=cfg.window)
     else:
         imputer = Imputer(model_class=model_cls,
                         model_kwargs=model_kwargs,

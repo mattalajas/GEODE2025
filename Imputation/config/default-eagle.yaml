@@ -2,7 +2,7 @@ defaults:
   - _self_
   - logger: null
   - dataset: metrla
-  - model: caustg
+  - model: eagle
 
 #### Experiment params ########################################################
 hydra:
@@ -31,8 +31,8 @@ stride: 1
 
 #### Training params ##########################################################
 epochs: 100
-patience: 100
-batch_size: 64
+patience: 25
+batch_size: 32
 grad_clip_val: 1
 grad_clip_alg: 'norm'
 scale_target: True
@@ -40,7 +40,7 @@ whiten_prob: 0.05
 prediction_loss_weight: 1
 impute_only_missing: False
 warm_up_steps: 0
-device: [0]
+device: [1]
 eval_setting: 'train_wise'
 
 detrend: False
@@ -51,7 +51,7 @@ optimizer:
   name: Adam
   hparams:
     lr: 0.0001
-    weight_decay: 0.00001
+    weight_decay: 0.
 
 lr_scheduler:
   name: CosineAnnealingLR
