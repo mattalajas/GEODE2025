@@ -185,11 +185,6 @@ class unKrigFillerV5(pl.LightningModule):
                       y_hat=finpreds,
                       mask=mask,
                       eval_mask=eval_mask)
-                    #   invars=output_invars_s[0],
-                    #   vars=output_vars_s[0],
-                    #   inv_adj=inv_adj,
-                    #   var_adj=var_adj)
-                    #   sum_out=sum_out)
         return output
 
     @staticmethod
@@ -479,16 +474,7 @@ class UnnamedKrigFillerV5(unKrigFillerV5):
             ratio = float(len(known_set) / mask_sum.shape[0])
             self.ratio = ratio
 
-        # else:
-        #     known_set = list(range(batch_data['mask'].shape[2]))
-        # else:
-        #     known_set = self.known_set
-
         batch_data["known_set"] = known_set
-
-        # x = x[:, :, train_set, :]  # b s n1 d, n1 = num of known entries
-        # mask = mask[:, :, train_set, :]  # b s n1 d
-        # y = y[:, :, train_set, :]  # b s n1 d
 
         sub_entry_num = 0
         batch_data["reset"] = self.inductive

@@ -11,6 +11,7 @@ import networkx as nx
 import numpy as np
 import torch
 import math
+import time
 
 from einops import rearrange
 
@@ -221,23 +222,22 @@ class EAGLE(BaseModel):
 
         def max_avg_diff_index(sorted_tensor):
             ds, n, k = sorted_tensor.shape
-            result = torch.zeros((ds, n))
-            for d in range(ds):
-                for i in range(n):
-                    row = sorted_tensor[d, i]
-                    max_diff = 0
-                    max_index = 0
-                    for j in range(1, k):
-                        avg1 = sum(row[:j]) / j
-                        avg2 = sum(row[j:]) / (k - j)
-                        diff = abs(avg1 - avg2)
-                        if diff <= max_diff:
-                            break
-                        if diff > max_diff:
-                            max_diff = diff
-                            max_index = j
-                    result[d, i] = max_index - 1
-            return result
+            # Cumulative sum along the last dimension
+            cumsum = torch.cumsum(sorted_tensor, dim=2)
+            # Create index tensors for dividing by j and (k - j)
+            j = torch.arange(1, k, device=sorted_tensor.device).view(1, 1, -1)  # shape (1, 1, k-1)
+            total = cumsum[:, :, -1].unsqueeze(-1)  # shape (ds, n, 1)
+            # avg1 = sum(row[:j]) / j
+            avg1 = cumsum[:, :, :-1] / j
+            # avg2 = (total - cumsum[:, :, :-1]) / (k - j)
+            avg2 = (total - cumsum[:, :, :-1]) / (k - j)
+            # abs difference
+            diff = torch.abs(avg1 - avg2)
+            # Find index of maximum diff
+            max_diff, max_index = torch.max(diff, dim=2)
+            # Adjust as in original: subtract 1 to match `max_index - 1`
+            result = max_index - 1
+            return result.float()
 
         var_sorted = torch.sort(var, dim=2)
         var_sorted_index = var_sorted.indices
@@ -380,7 +380,6 @@ class EAGLE(BaseModel):
         cvae_loss = self.loss_cvae(recon, x_flatten, mu, log_std) / (
             len(embeddings[0] * len(embeddings[0]))
         )
-
         fin_x_list = self.decoder(F.relu(embeddings))
         return fin_x_list, embeddings, cvae_loss
 

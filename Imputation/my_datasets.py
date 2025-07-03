@@ -82,9 +82,10 @@ def shift_mask(shape, feature, order, adj):
     if feature == 'c_centrality':
         # Compute closeness centrality
         closeness = nx.closeness_centrality(G)
+        nonzero_c = {node: score for node, score in closeness.items() if score > 0}
 
         # Sort nodes by closeness centrality in descending order
-        sorted_nodes = sorted(closeness.items(), key=lambda x: x[1])
+        sorted_nodes = sorted(nonzero_c.items(), key=lambda x: x[1])
         ord_nodes = [x for x, _ in sorted_nodes]
 
         f_nodes = ord_nodes[parts*order:parts*(order+1)]
@@ -94,9 +95,10 @@ def shift_mask(shape, feature, order, adj):
         
     elif feature == 'degree':
         degree = dict(nx.degree(G))
+        nonzero_d = {node: score for node, score in degree.items() if score > 0}
 
         # Sort nodes by node degree in descending order
-        sorted_nodes = sorted(degree.items(), key=lambda x: x[1])
+        sorted_nodes = sorted(nonzero_d.items(), key=lambda x: x[1])
         ord_nodes = [x for x, _ in sorted_nodes]
 
         f_nodes = ord_nodes[parts*order:parts*(order+1)]

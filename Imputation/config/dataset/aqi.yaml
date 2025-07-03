@@ -7,7 +7,7 @@ shift: false
 # spatial shift
 spatial_shift: false
 order: 0
-node_features: c_centrality
+node_features: c_centrality #
 
 # Point
 mode: region
@@ -22,5 +22,5 @@ splitting:
   test_times: [1, 2, 12]
 connectivity:
   method: distance
-  threshold: 0.1
+  threshold: 0.01
   include_self: False

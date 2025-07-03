@@ -135,8 +135,6 @@ class Filler(pl.LightningModule):
         adj = torch.tensor(self.adj).to(device=x.device)
         edge_index, edge_weights = dense_to_sparse(adj)
 
-        eval_mask = mask  # eval_mask = mask, during training
-
         batch_data["x"] = x  # t s n2 d
         batch_data["edge_index"] = edge_index
         batch_data["edge_weight"] = edge_weights
@@ -259,8 +257,6 @@ class Filler(pl.LightningModule):
 
             adj = torch.tensor(self.adj).to(device=x.device)
             edge_index, edge_weights = dense_to_sparse(adj)
-
-            eval_mask = mask  # eval_mask = mask, during training
 
             batch_data["x"] = x  # t s n2 d
             batch_data["edge_index"] = edge_index
@@ -611,8 +607,6 @@ class StandardFiller(Filler):
         adj = torch.tensor(self.adj).to(device=x.device)
         edge_index, edge_weights = dense_to_sparse(adj)
 
-        eval_mask = mask  # eval_mask = mask, during training
-
         batch_data["x"] = x  # t s n2 d
         batch_data["edge_index"] = edge_index
         batch_data["edge_weight"] = edge_weights
@@ -659,8 +653,6 @@ class StandardFiller(Filler):
 
         adj = torch.tensor(self.adj).to(device=x.device)
         edge_index, edge_weights = dense_to_sparse(adj)
-
-        eval_mask = mask  # eval_mask = mask, during training
 
         batch_data["x"] = x  # t s n2 d
         batch_data["edge_index"] = edge_index

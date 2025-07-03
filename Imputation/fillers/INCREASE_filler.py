@@ -2,7 +2,6 @@ import inspect
 import warnings
 from copy import deepcopy
 from einops import rearrange
-import time
 
 import numpy as np
 import pytorch_lightning as pl
@@ -12,10 +11,6 @@ from einops import rearrange
 from pytorch_lightning.utilities import move_data_to_device
 from torch_geometric.utils import dense_to_sparse
 from torchmetrics import MetricCollection
-from torch_geometric.utils import negative_sampling
-from torch_geometric.data import Data, Batch
-from torch_geometric.utils.convert import to_networkx
-from torch_geometric.loader import NeighborLoader
 from tsl import logger
 from tsl.metrics.torch import MaskedMetric
 from tsl.metrics.torch.functional import mre
@@ -31,41 +26,6 @@ def ensure_list(obj):
     else:
         return [obj]
 
-class NeibSampler:
-    def __init__(self, graph, nb_size, include_self=False):
-        n = graph.number_of_nodes()
-        assert 0 <= min(graph.nodes()) and max(graph.nodes()) < n
-        if include_self:
-            nb_all = torch.zeros(n, nb_size + 1, dtype=torch.int64)
-            nb_all[:, 0] = torch.arange(0, n)
-            nb = nb_all[:, 1:]
-        else:
-            nb_all = torch.zeros(n, nb_size, dtype=torch.int64)
-            nb = nb_all
-        popkids = []
-        for v in range(n):
-            nb_v = sorted(graph.neighbors(v))
-            if len(nb_v) <= nb_size:
-                nb_v.extend([-1] * (nb_size - len(nb_v)))
-                nb[v] = torch.LongTensor(nb_v)
-            else:
-                popkids.append(v)
-        self.include_self = include_self
-        self.g, self.nb_all, self.pk = graph, nb_all, popkids
-
-    def to(self, dev):
-        self.nb_all = self.nb_all.to(dev)
-        return self
-
-    def sample(self):
-        nb = self.nb_all[:, 1:] if self.include_self else self.nb_all
-        nb_size = nb.size(1)
-        pk_nb = np.zeros((len(self.pk), nb_size), dtype=np.int64)
-        for i, v in enumerate(self.pk):
-            pk_nb[i] = np.random.choice(sorted(self.g.neighbors(v)), nb_size)
-        nb[self.pk] = torch.from_numpy(pk_nb).to(nb.device)
-        return self.nb_all
-
 class Filler(pl.LightningModule):
     def __init__(self,
                  model_class,
@@ -78,7 +38,9 @@ class Filler(pl.LightningModule):
                  adj=None,
                  metrics=None,
                  scheduler_class=None,
-                 scheduler_kwargs=None):
+                 scheduler_kwargs=None,
+                 horizon=24,
+                 K=5):
         """
         PL module to implement hole fillers.
 
@@ -102,6 +64,8 @@ class Filler(pl.LightningModule):
         self.scheduler_class = scheduler_class
         self.automatic_optimization = False
         self.adj = adj
+        self.horizon = horizon
+        self.K = K
 
         if scheduler_kwargs is None:
             self.scheduler_kwargs = dict()
@@ -166,41 +130,42 @@ class Filler(pl.LightningModule):
         # batch_data["training"] = False
 
         # Extract mask and target
+        _ = batch_data.pop("edge_index")
         eval_mask = batch_data.pop('eval_mask', None)
         y = batch_data.pop('y')
 
         x = batch_data.pop("x")
         mask = batch_data.pop("mask")
+
+        adj = self.adj
+        full = list(range(adj.shape[0]))
         b, s, n, d = mask.size()
-        device = x.device
 
-        adj = torch.tensor(self.adj).to(device=x.device)
-        x = rearrange(x, 'b t n d -> t b n d')
-        x = list(x)
+        x = rearrange(x, 'b t n d -> n (b t) d')
+        gp, neigh_gp = self.heterogeneous_relations(adj, full, self.K)
+        gp = torch.tensor(gp).to(x.device)
+        neigh_gp = torch.tensor(neigh_gp).to(x.device)
 
-        edge_index, _ = dense_to_sparse(adj)
-        edge_index_list = [edge_index for _ in range(self.horizon)]
+        neigh_flat = neigh_gp.view(-1)
+        neigh_feat = x[neigh_flat]
+        neigh_feat = neigh_feat.view(n, self.K, b*s, d)
 
-        edge_index_list_pre = [
-            edge_index_list[ix].long().to(device)
-            for ix in range(s)
-        ]
-        neighbors_all = []
-        for t in range(s):
-            graph_data = Data(x=x[t][0], edge_index=edge_index_list_pre[t])
-            graph = to_networkx(graph_data)
-            sampler = NeibSampler(graph, self.nbsz)
-            neighbors = sampler.sample().to(device)
-            neighbors_all.append(neighbors)
-        neighbors_all = torch.stack(neighbors_all).to(device)
+        x_gp = torch.permute(neigh_feat, (0, 2, 1, 3))
+        
+        fin_gp = gp[full].unsqueeze(1).unsqueeze(1)
 
-        batch_data["x_list"] = x  # b s n2 d
-        batch_data["edge_index_list"] = edge_index_list  # b s n' 1
-        batch_data["neighbors_all"] = neighbors_all
+        timesteps = torch.arange(s).repeat(b).to(x.device)
+        TE = (timesteps * 3600) // (24 * 3600 / self.horizon)
+        TE = TE.unsqueeze(0)
+
+        # x_gp, gp, TE, T
+        batch_data["x_gp"] = x_gp  # t s n2 d
+        batch_data["gp"] = fin_gp
+        batch_data["TE"] = TE
+        batch_data["T"] = self.horizon
 
         # Compute outputs and rescale
-        res = self.predict_batch(batch, preprocess=False, postprocess=True)
-        imputation = res[0]
+        imputation = self.predict_batch(batch, preprocess=False, postprocess=True)
         
         output = dict(y=y,
                       y_hat=imputation,
@@ -287,10 +252,7 @@ class Filler(pl.LightningModule):
             y_hat = self.forward(**batch_data)
         # Rescale outputs
         if postprocess:
-            css, embs, loss = y_hat[0], y_hat[1], y_hat[2]
-            cs = self._postprocess(css, batch_preprocessing)
-            y_hat = [cs, embs, loss]
-
+            y_hat = self._postprocess(y_hat, batch_preprocessing)
         if return_target:
             y = batch_data.get('y')
             mask = batch_data.get('mask', None)
@@ -312,40 +274,41 @@ class Filler(pl.LightningModule):
             batch = move_data_to_device(batch, self.device)
             batch_data, batch_preprocessing = self._unpack_batch(batch)
             # Extract mask and target
+            _ = batch_data.pop("edge_index")
             eval_mask = batch_data.pop('eval_mask', None)
             y = batch_data.pop('y')
 
             x = batch_data.pop("x")
             mask = batch_data.pop("mask")
+
+            adj = self.adj
+            full = list(range(adj.shape[0]))
             b, s, n, d = mask.size()
-            device = x.device
 
-            adj = torch.tensor(self.adj).to(device=x.device)
-            x = rearrange(x, 'b t n d -> t b n d')
-            x = list(x)
+            x = rearrange(x, 'b t n d -> n (b t) d')
+            gp, neigh_gp = self.heterogeneous_relations(adj, full, self.K)
+            gp = torch.tensor(gp).to(x.device)
+            neigh_gp = torch.tensor(neigh_gp).to(x.device)
 
-            edge_index, _ = dense_to_sparse(adj)
-            edge_index_list = [edge_index for _ in range(self.horizon)]
+            neigh_flat = neigh_gp.view(-1)
+            neigh_feat = x[neigh_flat]
+            neigh_feat = neigh_feat.view(n, self.K, b*s, d)
 
-            edge_index_list_pre = [
-                edge_index_list[ix].long().to(device)
-                for ix in range(s)
-            ]
-            neighbors_all = []
-            for t in range(s):
-                graph_data = Data(x=x[t][0], edge_index=edge_index_list_pre[t])
-                graph = to_networkx(graph_data)
-                sampler = NeibSampler(graph, self.nbsz)
-                neighbors = sampler.sample().to(device)
-                neighbors_all.append(neighbors)
-            neighbors_all = torch.stack(neighbors_all).to(device)
+            x_gp = torch.permute(neigh_feat, (0, 2, 1, 3))
+            
+            fin_gp = gp[full].unsqueeze(1).unsqueeze(1)
 
-            batch_data["x_list"] = x  # b s n2 d
-            batch_data["edge_index_list"] = edge_index_list  # b s n' 1
-            batch_data["neighbors_all"] = neighbors_all
+            timesteps = torch.arange(s).repeat(b).to(x.device)
+            TE = (timesteps * 3600) // (24 * 3600 / self.horizon)
+            TE = TE.unsqueeze(0)
 
-            res = self.predict_batch(batch, preprocess=preprocess, postprocess=postprocess)
-            y_hat = res[0]
+            # x_gp, gp, TE, T
+            batch_data["x_gp"] = x_gp  # t s n2 d
+            batch_data["gp"] = fin_gp
+            batch_data["TE"] = TE
+            batch_data["T"] = self.horizon
+
+            y_hat = self.predict_batch(batch, preprocess=preprocess, postprocess=postprocess)
 
             targets.append(y)
             imputations.append(y_hat)
@@ -368,81 +331,6 @@ class Filler(pl.LightningModule):
         batch_preprocessing = batch.get('transform')
         return batch, batch_preprocessing
 
-    # def training_step(self, batch, batch_idx):
-    #     # Unpack batch
-    #     batch_data, batch_preprocessing = self._unpack_batch(batch)
-
-    #     # Extract mask and target
-    #     mask = batch_data['mask'].clone().detach()
-    #     batch_data['mask'] = torch.bernoulli(mask.clone().detach().float() * self.keep_prob).byte()
-    #     eval_mask = batch_data.pop('eval_mask')
-    #     eval_mask = (mask | eval_mask) - batch_data['mask']
-
-    #     y = batch_data.pop('y')
-
-    #     # Compute predictions and compute loss
-    #     imputation = self.predict_batch(batch, preprocess=False, postprocess=False)
-
-    #     if self.scaled_target:
-    #         target = self._preprocess(y, batch_preprocessing)
-    #     else:
-    #         target = y
-    #         imputation = self._postprocess(imputation, batch_preprocessing)
-
-    #     loss = self.loss_fn(imputation, target, mask)
-
-    #     # Logging
-    #     if self.scaled_target:
-    #         imputation = self._postprocess(imputation, batch_preprocessing)
-    #     self.train_metrics.update(imputation.detach(), y, eval_mask)  # all unseen data
-    #     self.log_dict(self.train_metrics, on_step=False, on_epoch=True, logger=True, prog_bar=True)
-    #     self.log('train_loss', loss.detach(), on_step=False, on_epoch=True, logger=True, prog_bar=False)
-    #     return loss
-
-    # def validation_step(self, batch, batch_idx):
-    #     # Unpack batch
-    #     batch_data, batch_preprocessing = self._unpack_batch(batch)
-
-    #     # Extract mask and target
-    #     eval_mask = batch_data.pop('eval_mask', None)
-    #     y = batch_data.pop('y')
-
-    #     # Compute predictions and compute loss
-    #     imputation = self.predict_batch(batch, preprocess=False, postprocess=False)
-
-    #     if self.scaled_target:
-    #         target = self._preprocess(y, batch_preprocessing)
-    #     else:
-    #         target = y
-    #         imputation = self._postprocess(imputation, batch_preprocessing)
-
-    #     val_loss = self.loss_fn(imputation, target, eval_mask)
-
-    #     # Logging
-    #     if self.scaled_target:
-    #         imputation = self._postprocess(imputation, batch_preprocessing)
-    #     self.val_metrics.update(imputation.detach(), y, eval_mask)
-    #     self.log_dict(self.val_metrics, on_step=False, on_epoch=True, logger=True, prog_bar=True)
-    #     self.log('val_loss', val_loss.detach(), on_step=False, on_epoch=True, logger=True, prog_bar=False)
-    #     return val_loss
-
-    # def test_step(self, batch, batch_idx):
-    #     # Unpack batch
-    #     batch_data, batch_preprocessing = self._unpack_batch(batch)
-
-    #     # Extract mask and target
-    #     eval_mask = batch_data.pop('eval_mask', None)
-    #     y = batch_data.pop('y')
-
-    #     # Compute outputs and rescale
-    #     imputation = self.predict_batch(batch, preprocess=False, postprocess=True)
-    #     test_loss = self.loss_fn(imputation, y, eval_mask)
-
-    #     # Logging
-    #     self.test_metrics.update(imputation.detach(), y, eval_mask)
-    #     self.log_dict(self.test_metrics, on_step=False, on_epoch=True, logger=True, prog_bar=True)
-    #     return test_loss
-
     def on_train_epoch_start(self) -> None:
         optimizers = ensure_list(self.optimizers())
         for i, optimizer in enumerate(optimizers):
@@ -461,7 +349,19 @@ class Filler(pl.LightningModule):
                 cfg['monitor'] = metric
         return cfg
 
-class EAGLEfiller(Filler):
+    def heterogeneous_relations(self, A, train_node, K):
+        relation = np.zeros_like(A) - 1
+        relation[:, train_node] = A[:, train_node] # only use the train nodes
+        np.fill_diagonal(relation, val = -1) # delete self-loop connections
+        Neighbor = np.argsort(-relation, axis = 1) # descending order
+        Neighbor = Neighbor[:, : K]
+        relation = -np.sort(-relation, axis = -1)
+        relation = relation[:, : K]
+        relation[relation < 0] = 0
+        relation = relation / (1e-10 + np.sum(relation, axis = 1, keepdims = True))
+        return relation, Neighbor
+
+class INCREASEFiller(Filler):
     def __init__(self,
                  model_class,
                  model_kwargs,
@@ -475,16 +375,11 @@ class EAGLEfiller(Filler):
                  metrics=None,
                  scheduler_class=None,
                  scheduler_kwargs=None,
-                 gradient_clip_val=None,
-                 gradient_clip_algorithm=None,
                  known_set=None,
-                 int_times=0,
                  adj=None,
-                 y1=1,
-                 y2=1,
-                 nbsz=1,
-                 horizon=24):
-        super(EAGLEfiller, self).__init__(model_class=model_class,
+                 horizon=24,
+                 num_n=5):
+        super(INCREASEFiller, self).__init__(model_class=model_class,
                                                   model_kwargs=model_kwargs,
                                                   optim_class=optim_class,
                                                   optim_kwargs=optim_kwargs,
@@ -498,16 +393,11 @@ class EAGLEfiller(Filler):
         
         self.tradeoff = pred_loss_weight
         self.trimming = (warm_up, warm_up)
-        self.int_times = int_times
-        self.nbsz = nbsz
-        self.horizon = horizon
 
         self.known_set = None
-        self.gradient_clip_val = gradient_clip_val
-        self.gradient_clip_algorithm = gradient_clip_algorithm
-        self.y1 = y1
-        self.y2 = y2
         self.adj = adj
+        self.horizon = horizon
+        self.K = num_n
 
         self.known_set = known_set
 
@@ -560,37 +450,25 @@ class EAGLEfiller(Filler):
                  logger=True,
                  prog_bar=False,
                  **kwargs)
-
-    # def on_train_batch_start(self, batch, batch_idx):
-    #     if self.e_start:
-    #         batch_data, batch_preprocessing = self._unpack_batch(batch)
-
-    #         # To make the model inductive
-    #         # => remove unobserved entries from input data and adjacency matrix
-    #         # if self.known_set is None:
-    #             # Get observed entries (nonzero masks across time)
-    #         mask = batch_data["mask"]
-    #         mask = rearrange(mask, "b s n 1 -> (b s) n")
-    #         mask_sum = mask.sum(0)  # n
-    #         known_set = torch.where(mask_sum > 0)[0]
-    #         ratio = float(len(known_set) / mask_sum.shape[0])
-    #         self.ratio = ratio / 2
-
-    #         dynamic_ratio = self.ratio + 0.2 * np.random.random()
-    #         val_len = int(dynamic_ratio*len(known_set))
-    #         arrange = torch.randperm(len(known_set), device=mask.device)
-    #         val_set = known_set[arrange[:val_len]].detach().cpu().numpy().tolist()
-    #         train_set = known_set[arrange[val_len:]].detach().cpu().numpy().tolist()
-
-    #         self.train_set = train_set
-    #         self.val_set = val_set
-    #         self.e_start = False
+        
+    def heterogeneous_relations(self, A, train_node, K):
+        relation = np.zeros_like(A) - 1
+        relation[:, train_node] = A[:, train_node] # only use the train nodes
+        np.fill_diagonal(relation, val = -1) # delete self-loop connections
+        Neighbor = np.argsort(-relation, axis = 1) # descending order
+        Neighbor = Neighbor[:, : K]
+        relation = -np.sort(-relation, axis = -1)
+        relation = relation[:, : K]
+        relation[relation < 0] = 0
+        relation = relation / (1e-10 + np.sum(relation, axis = 1, keepdims = True))
+        return relation, Neighbor
 
     def training_step(self, batch, batch_idx):
         # Unpack batch
         opt = self.optimizers()
         batch_data, batch_preprocessing = self._unpack_batch(batch)
 
+        _ = batch_data.pop("edge_index")
         mask = batch_data["mask"]
         mask = rearrange(mask, "b s n 1 -> (b s) n")
         mask_sum = mask.sum(0)  # n
@@ -611,8 +489,7 @@ class EAGLEfiller(Filler):
         mask = batch_data.pop("mask")
         y = batch_data.pop("y")
         _ = batch_data.pop("eval_mask")  # drop this, we will re-create a new eval_mask (=mask during training)
-        adj = torch.tensor(self.adj).to(device=x.device)
-        device = x.device
+        adj = self.adj
 
         sub_entry_num = 0
 
@@ -635,42 +512,38 @@ class EAGLEfiller(Filler):
         full = seened_indx + masked_indx
 
         x[:, :, masked_indx, :] = 0
-        x = x[:, :, full, :]  # b s n1 d, n1 = num of observed entries
-        x = rearrange(x, 'b t n d -> t b n d')
-        x = list(x)
-
         mask[:, :, seened_indx, :] = 0
         mask = mask[:, :, full, :]  # b s n1 d
         y = y[:, :, full, :]  # b s n1 d
 
-        adj = adj[:, full]
-        adj = adj[full, :]
-
-        edge_index, _ = dense_to_sparse(adj)
-        edge_index_list = [edge_index for _ in range(self.horizon)]
-
         eval_mask = mask  # eval_mask = mask, during training
 
-        edge_index_list_pre = [
-            edge_index_list[ix].long().to(device)
-            for ix in range(s)
-        ]
-        neighbors_all = []
-        for t in range(s):
-            graph_data = Data(x=x[t][0], edge_index=edge_index_list_pre[t])
-            graph = to_networkx(graph_data)
-            sampler = NeibSampler(graph, self.nbsz)
-            neighbors = sampler.sample().to(device)
-            neighbors_all.append(neighbors)
-        neighbors_all = torch.stack(neighbors_all).to(device)
+        x = rearrange(x, 'b t n d -> n (b t) d')
+        gp, neigh_gp = self.heterogeneous_relations(adj, full, self.K)
+        gp = torch.tensor(gp).to(x.device)
+        neigh_gp = torch.tensor(neigh_gp).to(x.device)
 
-        batch_data["x_list"] = x  # b s n2 d
-        batch_data["edge_index_list"] = edge_index_list  # b s n' 1
-        batch_data["neighbors_all"] = neighbors_all
+        neigh_flat = neigh_gp.view(-1)
+        neigh_feat = x[neigh_flat]
+        neigh_feat = neigh_feat.view(n, self.K, b*s, d)
+
+        x_gp = torch.permute(neigh_feat, (0, 2, 1, 3))
+        
+        x_gp = x_gp[full]  # b s n1 d, n1 = num of observed entries
+        fin_gp = gp[full].unsqueeze(1).unsqueeze(1)
+
+        timesteps = torch.arange(s).repeat(b).to(x.device)
+        TE = (timesteps * 3600) // (24 * 3600 / self.horizon)
+        TE = TE.unsqueeze(0)
+
+        # x_gp, gp, TE, T
+        batch_data["x_gp"] = x_gp  # t s n2 d
+        batch_data["gp"] = fin_gp
+        batch_data["TE"] = TE
+        batch_data["T"] = self.horizon
 
         # Compute predictions and compute loss
-        res = self.predict_batch(batch, preprocess=False, postprocess=False)
-        imputation, embeddings, cvae_loss = res[0], res[1], res[2]
+        imputation = self.predict_batch(batch, preprocess=False, postprocess=False)
 
         if self.scaled_target:
             target = batch.transform['y'].transform(y)
@@ -682,25 +555,9 @@ class EAGLEfiller(Filler):
         # partial loss + cycle loss
         opt.zero_grad()
 
-        intervention_times = self.int_times
-        env_loss = torch.tensor([]).to(device)
-        for i in range(intervention_times):
-            embeddings_interv, indices = self.model.intervention_final(embeddings)
-            pred_y_interv = self.model.decoder(embeddings_interv)
-            env_loss = torch.cat(
-                [env_loss, self.loss_fn(pred_y_interv, target, mask).unsqueeze(0)]
-            )
+        loss = self.loss_fn(imputation, target, mask)
 
-        var_loss = torch.var(env_loss)
-        main_loss = self.loss_fn(imputation, target, mask)
-
-        loss = main_loss + self.y1 * var_loss + self.y2 * cvae_loss
-        
         self.manual_backward(loss)
-
-        if self.gradient_clip_algorithm and self.gradient_clip_val:
-            self.clip_gradients(opt, gradient_clip_val=self.gradient_clip_val, gradient_clip_algorithm=self.gradient_clip_algorithm)
-
         opt.step()
 
         # Logging
@@ -723,46 +580,47 @@ class EAGLEfiller(Filler):
         # batch_data["training"] = False
 
         # Extract mask and target
+        _ = batch_data.pop("edge_index")
         x = batch_data.pop("x")
         mask = batch_data.pop('mask')
         eval_mask = batch_data.pop('eval_mask', None)
         # test = torch.sum(eval_mask, dim=(0, 1))
         # inds = torch.where(test > 0)
         y = batch_data.pop('y')
-        device = x.device
-        b, s, n, d = mask.size()
 
         # batch_data["x"] = x  # b s n2 d
         # batch_data["mask"] = mask  # b s n' 1
         # batch_data["known_set"] = self.known_set
         # print(self.val_set)
-        adj = torch.tensor(self.adj).to(device=x.device)
-        x = rearrange(x, 'b t n d -> t b n d')
-        x = list(x)
+        adj = self.adj
+        full = list(range(adj.shape[0]))
+        b, s, n, d = mask.size()
 
-        edge_index, _ = dense_to_sparse(adj)
-        edge_index_list = [edge_index for _ in range(self.horizon)]
+        x = rearrange(x, 'b t n d -> n (b t) d')
+        gp, neigh_gp = self.heterogeneous_relations(adj, full, self.K)
+        gp = torch.tensor(gp).to(x.device)
+        neigh_gp = torch.tensor(neigh_gp).to(x.device)
 
-        edge_index_list_pre = [
-            edge_index_list[ix].long().to(device)
-            for ix in range(s)
-        ]
-        neighbors_all = []
-        for t in range(s):
-            graph_data = Data(x=x[t][0], edge_index=edge_index_list_pre[t])
-            graph = to_networkx(graph_data)
-            sampler = NeibSampler(graph, self.nbsz)
-            neighbors = sampler.sample().to(device)
-            neighbors_all.append(neighbors)
-        neighbors_all = torch.stack(neighbors_all).to(device)
+        neigh_flat = neigh_gp.view(-1)
+        neigh_feat = x[neigh_flat]
+        neigh_feat = neigh_feat.view(n, self.K, b*s, d)
 
-        batch_data["x_list"] = x  # b s n2 d
-        batch_data["edge_index_list"] = edge_index_list  # b s n' 1
-        batch_data["neighbors_all"] = neighbors_all
+        x_gp = torch.permute(neigh_feat, (0, 2, 1, 3))
+        
+        fin_gp = gp[full].unsqueeze(1).unsqueeze(1)
 
+        timesteps = torch.arange(s).repeat(b).to(x.device)
+        TE = (timesteps * 3600) // (24 * 3600 / self.horizon)
+        TE = TE.unsqueeze(0)
+
+        # x_gp, gp, TE, T
+        batch_data["x_gp"] = x_gp  # t s n2 d
+        batch_data["gp"] = fin_gp
+        batch_data["TE"] = TE
+        batch_data["T"] = self.horizon
         # Compute predictions and compute loss
-        imputation, _, _ = self.predict_batch(batch, preprocess=False, postprocess=False)
-
+        imputation = self.predict_batch(batch, preprocess=False, postprocess=False)
+        
         # trim to imputation horizon len
         # imputation, mask, eval_mask, y = self.trim_seq(imputation, mask, eval_mask, y)
 
@@ -793,41 +651,43 @@ class EAGLEfiller(Filler):
         # batch_data["training"] = False
 
         # Extract mask and target
+        _ = batch_data.pop("edge_index")
         x = batch_data.pop("x")
         mask = batch_data.pop('mask')
         eval_mask = batch_data.pop('eval_mask', None)
         # test = torch.sum(eval_mask, dim=(0, 1))
         # inds = torch.where(test > 0)
         y = batch_data.pop('y')
-        device = x.device
+
+        adj = self.adj
+        full = list(range(adj.shape[0]))
         b, s, n, d = mask.size()
 
-        adj = torch.tensor(self.adj).to(device=x.device)
-        x = rearrange(x, 'b t n d -> t b n d')
-        x = list(x)
+        x = rearrange(x, 'b t n d -> n (b t) d')
+        gp, neigh_gp = self.heterogeneous_relations(adj, full, self.K)
+        gp = torch.tensor(gp).to(x.device)
+        neigh_gp = torch.tensor(neigh_gp).to(x.device)
 
-        edge_index, _ = dense_to_sparse(adj)
-        edge_index_list = [edge_index for _ in range(self.horizon)]
+        neigh_flat = neigh_gp.view(-1)
+        neigh_feat = x[neigh_flat]
+        neigh_feat = neigh_feat.view(n, self.K, b*s, d)
 
-        edge_index_list_pre = [
-            edge_index_list[ix].long().to(device)
-            for ix in range(s)
-        ]
-        neighbors_all = []
-        for t in range(s):
-            graph_data = Data(x=x[t][0], edge_index=edge_index_list_pre[t])
-            graph = to_networkx(graph_data)
-            sampler = NeibSampler(graph, self.nbsz)
-            neighbors = sampler.sample().to(device)
-            neighbors_all.append(neighbors)
-        neighbors_all = torch.stack(neighbors_all).to(device)
+        x_gp = torch.permute(neigh_feat, (0, 2, 1, 3))
+        
+        fin_gp = gp[full].unsqueeze(1).unsqueeze(1)
 
-        batch_data["x_list"] = x  # b s n2 d
-        batch_data["edge_index_list"] = edge_index_list  # b s n' 1
-        batch_data["neighbors_all"] = neighbors_all
+        timesteps = torch.arange(s).repeat(b).to(x.device)
+        TE = (timesteps * 3600) // (24 * 3600 / self.horizon)
+        TE = TE.unsqueeze(0)
+
+        # x_gp, gp, TE, T
+        batch_data["x_gp"] = x_gp  # t s n2 d
+        batch_data["gp"] = fin_gp
+        batch_data["TE"] = TE
+        batch_data["T"] = self.horizon
 
         # Compute outputs and rescale
-        imputation, _, _ = self.predict_batch(batch, preprocess=False, postprocess=True)
+        imputation = self.predict_batch(batch, preprocess=False, postprocess=True)
         test_loss = self.loss_fn(imputation, y, eval_mask)
 
         # Logging

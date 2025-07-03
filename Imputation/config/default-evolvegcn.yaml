@@ -48,7 +48,7 @@ scaling_axis: 'global'  # ['channels', 'global']
 optimizer:
   name: Adam
   hparams:
-    lr: 0.005
+    lr: 0.01
     weight_decay: 0.
 
 lr_scheduler:

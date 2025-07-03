@@ -138,8 +138,6 @@ class Filler(pl.LightningModule):
 
         edge_index, edge_weights = dense_to_sparse(adj)
 
-        eval_mask = mask  # eval_mask = mask, during training
-
         batch_data["x_list"] = x  # t s n2 d
         batch_data["edge_index"] = edge_index
         batch_data["edge_weights"] = edge_weights
@@ -265,8 +263,6 @@ class Filler(pl.LightningModule):
             x = list(x)
 
             edge_index, edge_weights = dense_to_sparse(adj)
-
-            eval_mask = mask  # eval_mask = mask, during training
 
             batch_data["x_list"] = x  # t s n2 d
             batch_data["edge_index"] = edge_index
@@ -623,8 +619,6 @@ class DYSATFiller(Filler):
 
         edge_index, edge_weights = dense_to_sparse(adj)
 
-        eval_mask = mask  # eval_mask = mask, during training
-
         batch_data["x_list"] = x  # t s n2 d
         batch_data["edge_index"] = edge_index
         batch_data["edge_weights"] = edge_weights
@@ -674,8 +668,6 @@ class DYSATFiller(Filler):
         x = list(x)
 
         edge_index, edge_weights = dense_to_sparse(adj)
-
-        eval_mask = mask  # eval_mask = mask, during training
 
         batch_data["x_list"] = x  # t s n2 d
         batch_data["edge_index"] = edge_index

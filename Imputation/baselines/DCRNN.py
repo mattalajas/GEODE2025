@@ -1,5 +1,6 @@
 from einops import rearrange
 from torch import Tensor, nn
+import torch
 from torch_geometric.typing import Adj, OptTensor
 
 from tsl.nn.blocks.decoders import MLPDecoder
@@ -70,7 +71,7 @@ class DCRNNModel(BaseModel):
                 edge_index: Adj,
                 edge_weight: OptTensor = None) -> Tensor:
         """"""
-        x = self.input_encoder(x)
+        x = self.input_encoder(x)   
 
         out = self.dcrnn(x,
                          edge_index,

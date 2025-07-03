@@ -15,8 +15,9 @@ if __name__ == '__main__':
     mode = res.pop('mode')
     shift = res.pop('spatial')
     eval_setting = res.pop('eval_setting')
+    node_features = res.pop('node_f')
     if shift:
-        csv_path = f"/data/mala711/Thesis/GNNthesis/res/{res['model']}-{mode}-spatial.csv"
+        csv_path = f"/data/mala711/Thesis/GNNthesis/res/{res['model']}-{mode}-spatial-{node_features}.csv"
     else:
         if eval_setting == 'train_wise':
             csv_path = f"/data/mala711/Thesis/GNNthesis/res/{res['model']}-{mode}.csv"
