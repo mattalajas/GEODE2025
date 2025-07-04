@@ -284,6 +284,7 @@ def test_wise_eval(y_hat, y_true, mask, known_nodes, adj, mode, num_groups=4, al
 
     # CC
     closeness = nx.closeness_centrality(numpy_graph)
+    closeness = {node: score for node, score in closeness.items() if score > 0}
 
     sorted_cls = sorted(u_nodes, key=lambda i: closeness[i])
     # sorted_cls = [x for x, _ in sorted_cls]
@@ -294,6 +295,7 @@ def test_wise_eval(y_hat, y_true, mask, known_nodes, adj, mode, num_groups=4, al
 
     # ND
     degrees = dict(nx.degree(numpy_graph))
+    degrees = {node: score for node, score in degrees.items() if score > 0}
 
     sorted_nd = sorted(u_nodes, key=lambda i: degrees[i])
     # sorted_nd = [x for x, _ in sorted_nd]
@@ -304,6 +306,7 @@ def test_wise_eval(y_hat, y_true, mask, known_nodes, adj, mode, num_groups=4, al
 
     # KHR
     khr_grouped = closest_distances_unweighted(numpy_graph, u_nodes, k_nodes)
+    khr_grouped = {node: score for node, score in khr_grouped.items() if score < 1e9}
     khr_gr = [[] for _ in range(num_groups)]
 
     for key, pos in khr_grouped.items():
