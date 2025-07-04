@@ -416,7 +416,7 @@ class INCREASEFiller(Filler):
         outside the predictor, without checking that hyperparameters of the
         checkpoint's model are the same of the predictor's model.
         """
-        storage = torch.load(filename, lambda storage, loc: storage)
+        storage = torch.load(filename, lambda storage, loc: storage, weights_only=False)
         # if predictor.model has been instantiated inside predictor
         if self.model_cls is not None:
             model_cls = storage['hyper_parameters']['model_class']
