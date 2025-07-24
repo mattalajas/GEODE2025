@@ -46,7 +46,7 @@ class RelTemporalEncoding(nn.Module):
         temb = self.lin(self.emb(texp))
         return x + temb
 
-class UnnamedKrigModelV5(BaseModel):
+class UnnamedKrigModelV5WoRA(BaseModel):
     def __init__(self,
                  input_size,
                  hidden_size,
@@ -64,7 +64,7 @@ class UnnamedKrigModelV5(BaseModel):
                  att_window=3,
                  k=5,
                  att_heads=8):
-        super(UnnamedKrigModelV5, self).__init__()
+        super(UnnamedKrigModelV5WoRA, self).__init__()
 
         self.steps = intervention_steps
         self.horizon = horizon
@@ -138,6 +138,10 @@ class UnnamedKrigModelV5(BaseModel):
                 u=None,
                 transform=None):
         # x: [batches steps nodes features]
+        # Unrandomised x, make sure this only has training nodes
+        # x transferred here would be the imputed x
+        # adj is the original 
+        # mask is for nodes that need to get predicted, mask is also imputed 
         b, t, _, _ = x.size()
         x = utils.maybe_cat_exog(x, u)
         device = x.device
@@ -151,6 +155,7 @@ class UnnamedKrigModelV5(BaseModel):
             o_adj = o_adj[:, known_set]
 
         edge_index, _ = dense_to_sparse(o_adj)
+        # Spatial encoding
         x_fwd = self.init_emb(x)
 
         # ========================================
@@ -329,8 +334,29 @@ class UnnamedKrigModelV5(BaseModel):
             # huh6 = torch.sum(xh_inv_2, dim=(0, 2))
             # yes = 1
 
+        # ========================================
+        # Append the most similar embedding
+        # ========================================
+        # if seened_set != []:
+        #     inv_sim = self.get_sim(xh_inv_2, seened_set, grouped)
+        #     var_sim = self.get_sim(xh_var_2, seened_set, grouped)
+        # else:
+        #     inv_sim = self.get_sim(xh_inv_2, known_set, grouped)
+        #     var_sim = self.get_sim(xh_var_2, known_set, grouped)
+
         xh_inv_3 = xh_inv_2
         xh_var_3 = xh_var_2
+
+        # xh_inv_3 = torch.cat([xh_inv_2, inv_sim], dim=-1)
+        # xh_var_3 = torch.cat([xh_var_2, var_sim], dim=-1)
+        
+        # xh_inv_3 = self.squeeze1(xh_inv_3)
+        # xh_inv_3 = self.layernorm2(xh_inv_3)
+        # xh_var_3 = self.squeeze1(xh_var_3)
+        # xh_var_3 = self.layernorm2(xh_var_3)
+
+        # xh_inv_3 = self.layernorm2(xh_inv_2 + inv_sim)
+        # xh_var_3 = self.layernorm2(xh_var_2 + var_sim)
 
         # ========================================
         # Final Message Passing
@@ -348,55 +374,7 @@ class UnnamedKrigModelV5(BaseModel):
         if not training:
             return finpreds
         
-        # ========================================
-        # MMD of embeddings
-        # ========================================
-        # Get embedding softmax
-        s_batch = b
-        if self.mmd_ratio < 1.0:
-            s_batch = int(b*self.mmd_ratio)
-            indx = torch.randperm(b, device=device)[:s_batch]
-
-            # xh_inv_sim = rearrange(inv_sim, '(b t) n d -> b t n d', b=b, t=t)
-            # xh_var_sim = rearrange(var_sim, '(b t) n d -> b t n d', b=b, t=t)
-            # sml_inv = xh_inv_sim[indx]
-            # sml_var = xh_var_sim[indx]
-
-            vir_inv = xh_inv_3[indx]
-            vir_var = xh_var_3[indx]
-        
         finrecos = []
-        for i in range(1, self.k+1):
-            prev_group = []
-            cur_group = []
-
-            for j in range(i):
-                prev_group.extend(grouped[j])
-            for j in range(i+1):
-                cur_group.extend(grouped[j])
-
-            # emb_com_inv = sml_inv[:, :, grouped[i]]
-            # emb_com_var = sml_var[:, :, grouped[i]]
-
-            emb_com_inv = vir_inv[:, :, prev_group]
-            # emb_com_var = vir_inv[:, :, prev_group]
-
-            emb_tru_inv = vir_inv[:, :, cur_group]
-            # emb_tru_var = vir_var[:, :, grouped[i]]
-
-            emb_com_inv = rearrange(emb_com_inv, 'b t n d -> b (t n) d')
-            # emb_com_var = rearrange(emb_com_var, 'b t n d -> b (t n) d')
-            emb_tru_inv = rearrange(emb_tru_inv, 'b t n d -> b (t n) d')
-            # emb_tru_var = rearrange(emb_tru_var, 'b t n d -> b (t n) d')
-
-            # emb_com_inv = emb_com_inv
-            # emb_com_var = emb_com_var.detach()
-
-            if emb_tru_inv.numel() == 0:
-                continue
-            else:
-                finrecos.append([s_batch, emb_com_inv, emb_tru_inv])
-
         # ========================================
         # Disentanglement module
         # ========================================
@@ -419,6 +397,52 @@ class UnnamedKrigModelV5(BaseModel):
         fin_irm_all = torch.stack(fin_irm_all)
 
         return finpreds, finrecos, fin_irm_all
+    
+    def get_sim(self, embs, knownset, grouped, invs=True, eps=1e-8):
+        # B*T N D
+        b, t, _, _ = embs.shape
+        embs = rearrange(embs, 'b t n d -> (b t) n d')
+
+        Bt, N, D = embs.shape
+        q = embs.clone() 
+        k = embs.clone().transpose(-2, -1)
+        q_norm = torch.norm(q, 2, 2, True)
+        k_norm = torch.norm(k, 2, 1, True)
+
+        cos_sim = torch.bmm(q, k) / (torch.bmm(q_norm, k_norm) + eps) 
+        cos_sim = (cos_sim + 1.) / 2.
+
+        idx = torch.arange(N, device=embs.device)
+        grouped_ks = []
+
+        # if invs:
+        cos_sim[:, idx, idx] = 0
+        # cos_sim[:, :len(knownset), :len(knownset)] = 0
+        # cos_sim[:, len(knownset):, len(knownset):] = 0
+
+        for k in range(1, self.k+1):
+            for ks in range(k, self.k+1):
+                grouped_ks.extend(grouped[ks])
+
+            if len(grouped[k]) != 0 or len(grouped_ks) != 0:
+                rows_t = torch.tensor(grouped[k], dtype=torch.long, device=embs.device)
+                cols_t = torch.tensor(grouped_ks, dtype=torch.long, device=embs.device)
+
+                rows, cols = torch.meshgrid(rows_t, cols_t, indexing='ij')
+                cos_sim[:, rows, cols] = 0
+            
+            grouped_ks = []
+            
+        cos_sim_val, cos_sim_ind = torch.max(cos_sim, dim=1)
+
+        cos_sim_ind = cos_sim_ind.unsqueeze(-1).expand(-1, -1, D).detach()
+        cos_sim_val = cos_sim_val.unsqueeze(-1).expand(-1, -1, D).detach()
+
+        sim_emb = torch.gather(embs, dim=1, index=cos_sim_ind).detach()
+        fin_emb = sim_emb * cos_sim_val
+
+        fin_emb = rearrange(fin_emb, '(b t) n d -> b t n d', b=b, t=t)
+        return fin_emb
 
     def get_new_adj(self, adj, k, n_add, scale=1.0, init_hops={}):
         """
@@ -505,9 +529,7 @@ class UnnamedKrigModelV5(BaseModel):
         src_nodes = x_fwd[:, :, srcs]
 
         B, T, N, D = tar_nodes.shape
-        assert T >= 2 * att_window + 1
         assert D % att_heads == 0
-        
         d_k = D // att_heads
 
         # Time encoding
@@ -534,22 +556,22 @@ class UnnamedKrigModelV5(BaseModel):
         context_att = []
         context_msg = []
         for offset in range(-att_window, att_window + 1):
-            context_att.append(padded_att[att_window + offset : att_window + offset + T])  # [T, B, E, D]
-            context_msg.append(padded_msg[att_window + offset : att_window + offset + T])  # [T, B, E, D]
+            context_att.append(padded_att[att_window + offset : att_window + offset + T])  # [T, B, N, D]
+            context_msg.append(padded_msg[att_window + offset : att_window + offset + T])  # [T, B, N, D]
 
         # [T, B, N*(att_window*2 + 1), D]
-        res_att_og = torch.cat(context_att, dim=2)
+        res_att = torch.cat(context_att, dim=2)
         res_msg = torch.cat(context_msg, dim=2)
 
         ei_tar = tars.repeat(att_window*2 + 1)
 
-        res_att = softmax(res_att_og, ei_tar, dim=2)
+        res_att = softmax(res_att, ei_tar, dim=2)
         t, b, n = res_att.shape[0], res_att.shape[1], res_att.shape[2]
         res = res_msg * res_att.view(t, b, n, att_heads, 1)  
         res = res.view(t, b, n, D)
 
-        spu_att = softmax(-res_att_og, ei_tar, dim=2)
-        t, b, n = spu_att.shape[0], spu_att.shape[1], spu_att.shape[2]
+        spu_att = softmax(-res_att, ei_tar, dim=2)
+        t, b, n = spu_att.shape[0], spu_att.shape[1], res_att.shape[2]
         spu = res_msg * spu_att.view(t, b, n, att_heads, 1)  
         spu = spu.view(t, b, n, D)
 

@@ -179,7 +179,7 @@ def region_masking(adj_matrix, n):
 
     while len(visited) < n:
         # Start from an unvisited random seed node
-        seed = random.choice(list(all_nodes - visited))
+        seed = np.random.choice(list(all_nodes - visited))
         queue = deque([seed])
         visited.add(seed)
 

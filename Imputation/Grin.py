@@ -53,10 +53,14 @@ from unnamedKrig_v2 import UnnamedKrigModelV2
 from unnamedKrig_v3 import UnnamedKrigModelV3
 from unnamedKrig_v4 import UnnamedKrigModelV4
 from unnamedKrig_v5 import UnnamedKrigModelV5
+from unnamedKrig_v5_woCRL import UnnamedKrigModelV5woCRL
+from unnamedKrig_v5_woRA import UnnamedKrigModelV5WoRA
+from unnamedKrig_v5_woCRLRA import UnnamedKrigModelV5woCRLRA
+
 from utils import month_splitter, test_wise_eval
 
-MODELS = ['kits', 'unkrig', 'unkrigv2', 'unkrigv3', 'unkrigv4', 'unkrigv5', 'ignnk', 
-          'lsjstn', 'caustg', 'eagle', 'dida', 'dysat', 'evolvegcn', 'dcrnn', 'increase']
+MODELS = ['kits', 'unkrig', 'unkrigv2', 'unkrigv3', 'unkrigv4', 'unkrigv5', 'unkrigv5woRA', 'unkrigv5woCRL', 
+          'unkrigv5woCRLRA','ignnk', 'lsjstn', 'caustg', 'eagle', 'dida', 'dysat', 'evolvegcn', 'dcrnn', 'increase']
 
 def get_model_class(model_str):
     if model_str == 'rnni':
@@ -81,6 +85,12 @@ def get_model_class(model_str):
         model = UnnamedKrigModelV4
     elif model_str == 'unkrigv5':
         model = UnnamedKrigModelV5
+    elif model_str == 'unkrigv5woCRL':
+        model = UnnamedKrigModelV5woCRL
+    elif model_str == 'unkrigv5woCRLRA':
+        model = UnnamedKrigModelV5woCRLRA
+    elif model_str == 'unkrigv5woRA':
+        model = UnnamedKrigModelV5WoRA
     elif model_str == 'ignnk':
         model = IGNNK
     elif model_str == 'dida':
@@ -399,7 +409,7 @@ def run_imputation(cfg: DictConfig):
         model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
     elif cfg.model.name == 'unkrigv4':
         model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
-    elif cfg.model.name == 'unkrigv5':
+    elif cfg.model.name == 'unkrigv5' or cfg.model.name == 'unkrigv5woCRL' or cfg.model.name == 'unkrigv5woCRLRA' or cfg.model.name == 'unkrigv5woRA':
         model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
     elif cfg.model.name == 'ignnk':
         model_kwargs = dict(h=cfg.window)
@@ -433,7 +443,8 @@ def run_imputation(cfg: DictConfig):
         loss_fn = [torch_metrics.MaskedMAE(), torch_metrics.MaskedMSE()]
     elif cfg.model.name in ['ignnk', 'increase']:
         loss_fn = torch_metrics.MaskedMSE()
-    elif cfg.model.name in ['kits', 'unkrigv5', 'lsjstn', 'dida', 
+    elif cfg.model.name in ['kits', 'unkrigv5', 'unkrigv5woRA', 'unkrigv5woCRL', 
+                            'unkrigv5woCRLRA', 'lsjstn', 'dida', 
                             'caustg', 'eagle', 'dysat', 'evolvegcn',
                             'dcrnn']:
         loss_fn = torch_metrics.MaskedMAE()
@@ -529,7 +540,7 @@ def run_imputation(cfg: DictConfig):
                             gradient_clip_algorithm=cfg.grad_clip_alg,
                             known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
                             **cfg.model.regs)
-    elif cfg.model.name == "unkrigv5":
+    elif cfg.model.name == "unkrigv5" or cfg.model.name == 'unkrigv5woCRL' or cfg.model.name == 'unkrigv5woCRLRA' or cfg.model.name == 'unkrigv5woRA':
         imputer = UnnamedKrigFillerV5(model_class=model_cls,
                             model_kwargs=model_kwargs,
                             optim_class=getattr(torch.optim, cfg.optimizer.name),
@@ -782,7 +793,8 @@ def run_imputation(cfg: DictConfig):
         res = test_wise_eval(y_hat, y_true, mask, 
                              known_nodes=[i for i in range(adj.shape[0]) if i not in masked_sensors],
                              adj=adj,
-                             mode='test')
+                             mode='test',
+                             num_groups=cfg.num_groups)
 
     output = trainer.predict(imputer, dataloaders=dm.val_dataloader())
     output = imputer.collate_prediction_outputs(output)
@@ -800,7 +812,7 @@ def run_imputation(cfg: DictConfig):
     elif cfg.eval_setting == 'test_wise':
         res.update(test_wise_eval(y_hat, y_true, mask, 
                     known_nodes=[i for i in range(adj.shape[0]) if i not in masked_sensors],
-                    adj=adj, mode='val'))
+                    adj=adj, mode='val', num_groups=cfg.num_groups))
     
     res.update(
         dict(model=cfg.model.name,

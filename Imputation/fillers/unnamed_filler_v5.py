@@ -541,49 +541,55 @@ class UnnamedKrigFillerV5(unKrigFillerV5):
         opt1.zero_grad()
 
         # IRM Loss
-        irm_target = target[:, :, :len(known_set)]
-        irm_mask = eval_mask[:, :, :len(known_set)]
-        steps = self.model.steps
-        env_loss = torch.tensor([]).to(x.device)
-        for i in range(steps):
-            env_loss = torch.cat(
-                        [env_loss,
-                         self.loss_fn(fin_irm_all_s[i], irm_target, irm_mask.bool()).unsqueeze(0)])
-        env_mean = env_loss.mean()
-        env_var = torch.var(env_loss * steps)
-        irm_loss = env_var + env_mean
+        if self.y2 != 0:
+            irm_target = target[:, :, :len(known_set)]
+            irm_mask = eval_mask[:, :, :len(known_set)]
+            steps = self.model.steps
+            env_loss = torch.tensor([]).to(x.device)
+            for i in range(steps):
+                env_loss = torch.cat(
+                            [env_loss,
+                            self.loss_fn(fin_irm_all_s[i], irm_target, irm_mask.bool()).unsqueeze(0)])
+            env_mean = env_loss.mean()
+            env_var = torch.var(env_loss * steps)
+            irm_loss = env_var + env_mean
+        else:
+            irm_loss = 0
 
-        if self.dloss == 'mmd':
-            # MMD Loss
-            mmds = torch.tensor([]).to(x.device)
-            for reco in finrecos:
-                # MMD for inv 
-                s_batch = reco.pop(0)
-                mmds = torch.cat([mmds, torch.clamp(mmd_loss(reco[0], reco[2]), min=0).unsqueeze(0)])
-                # mmds = torch.cat([mmds, torch.clamp(mmd_loss(reco[1], reco[3]), min=0).unsqueeze(0)])
+        if self.y1 != 0:
+            if self.dloss == 'mmd':
+                # MMD Loss
+                mmds = torch.tensor([]).to(x.device)
+                for reco in finrecos:
+                    # MMD for inv 
+                    s_batch = reco.pop(0)
+                    mmds = torch.cat([mmds, torch.clamp(mmd_loss(reco[0], reco[2]), min=0).unsqueeze(0)])
+                    # mmds = torch.cat([mmds, torch.clamp(mmd_loss(reco[1], reco[3]), min=0).unsqueeze(0)])
 
-                recon_loss = mmds.mean()
+                    recon_loss = mmds.mean()
 
-        elif self.dloss == 'cmd':
-            cmds = torch.tensor([]).to(x.device)
-            for reco in finrecos:
-                B = reco.pop(0)
-                inv_emb_tru = rearrange(reco[0], 'b t d -> (b t) d')
-                inv_emb_vir = rearrange(reco[1], 'b t d -> (b t) d')
+            elif self.dloss == 'cmd':
+                cmds = torch.tensor([]).to(x.device)
+                for reco in finrecos:
+                    B = reco.pop(0)
+                    inv_emb_tru = rearrange(reco[0], 'b t d -> (b t) d')
+                    inv_emb_vir = rearrange(reco[1], 'b t d -> (b t) d')
 
-                og_nt = inv_emb_tru.size(0) // (B*s)
-                cr_nt = inv_emb_vir.size(0) // (B*s)
+                    og_nt = inv_emb_tru.size(0) // (B*s)
+                    cr_nt = inv_emb_vir.size(0) // (B*s)
 
-                batches = torch.arange(0, B*s).to(device=x.device)
-                og_batch = torch.repeat_interleave(batches, repeats=(og_nt))
-                cr_batch = torch.repeat_interleave(batches, repeats=(cr_nt))
+                    batches = torch.arange(0, B*s).to(device=x.device)
+                    og_batch = torch.repeat_interleave(batches, repeats=(og_nt))
+                    cr_batch = torch.repeat_interleave(batches, repeats=(cr_nt))
 
-                cmds = torch.cat([cmds, torch.clamp(cmd(inv_emb_tru, inv_emb_vir, \
-                                                        og_batch, cr_batch, n_moments=2).mean(), min=0).unsqueeze(0)])
-                # cmds = torch.cat([cmds, torch.clamp(cmd(reco[1].squeeze(0), reco[3].squeeze(0), \
-                #                                         og_batch, cr_batch).mean(), min=0).unsqueeze(0)])
+                    cmds = torch.cat([cmds, torch.clamp(cmd(inv_emb_tru, inv_emb_vir, \
+                                                            og_batch, cr_batch, n_moments=2).mean(), min=0).unsqueeze(0)])
+                    # cmds = torch.cat([cmds, torch.clamp(cmd(reco[1].squeeze(0), reco[3].squeeze(0), \
+                    #                                         og_batch, cr_batch).mean(), min=0).unsqueeze(0)])
 
-            recon_loss = cmds.mean()
+                recon_loss = cmds.mean()
+        else:
+            recon_loss = 0
 
         main_loss = self.loss_fn(finpreds, target, eval_mask.bool()) 
         loss = main_loss + self.y1 * recon_loss + self.y2 * irm_loss

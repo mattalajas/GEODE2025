@@ -46,7 +46,7 @@ class RelTemporalEncoding(nn.Module):
         temb = self.lin(self.emb(texp))
         return x + temb
 
-class UnnamedKrigModelV5(BaseModel):
+class UnnamedKrigModelV5woCRLRA(BaseModel):
     def __init__(self,
                  input_size,
                  hidden_size,
@@ -64,7 +64,7 @@ class UnnamedKrigModelV5(BaseModel):
                  att_window=3,
                  k=5,
                  att_heads=8):
-        super(UnnamedKrigModelV5, self).__init__()
+        super(UnnamedKrigModelV5woCRLRA, self).__init__()
 
         self.steps = intervention_steps
         self.horizon = horizon
@@ -76,23 +76,6 @@ class UnnamedKrigModelV5(BaseModel):
 
         self.time_emb = RelTemporalEncoding(hidden_size)
         self.init_emb = nn.Linear(input_size, hidden_size)
-
-        self.key = MLP(input_size=hidden_size,
-                        hidden_size=hidden_size,
-                        output_size=hidden_size,
-                        activation=activation)
-        self.query = MLP(input_size=hidden_size,
-                        hidden_size=hidden_size,
-                        output_size=hidden_size,
-                        activation=activation)
-        self.value = MLP(input_size=hidden_size,
-                        hidden_size=hidden_size,
-                        output_size=hidden_size,
-                        activation=activation)
-        self.out_proj = MLP(input_size=hidden_size,
-                            hidden_size=hidden_size,
-                            output_size=hidden_size,
-                            activation=activation)
 
         self.layernorm0 = LayerNorm(hidden_size)
         self.layernorm1 = LayerNorm(hidden_size)
@@ -138,6 +121,10 @@ class UnnamedKrigModelV5(BaseModel):
                 u=None,
                 transform=None):
         # x: [batches steps nodes features]
+        # Unrandomised x, make sure this only has training nodes
+        # x transferred here would be the imputed x
+        # adj is the original 
+        # mask is for nodes that need to get predicted, mask is also imputed 
         b, t, _, _ = x.size()
         x = utils.maybe_cat_exog(x, u)
         device = x.device
@@ -151,14 +138,15 @@ class UnnamedKrigModelV5(BaseModel):
             o_adj = o_adj[:, known_set]
 
         edge_index, _ = dense_to_sparse(o_adj)
-        x_fwd = self.init_emb(x)
+        # Spatial encoding
+        output_invars = self.init_emb(x)
 
         # ========================================
         # Calculating variant and invariant features using self-attention 
         # across different nodes using their representations
         # ========================================
-        output_invars, output_vars = self.scaled_dot_product_mhattention(x_fwd, edge_index,
-                                                                         self.att_window, self.att_heads)
+        # output_invars = self.scaled_dot_product_mhattention(x_fwd, edge_index,
+        #                                                     self.att_window, self.att_heads)
         # output_invars = rearrange(output_invars, 'b t n d -> (b t) n d')
         # output_vars = rearrange(output_vars, 'b t n d -> (b t) n d')
 
@@ -224,12 +212,9 @@ class UnnamedKrigModelV5(BaseModel):
 
         if add_nodes != 0:
             sub_entry = torch.zeros(b, t, add_nodes, d).to(device)
-
             xh_inv = torch.cat([output_invars, sub_entry], dim=2)  # b t n2 d
-            xh_var = torch.cat([output_vars, sub_entry], dim=2)
         else:
             xh_inv = output_invars
-            xh_var = output_vars
 
         # ========================================
         # Curriculum based pseudo-labelling
@@ -261,13 +246,11 @@ class UnnamedKrigModelV5(BaseModel):
         gcn_adj = dense_to_sparse(adj.to(torch.float32))
         
         xh_inv_2 = torch.zeros_like(xh_inv).to(device=device)
-        xh_var_2 = torch.zeros_like(xh_var).to(device=device)
 
         cur_indices_tensor = torch.tensor(grouped[0], dtype=torch.long, device=device)
         cur_ind_exp = cur_indices_tensor[None, None, :, None].expand(b, t, -1, xh_inv.size(-1))
         
         xh_inv_2 = xh_inv_2.scatter(2, cur_ind_exp, xh_inv[:, :, grouped[0], :])
-        xh_var_2 = xh_var_2.scatter(2, cur_ind_exp, xh_var[:, :, grouped[0], :])
 
         for kh in range(1, self.k+1):
             # Pass if there are no k-hop reach nodes
@@ -292,11 +275,9 @@ class UnnamedKrigModelV5(BaseModel):
                 #     breakpoint()
 
                 rep_inv = xh_inv_2[:, :, rep_indices, :]
-                rep_var = xh_var_2[:, :, rep_indices, :]
             else:
                 rep_adj = alt_adj
                 rep_inv = xh_inv_2
-                rep_var = xh_var_2
 
             # Concatenate t-1, t, t+1 into one vector then pass
             # rep_inv = self.expand_embs(b, rep_inv)
@@ -310,14 +291,10 @@ class UnnamedKrigModelV5(BaseModel):
             xh_inv_0 = self.gcn1(rep_inv, rep_adj[0], rep_adj[1])
             xh_inv_1 = self.layernorm1(xh_inv_0)
 
-            xh_var_0 = self.gcn1(rep_var, rep_adj[0], rep_adj[1])
-            xh_var_1 = self.layernorm1(xh_var_0)
-
             cur_indices_tensor = torch.tensor(cur_indices, dtype=torch.long, device=device)
             cur_ind_exp = cur_indices_tensor[None, None, :, None].expand(b, t, -1, xh_inv_1.size(-1))
 
             xh_inv_2 = xh_inv_2.scatter(2, cur_ind_exp, xh_inv_1[:, :, -len(cur_indices):, :])
-            xh_var_2 = xh_var_2.scatter(2, cur_ind_exp, xh_var_1[:, :, -len(cur_indices):, :])
 
             # huh1 = torch.sum(xh_var_0, dim=(0, 2))
             # huh2 = torch.sum(xh_inv_0, dim=(0, 2))
@@ -329,17 +306,34 @@ class UnnamedKrigModelV5(BaseModel):
             # huh6 = torch.sum(xh_inv_2, dim=(0, 2))
             # yes = 1
 
+        # ========================================
+        # Append the most similar embedding
+        # ========================================
+        # if seened_set != []:
+        #     inv_sim = self.get_sim(xh_inv_2, seened_set, grouped)
+        #     var_sim = self.get_sim(xh_var_2, seened_set, grouped)
+        # else:
+        #     inv_sim = self.get_sim(xh_inv_2, known_set, grouped)
+        #     var_sim = self.get_sim(xh_var_2, known_set, grouped)
+
         xh_inv_3 = xh_inv_2
-        xh_var_3 = xh_var_2
+
+        # xh_inv_3 = torch.cat([xh_inv_2, inv_sim], dim=-1)
+        # xh_var_3 = torch.cat([xh_var_2, var_sim], dim=-1)
+        
+        # xh_inv_3 = self.squeeze1(xh_inv_3)
+        # xh_inv_3 = self.layernorm2(xh_inv_3)
+        # xh_var_3 = self.squeeze1(xh_var_3)
+        # xh_var_3 = self.layernorm2(xh_var_3)
+
+        # xh_inv_3 = self.layernorm2(xh_inv_2 + inv_sim)
+        # xh_var_3 = self.layernorm2(xh_var_2 + var_sim)
 
         # ========================================
         # Final Message Passing
         # ========================================
         xh_inv_3 = self.gcn2(xh_inv_3, gcn_adj[0], gcn_adj[1]) + xh_inv_3
         xh_inv_3 = self.layernorm3(xh_inv_3)
-
-        xh_var_3 = self.gcn2(xh_var_3, gcn_adj[0], gcn_adj[1]) + xh_var_3
-        xh_var_3 = self.layernorm3(xh_var_3)
 
         # xh_inv_3 = rearrange(xh_inv_3, '(b t) n d -> b t n d', b=b, t=t)
         # xh_var_3 = rearrange(xh_var_3, '(b t) n d -> b t n d', b=b, t=t)
@@ -352,50 +346,7 @@ class UnnamedKrigModelV5(BaseModel):
         # MMD of embeddings
         # ========================================
         # Get embedding softmax
-        s_batch = b
-        if self.mmd_ratio < 1.0:
-            s_batch = int(b*self.mmd_ratio)
-            indx = torch.randperm(b, device=device)[:s_batch]
-
-            # xh_inv_sim = rearrange(inv_sim, '(b t) n d -> b t n d', b=b, t=t)
-            # xh_var_sim = rearrange(var_sim, '(b t) n d -> b t n d', b=b, t=t)
-            # sml_inv = xh_inv_sim[indx]
-            # sml_var = xh_var_sim[indx]
-
-            vir_inv = xh_inv_3[indx]
-            vir_var = xh_var_3[indx]
-        
         finrecos = []
-        for i in range(1, self.k+1):
-            prev_group = []
-            cur_group = []
-
-            for j in range(i):
-                prev_group.extend(grouped[j])
-            for j in range(i+1):
-                cur_group.extend(grouped[j])
-
-            # emb_com_inv = sml_inv[:, :, grouped[i]]
-            # emb_com_var = sml_var[:, :, grouped[i]]
-
-            emb_com_inv = vir_inv[:, :, prev_group]
-            # emb_com_var = vir_inv[:, :, prev_group]
-
-            emb_tru_inv = vir_inv[:, :, cur_group]
-            # emb_tru_var = vir_var[:, :, grouped[i]]
-
-            emb_com_inv = rearrange(emb_com_inv, 'b t n d -> b (t n) d')
-            # emb_com_var = rearrange(emb_com_var, 'b t n d -> b (t n) d')
-            emb_tru_inv = rearrange(emb_tru_inv, 'b t n d -> b (t n) d')
-            # emb_tru_var = rearrange(emb_tru_var, 'b t n d -> b (t n) d')
-
-            # emb_com_inv = emb_com_inv
-            # emb_com_var = emb_com_var.detach()
-
-            if emb_tru_inv.numel() == 0:
-                continue
-            else:
-                finrecos.append([s_batch, emb_com_inv, emb_tru_inv])
 
         # ========================================
         # Disentanglement module
@@ -403,20 +354,6 @@ class UnnamedKrigModelV5(BaseModel):
         # Predict the real nodes by propagating back using both variant and invariant features
         # Get IRM loss
         fin_irm_all = []
-        for _ in range(self.steps):
-            seen_invr = xh_inv_3[:, :, :len(known_set)]
-            seen_vars = xh_var_3[:, :, :len(known_set)]
-            
-            seen_vars_l = rearrange(seen_vars, 'b t n d -> b (t n) d', b=b, t=t)
-            s_rands = torch.randperm(seen_vars_l.shape[1])
-            rand_seen = seen_vars_l[:, s_rands, :].detach()
-
-            rand_seen = rearrange(rand_seen, 'b (t n) d -> b t n d', t=t)
-            fin_vars = torch.cat((seen_invr, rand_seen), dim=-1)
-            fin_irm = self.readout3(fin_vars)
-            fin_irm_all.append(fin_irm)
-
-        fin_irm_all = torch.stack(fin_irm_all)
 
         return finpreds, finrecos, fin_irm_all
 
@@ -495,71 +432,3 @@ class UnnamedKrigModelV5(BaseModel):
             print('error')
 
         return adj_aug_n1, levels
-
-    def scaled_dot_product_mhattention(self, x_fwd, edge_index, att_window, att_heads):
-        device = x_fwd.device
-        srcs = edge_index[0, :].T
-        tars = edge_index[1, :].T
-
-        tar_nodes = x_fwd[:, :, tars]
-        src_nodes = x_fwd[:, :, srcs]
-
-        B, T, N, D = tar_nodes.shape
-        assert T >= 2 * att_window + 1
-        assert D % att_heads == 0
-        
-        d_k = D // att_heads
-
-        # Time encoding
-        tar_nodes = rearrange(tar_nodes, 'b t n d -> t (b n) d')
-        tar_nodes = self.time_emb(tar_nodes, torch.LongTensor(list(range(T))).to(device))
-        tar_fwd = rearrange(tar_nodes, 't (b n) d -> t b n d', b=B, n=N)
-
-        src_nodes = rearrange(src_nodes, 'b t n d -> t (b n) d')
-        src_nodes = self.time_emb(src_nodes, torch.LongTensor(list(range(T))).to(device))
-        src_fwd = rearrange(src_nodes, 't (b n) d -> t b n d', b=B, n=N)
-
-        # Get the Q, K, V
-        q_mat = self.query(tar_fwd).view(T, B, N, att_heads, d_k)
-        k_mat = self.key(src_fwd).view(T, B, N, att_heads, d_k) 
-        v_mat = self.value(src_fwd).view(T, B, N, att_heads, d_k)
-
-        # Message and attention scores
-        res_atts = (q_mat * k_mat).sum(dim=-1) / math.sqrt(d_k)
-        res_msgs = v_mat
-
-        padded_att = F.pad(res_atts, (0, 0, 0, 0, 0, 0, att_window, att_window))
-        padded_msg = F.pad(res_msgs, (0, 0, 0, 0, 0, 0, 0, 0, att_window, att_window))
-        
-        context_att = []
-        context_msg = []
-        for offset in range(-att_window, att_window + 1):
-            context_att.append(padded_att[att_window + offset : att_window + offset + T])  # [T, B, E, D]
-            context_msg.append(padded_msg[att_window + offset : att_window + offset + T])  # [T, B, E, D]
-
-        # [T, B, N*(att_window*2 + 1), D]
-        res_att_og = torch.cat(context_att, dim=2)
-        res_msg = torch.cat(context_msg, dim=2)
-
-        ei_tar = tars.repeat(att_window*2 + 1)
-
-        res_att = softmax(res_att_og, ei_tar, dim=2)
-        t, b, n = res_att.shape[0], res_att.shape[1], res_att.shape[2]
-        res = res_msg * res_att.view(t, b, n, att_heads, 1)  
-        res = res.view(t, b, n, D)
-
-        spu_att = softmax(-res_att_og, ei_tar, dim=2)
-        t, b, n = spu_att.shape[0], spu_att.shape[1], spu_att.shape[2]
-        spu = res_msg * spu_att.view(t, b, n, att_heads, 1)  
-        spu = spu.view(t, b, n, D)
-
-        causal_hat = scatter(res, ei_tar, dim=2, dim_size=x_fwd.shape[2], reduce='add')  # [N,F]
-        spurious_hat = scatter(spu, ei_tar, dim=2, dim_size=x_fwd.shape[2], reduce='add')  # [N,F]
-
-        causal_hat = rearrange(causal_hat, 't b n d -> b t n d')
-        spurious_hat = rearrange(spurious_hat, 't b n d -> b t n d')
-
-        output_invars = self.out_proj(self.layernorm0(causal_hat+x_fwd))
-        output_vars = self.out_proj(self.layernorm0(spurious_hat))
-
-        return output_invars, output_vars

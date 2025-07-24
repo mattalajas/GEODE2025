@@ -329,7 +329,13 @@ def test_wise_eval(y_hat, y_true, mask, known_nodes, adj, mode, num_groups=4, al
         results = {'mae':[], 'mre':[], 'rmse':[]}
         for group in groups:
             node_mask = np.zeros_like(mask, dtype=bool)
-            node_mask[:, :, group] = True
+            if len(node_mask.shape) == 4:
+                node_mask[:, :, group] = True
+            elif len(node_mask.shape) == 3:
+                node_mask[:, group] = True
+            else:
+                raise 'node_mask dim only 3 or 2'
+            
             masked_adj = mask * node_mask
 
             # nonzero_mask = masked_adj != 0  # shape: D x T x N
@@ -363,5 +369,10 @@ def test_wise_eval(y_hat, y_true, mask, known_nodes, adj, mode, num_groups=4, al
             res[f'wdp_{metric}_{key}_{mode}'] = wdp
             res[f'wsd_{metric}_{key}_{mode}'] = wsd
             res[f'wcv_{metric}_{key}_{mode}'] = wcv
+        
+        if num_groups == 5:
+            res[f'all_mae_{key}_{mode}'] = results['mae']
+            res[f'all_mre_{key}_{mode}'] = results['mre']
+            res[f'all_rmse_{key}_{mode}'] = results['rmse']
     
     return res    

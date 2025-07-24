@@ -280,8 +280,8 @@ class EAGLE(BaseModel):
         extract_env = rearrange(extract_env, 'a b c d e -> a b (c d) e')
         extract_env = extract_env[:, :, torch.randperm(times * n), :]
         for i in range(k):
-            zero_rows = (extract_env[:, i].sum(dim=2) == 0).nonzero(as_tuple=True)[0]
-            non_zero_rows = (extract_env[:, i].sum(dim=2) != 0).nonzero(as_tuple=True)[0]
+            zero_rows = (extract_env[:, i].sum(dim=0) == 0).nonzero(as_tuple=True)[0]
+            non_zero_rows = (extract_env[:, i].sum(dim=0) != 0).nonzero(as_tuple=True)[0]
             if non_zero_rows.shape[0] > 0:
                 replacement_rows = non_zero_rows[
                     torch.randint(0, non_zero_rows.shape[0], (zero_rows.shape[0],))
