@@ -2,23 +2,24 @@ defaults:
   - _self_
   - logger: null
   - dataset: metrla
-  - model: evolvegcn
+  - model: unkrigv5woCRLRA
 
 #### Experiment params ########################################################
 hydra:
   run:
-    # dir: logs/kits/air/2025-05-03/12-20-42
+    # dir: logs/unkrigv5/aqi/2025-06-19/19-32-15
     dir: logs/${model.name}/${dataset.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
   sweep:
     dir: logs/${now:%Y-%m-%d-%H-%M-%S}
     subdir: ${model.name}/${dataset.name}/${hydra.job.num}
 
-# seed: 420  # automatically set everywhere the seed
+# seed: 87654321  # automatically set everywhere the seed
 tags:
   - ${model.name}
   - ${dataset.name}
 
 # Replace with the last ckpt file to resume training
+# call_path: logs/unkrigv5/aqi/2025-06-19/19-32-15/epoch=82-last.ckpt
 call_path: null
 workers: 0
 num_threads: 1  # limit the number of pytorch threads spawn
@@ -30,9 +31,11 @@ window: 24
 stride: 1
 
 #### Training params ##########################################################
-epochs: 100
-patience: 25
+epochs: 200
+patience: 50
 batch_size: 64
+grad_clip_val: 1
+grad_clip_alg: 'norm'
 scale_target: True
 whiten_prob: 0.05
 prediction_loss_weight: 1
@@ -49,11 +52,11 @@ scaling_axis: 'global'  # ['channels', 'global']
 optimizer:
   name: Adam
   hparams:
-    lr: 0.01
+    lr: 0.00007
     weight_decay: 0.
 
 lr_scheduler:
-  name: MultiStepLR
+  name: CosineAnnealingLR
   hparams:
-    gamma: 0.1
-    milestones: [ 20, 30, 40 ]
+      eta_min: 0.0001
+      T_max: ${ epochs }

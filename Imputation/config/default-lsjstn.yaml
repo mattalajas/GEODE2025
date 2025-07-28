@@ -32,7 +32,7 @@ stride: 1
 #### Training params ##########################################################
 epochs: 100
 patience: 25
-batch_size: 64
+batch_size: 16
 grad_clip_val: 1
 grad_clip_alg: 'norm'
 scale_target: True
@@ -42,6 +42,7 @@ impute_only_missing: False
 warm_up_steps: 0
 device: [0]
 eval_setting: 'train_wise'
+num_groups: 4
 
 detrend: False
 scale: True
