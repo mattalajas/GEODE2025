@@ -7,7 +7,7 @@ order: 0
 node_features: c_centrality
 
 # Point
-mode: 'region'
+mode: road
 p_fault: 0.
 p_noise: 0.25
 

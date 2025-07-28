@@ -1,2 +1,0 @@
-python3 Imputation/Grin.py '+seed=16849815' 'model=unkrigv3' 'model.hparams.k=4' 'device=[3]' 'optimizer.hparams_1.lr=0.00007' 'optimizer.hparams_1.weight_decay=0.' 'model.hparams.gcn_layers=2' 'model.hparams.enc_layers=2' 'model.regs.y1=0.8'
-python3 Imputation/Grin.py '+seed=16849815' 'model=unkrigv3' 'model.hparams.k=4' 'device=[3]' 'optimizer.hparams_1.lr=0.00007' 'optimizer.hparams_1.weight_decay=0.' 'model.hparams.gcn_layers=2' 'model.hparams.enc_layers=2' 'model.regs.y1=0.5'

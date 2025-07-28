@@ -1,4 +1,0 @@
-name: 'increase'
-hparams:
-  K: 5
-  hidden_size: 64

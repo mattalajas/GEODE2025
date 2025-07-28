@@ -1,7 +1,0 @@
-name: 'evolvegcn'
-hparams:
-  hidden_size: 128
-  n_layers: 2
-  norm: none
-  variant: O
-  root_weight: False

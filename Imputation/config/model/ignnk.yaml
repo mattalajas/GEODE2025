@@ -1,5 +1,0 @@
-name: 'ignnk'
-n_o_n_m: 150 #sampled space dimension
-hparams:
-  z: 100 #hidden dimension for graph convolution
-  k: 1 #If using diffusion convolution, the actual diffusion convolution step is K+1

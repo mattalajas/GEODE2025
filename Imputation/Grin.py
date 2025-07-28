@@ -1,6 +1,4 @@
-import argparse
 import torch
-import math
 from omegaconf import DictConfig
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
@@ -11,141 +9,21 @@ import numpy as np
 from tsl import logger
 from tsl.data import ImputationDataset, SpatioTemporalDataModule
 from tsl.data.preprocessing import StandardScaler
-from tsl.datasets import AirQuality, MetrLA, PeMS07, PvUS, LargeST, ElectricityBenchmark, PeMS04, Elergone, PemsBay
-from tsl.datasets.prototypes import casting
-from tsl.engines import Imputer
+from tsl.datasets import AirQuality, MetrLA, PeMS07, PvUS, LargeST, PeMS04
 from tsl.experiment import Experiment
 from tsl.metrics import numpy as numpy_metrics
 from tsl.metrics import torch as torch_metrics
-from tsl.nn.models import (BiRNNImputerModel, GRINModel, RNNImputerModel,
-                           SPINHierarchicalModel, SPINModel)
-from tsl.ops import similarities as sims
 from tsl.transforms import MaskInput
 from tsl.utils.casting import torch_to_numpy
 
-from my_datasets import AirQualitySmaller, AirQualityAuckland, AirQualityKrig, add_missing_sensors
-from baselines.KITS import KITS
-from baselines.IGNNK import IGNNK
-from baselines.DIDA import DGNN
-from baselines.CauSTG import CauSTG
-from baselines.IGNNK import IGNNK
-from baselines.LSJSTN import LSJSTN
-from baselines.EAGLE import EAGLE
-from baselines.DYSAT import DySAT
-from baselines.EVOLVEGCN import EvolveGCNModel
-from baselines.DCRNN import DCRNNModel
-from baselines.INCREASE import INCREASE
-from fillers.KITS_filler import GCNCycVirtualFiller
-from fillers.unnamed_filler import UnnamedKrigFiller
-from fillers.unnamed_filler_v2 import UnnamedKrigFillerV2
-from fillers.unnamed_filler_v4 import UnnamedKrigFillerV4
-from fillers.unnamed_filler_v5 import UnnamedKrigFillerV5
-from fillers.DIDA_filler import DidaFiller
-from fillers.CauSTG_filler import CauSTGFiller
-from fillers.IGNNK_filler import IGNNKFiller
-from fillers.LSJSTN_filler import LSJSTNFiller
-from fillers.EAGLE_filler import EAGLEfiller
-from fillers.DYSAT_filler import DYSATFiller
-from fillers.Standard_filler import StandardFiller
-from fillers.INCREASE_filler import INCREASEFiller
-from unnamedKrig import UnnamedKrigModel
-from unnamedKrig_v2 import UnnamedKrigModelV2
-from unnamedKrig_v3 import UnnamedKrigModelV3
-from unnamedKrig_v4 import UnnamedKrigModelV4
-from unnamedKrig_v5 import UnnamedKrigModelV5
-from unnamedKrig_v5_woCRL import UnnamedKrigModelV5woCRL
-from unnamedKrig_v5_woRA import UnnamedKrigModelV5WoRA
-from unnamedKrig_v5_woCRLRA import UnnamedKrigModelV5woCRLRA
+from my_datasets import add_missing_sensors
 
-from utils import month_splitter, test_wise_eval
+from geode import Geode
+from geode_filler import GeodeFiller
+from utils import test_wise_eval
 
-MODELS = ['kits', 'unkrig', 'unkrigv2', 'unkrigv3', 'unkrigv4', 'unkrigv5', 'unkrigv5woRA', 'unkrigv5woCRL', 
-          'unkrigv5woCRLRA','ignnk', 'lsjstn', 'caustg', 'eagle', 'dida', 'dysat', 'evolvegcn', 'dcrnn', 'increase']
-
-def get_model_class(model_str):
-    if model_str == 'rnni':
-        model = RNNImputerModel
-    elif model_str == 'birnni':
-        model = BiRNNImputerModel
-    elif model_str == 'grin':
-        model = GRINModel
-    elif model_str == 'spin':
-        model = SPINModel
-    elif model_str == 'spin-h':
-        model = SPINHierarchicalModel
-    elif model_str == 'kits':
-        model = KITS
-    elif model_str == 'unkrig':
-        model = UnnamedKrigModel
-    elif model_str == 'unkrigv2':
-        model = UnnamedKrigModelV2
-    elif model_str == 'unkrigv3':
-        model = UnnamedKrigModelV3
-    elif model_str == 'unkrigv4':
-        model = UnnamedKrigModelV4
-    elif model_str == 'unkrigv5':
-        model = UnnamedKrigModelV5
-    elif model_str == 'unkrigv5woCRL':
-        model = UnnamedKrigModelV5woCRL
-    elif model_str == 'unkrigv5woCRLRA':
-        model = UnnamedKrigModelV5woCRLRA
-    elif model_str == 'unkrigv5woRA':
-        model = UnnamedKrigModelV5WoRA
-    elif model_str == 'ignnk':
-        model = IGNNK
-    elif model_str == 'dida':
-        model = DGNN
-    elif model_str == 'caustg':
-        model = CauSTG
-    elif model_str == 'lsjstn':
-        model = LSJSTN
-    elif model_str == 'eagle':
-        model = EAGLE
-    elif model_str == 'dysat':
-        model = DySAT
-    elif model_str == 'evolvegcn':
-        model = EvolveGCNModel
-    elif model_str == 'dcrnn':
-        model = DCRNNModel
-    elif model_str == 'increase':
-        model = INCREASE
-    else:
-        raise NotImplementedError(f'Model "{model_str}" not available.')
-    return model
-
-
-def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-01', '2022-12-01'],
-                masked_s=None, agg_func = 'mean', test_month=[5], location='Auckland', connectivity=None, mode='road',
+def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, connectivity=None, mode='road',
                 spatial_shift=False, order=0, node_features='c_centrality'):
-    if dataset_name == 'air':
-        return AirQualityKrig(impute_nans=True, small=True, masked_sensors=masked_s, p=p_noise), masked_s
-    if dataset_name == 'air_smaller':
-        return AirQualitySmaller('data', impute_nans=True, masked_sensors=masked_s), masked_s
-    if dataset_name == 'air_auckland' or dataset_name == 'air_invercargill1' or dataset_name == 'air_invercargill2':
-        air_data = AirQualityAuckland('data', t_range=t_range, masked_sensors=masked_s, 
-                                  agg_func=agg_func, test_months=test_month,
-                                  location=location, p=p_noise)
-        
-        return add_missing_sensors(air_data,
-                            p_fault=p_fault,
-                            p_noise=p_noise,
-                            min_seq=12,
-                            max_seq=12 * 4, 
-                            masked_sensors=masked_s,
-                            connect=connectivity,
-                            mode=mode,
-                            spatial_shift=spatial_shift,
-                            order=order,
-                            node_features=node_features)
-        
-
-    if dataset_name.endswith('_point'):
-        p_fault, p_noise = 0., 0.25
-        dataset_name = dataset_name[:-6]
-    if dataset_name.endswith('_block'):
-        p_fault, p_noise = 0.0015, 0.05
-        dataset_name = dataset_name[:-6]
-
     if dataset_name == 'aqi':
         return add_missing_sensors(AirQuality(),
                                   p_fault=p_fault,
@@ -158,7 +36,6 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-0
                                   spatial_shift=spatial_shift,
                                   order=order,
                                   node_features=node_features)
-
     if dataset_name == 'aqism':
         return add_missing_sensors(AirQuality(small=True),
                                   p_fault=p_fault,
@@ -171,7 +48,6 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-0
                                   spatial_shift=spatial_shift,
                                   order=order,
                                   node_features=node_features)
-    
     if dataset_name == 'metrla':
         return add_missing_sensors(MetrLA(freq='5T'),
                                   p_fault=p_fault,
@@ -201,24 +77,6 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-0
                                   spatial_shift=spatial_shift,
                                   order=order,
                                   node_features=node_features)
-    if dataset_name == 'pemsbay':
-        pems = PemsBay()
-
-        masks = np.ones((pems.target.shape[0], pems.target.shape[1], 1))
-        pems.set_mask(masks)
-        
-        return add_missing_sensors(pems,
-                                  p_fault=p_fault,
-                                  p_noise=p_noise,
-                                  min_seq=12,
-                                  max_seq=12 * 4,
-                                  masked_sensors=masked_s,
-                                  connect=connectivity,
-                                  mode=mode,
-                                  spatial_shift=spatial_shift,
-                                  order=order,
-                                  node_features=node_features)
-    
     if dataset_name == 'pem04':
         pems = PeMS04()
 
@@ -236,7 +94,6 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-0
                                   spatial_shift=spatial_shift,
                                   order=order,
                                   node_features=node_features)
-
     if dataset_name == 'nrel-al':
         pv_us = PvUS(zones='east')
         pv_us.metadata = pv_us.metadata[:137]
@@ -257,7 +114,6 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-0
                                   spatial_shift=spatial_shift,
                                   order=order,
                                   node_features=node_features)
-
     if dataset_name == 'nrel-md':
         pv_us = PvUS(zones='east')
         pv_us.metadata = pv_us.metadata[1746: 1826]
@@ -278,7 +134,6 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-0
                                   spatial_shift=spatial_shift,
                                   order=order,
                                   node_features=node_features)
-    
     if dataset_name == 'sd':
         return add_missing_sensors(LargeST(subset='SD', year=[2019, 2020]),
                                   p_fault=p_fault,
@@ -291,32 +146,6 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., t_range = ['2022-04-0
                                   spatial_shift=spatial_shift,
                                   order=order,
                                   node_features=node_features)
-
-    if dataset_name == 'electricity':
-        df = ElectricityBenchmark()
-
-        df.similarity_options = 'precomputed'
-        train_df = df.dataframe()
-        x = np.asarray(train_df) * df.mask[..., -1]
-        period = casting.to_pandas_freq('1D').nanos // df.freq.nanos
-        x = (x - x.mean()) / x.std()
-
-        sim = sims.correntropy(x, period=period, mask=df.mask, gamma=10)
-
-        def compute_similarity(self):
-            return sim
-        df.compute_similarity = compute_similarity
-        
-        return add_missing_sensors(df,
-                                  p_fault=p_fault,
-                                  p_noise=p_noise,
-                                  min_seq=12,
-                                  max_seq=12 * 4,
-                                  masked_sensors=masked_s,
-                                  connect=connectivity,
-                                  mode=mode,
-                                  )
-
     raise ValueError(f"Dataset {dataset_name} not available in this setting.")
 
 def run_imputation(cfg: DictConfig):
@@ -329,11 +158,7 @@ def run_imputation(cfg: DictConfig):
     dataset, masked_sensors = get_dataset(cfg.dataset.name,
                             p_fault=cfg.dataset.get('p_fault'),
                             p_noise=cfg.dataset.get('p_noise'),
-                            t_range=cfg.dataset.get('t_range'),
                             masked_s=cfg.dataset.get('masked_sensors'),
-                            agg_func=cfg.dataset.get('agg_func'),
-                            test_month=cfg.dataset.get('test_month'),
-                            location=cfg.dataset.get('location'),
                             connectivity=cfg.dataset.get('connectivity'),
                             mode=cfg.dataset.get('mode'),
                             spatial_shift=cfg.dataset.get('spatial_shift'),
@@ -342,120 +167,45 @@ def run_imputation(cfg: DictConfig):
 
     print(f'Masked sensors: {masked_sensors}')
 
-    # encode time of the day and use it as exogenous variable
-    # covariates = {'u': dataset.datetime_encoded('day').values}
-
     # get adjacency matrix
-    if cfg.model.name in MODELS:
-        adj = dataset.get_connectivity(**cfg.dataset.connectivity, layout='dense')
-    else:
-        adj = dataset.get_connectivity(**cfg.dataset.connectivity)
-    # u = np.expand_dims(covariates['u'], axis=1)
-    # covariates['u'] = np.repeat(u, max(adj[0]), axis=1)
-    # print(covariates['u'].shape)
+    adj = dataset.get_connectivity(**cfg.dataset.connectivity)
 
     # instantiate dataset
-
     torch_dataset = ImputationDataset(target=dataset.dataframe(),
                                       mask=dataset.training_mask,
                                       eval_mask=dataset.eval_mask,
-                                    #   covariates=covariates,
                                       transform=MaskInput(),
                                       connectivity=adj,
                                       window=cfg.window,
                                       stride=cfg.stride)
 
     scalers = {'target': StandardScaler(axis=(0, 1))}
-
-    if cfg.dataset.get('shift', False):
-        dataset.get_splitter = month_splitter
-
-        dm = SpatioTemporalDataModule(
-            dataset=torch_dataset,
-            scalers=scalers,
-            splitter=dataset.get_splitter(**cfg.dataset.splitting),
-            batch_size=cfg.batch_size,
-            workers=cfg.workers)
-    else:
-        val_len = cfg.dataset.splitting.get('val_len')
-        test_len = cfg.dataset.splitting.get('test_len')
-        dm = SpatioTemporalDataModule(
-            dataset=torch_dataset,
-            scalers=scalers,
-            splitter=dataset.get_splitter(val_len=val_len, test_len=test_len),
-            batch_size=cfg.batch_size,
-            workers=cfg.workers)
+    val_len = cfg.dataset.splitting.get('val_len')
+    test_len = cfg.dataset.splitting.get('test_len')
+    dm = SpatioTemporalDataModule(
+        dataset=torch_dataset,
+        scalers=scalers,
+        splitter=dataset.get_splitter(val_len=val_len, test_len=test_len),
+        batch_size=cfg.batch_size,
+        workers=cfg.workers)
     dm.setup(stage='fit')
-
-    print(f'train_times: {np.unique(dataset.dataframe().iloc[dm.train_dataloader().dataset.indices].index.month)}, \
-          test_times: {np.unique(dataset.dataframe().iloc[dm.test_dataloader().dataset.indices].index.month)}')
-
-    if cfg.get('in_sample', False):
-        dm.trainset = list(range(len(torch_dataset)))
 
     ########################################
     # imputer                              #
     ########################################
 
-    model_cls = get_model_class(cfg.model.name)
-    
-    if cfg.model.name == 'kits':
-        model_kwargs = dict(adj=adj, d_in=dm.n_channels, n_nodes=dm.n_nodes, args=cfg.model)
-    elif cfg.model.name == 'unkrig':
-        model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
-    elif cfg.model.name == 'unkrigv2':
-        model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
-    elif cfg.model.name == 'unkrigv3':
-        model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
-    elif cfg.model.name == 'unkrigv4':
-        model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
-    elif cfg.model.name == 'unkrigv5' or cfg.model.name == 'unkrigv5woCRL' or cfg.model.name == 'unkrigv5woCRLRA' or cfg.model.name == 'unkrigv5woRA':
-        model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
-    elif cfg.model.name == 'ignnk':
-        model_kwargs = dict(h=cfg.window)
-    elif cfg.model.name == 'dida':
-        model_kwargs = dict(nfeat=dm.n_channels, output_size=dm.n_channels, 
-                            num_nodes=adj.shape[0], args=cfg.model.hparams)
-    elif cfg.model.name == 'caustg':
-        model_kwargs = dict(in_dim=dm.n_channels, out_dim=cfg.window, args=cfg.model.hparams)
-    elif cfg.model.name == 'lsjstn':
-        model_kwargs = dict(in_dim=dm.n_channels)
-    elif cfg.model.name == 'dysat':
-        model_kwargs = dict(num_features=dm.n_channels, time_length=cfg.window)
-    elif cfg.model.name == 'eagle':
-        model_kwargs = dict(nfeat=dm.n_channels, output_size=dm.n_channels, 
-                            num_nodes=adj.shape[0], args=cfg.model.hparams)
-    elif cfg.model.name == "dcrnn" or cfg.model.name == "evolvegcn":
-        model_kwargs = dict(input_size=torch_dataset.n_channels,
-                            output_size=dm.n_channels,
-                            horizon=cfg.window)
-    elif cfg.model.name == 'increase':
-        model_kwargs = dict(input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
-    else:
-        model_kwargs = dict(n_nodes=torch_dataset.n_nodes,
-                            input_size=torch_dataset.n_channels)
+    model_cls = Geode
 
+    model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
     model_cls.filter_model_args_(model_kwargs)
+    loss_fn = torch_metrics.MaskedMAE()
 
     model_kwargs.update(cfg.model.hparams)
-
-    if cfg.model.name in ['unkrig', 'unkrigv2', 'unkrigv3', 'unkrigv4']:
-        loss_fn = [torch_metrics.MaskedMAE(), torch_metrics.MaskedMSE()]
-    elif cfg.model.name in ['ignnk', 'increase']:
-        loss_fn = torch_metrics.MaskedMSE()
-    elif cfg.model.name in ['kits', 'unkrigv5', 'unkrigv5woRA', 'unkrigv5woCRL', 
-                            'unkrigv5woCRLRA', 'lsjstn', 'dida', 
-                            'caustg', 'eagle', 'dysat', 'evolvegcn',
-                            'dcrnn']:
-        loss_fn = torch_metrics.MaskedMAE()
-    else:
-        raise f'{cfg.model.name} not implemented'
 
     log_metrics = {
         'mae': torch_metrics.MaskedMAE(),
         'mse': torch_metrics.MaskedMSE(),
-        'mre': torch_metrics.MaskedMRE(),
-        'mape': torch_metrics.MaskedMAPE()
+        'mre': torch_metrics.MaskedMRE()
     }
 
     if cfg.lr_scheduler is not None:
@@ -464,254 +214,23 @@ def run_imputation(cfg: DictConfig):
         scheduler_kwargs = dict(cfg.lr_scheduler.hparams)
     else:
         scheduler_class = scheduler_kwargs = None
-
-    # setup imputer
-    if cfg.model.name =='kits':
-        imputer = GCNCycVirtualFiller(model_class=model_cls,
-                                    model_kwargs=model_kwargs,
-                                    optim_class=getattr(torch.optim, cfg.optimizer.name),
-                                    optim_kwargs=dict(cfg.optimizer.hparams),
-                                    loss_fn=loss_fn,
-                                    scaled_target=cfg.scale_target,
-                                    whiten_prob=cfg.whiten_prob,
-                                    pred_loss_weight=cfg.prediction_loss_weight,
-                                    warm_up=cfg.warm_up_steps,
-                                    metrics=log_metrics,
-                                    scheduler_class=scheduler_class,
-                                    scheduler_kwargs=scheduler_kwargs,
-                                    gradient_clip_val=cfg.grad_clip_val,
-                                    gradient_clip_algorithm=cfg.grad_clip_alg,
-                                    known_nodes = [i for i in range(adj.shape[0]) if i not in masked_sensors],
-                                    **cfg.model.technique)
-    elif cfg.model.name == "unkrig":
-        imputer = UnnamedKrigFiller(model_class=model_cls,
-                                    model_kwargs=model_kwargs,
-                                    optim_class=[getattr(torch.optim, cfg.optimizer.name_1), 
-                                                 getattr(torch.optim, cfg.optimizer.name_2)],
-                                    optim_kwargs=[dict(cfg.optimizer.hparams_1),
-                                                  dict(cfg.optimizer.hparams_2)],
-                                    loss_fn=loss_fn,
-                                    scaled_target=cfg.scale_target,
-                                    whiten_prob=cfg.whiten_prob,
-                                    pred_loss_weight=cfg.prediction_loss_weight,
-                                    warm_up=cfg.warm_up_steps,
-                                    metrics=log_metrics,
-                                    scheduler_class=scheduler_class,
-                                    scheduler_kwargs=scheduler_kwargs,
-                                    gradient_clip_val=cfg.grad_clip_val,
-                                    gradient_clip_algorithm=cfg.grad_clip_alg,
-                                    known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
-                                    **cfg.model.regs)
-    elif cfg.model.name == "unkrigv2" or cfg.model.name == "unkrigv3":
-        imputer = UnnamedKrigFillerV2(model_class=model_cls,
-                            model_kwargs=model_kwargs,
-                            optim_class=[getattr(torch.optim, cfg.optimizer.name_1), 
-                                         getattr(torch.optim, cfg.optimizer.name_2)],
-                            optim_kwargs=[dict(cfg.optimizer.hparams_1),
-                                          dict(cfg.optimizer.hparams_2)],
-                            loss_fn=loss_fn,
-                            scaled_target=cfg.scale_target,
-                            whiten_prob=cfg.whiten_prob,
-                            pred_loss_weight=cfg.prediction_loss_weight,
-                            warm_up=cfg.warm_up_steps,
-                            metrics=log_metrics,
-                            scheduler_class=scheduler_class,
-                            scheduler_kwargs=scheduler_kwargs,
-                            gradient_clip_val=cfg.grad_clip_val,
-                            gradient_clip_algorithm=cfg.grad_clip_alg,
-                            known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
-                            **cfg.model.regs)
-    elif cfg.model.name == "unkrigv4":
-        imputer = UnnamedKrigFillerV4(model_class=model_cls,
-                            model_kwargs=model_kwargs,
-                            optim_class=[getattr(torch.optim, cfg.optimizer.name_1), 
-                                         getattr(torch.optim, cfg.optimizer.name_2)],
-                            optim_kwargs=[dict(cfg.optimizer.hparams_1),
-                                          dict(cfg.optimizer.hparams_2)],
-                            loss_fn=loss_fn,
-                            scaled_target=cfg.scale_target,
-                            whiten_prob=cfg.whiten_prob,
-                            pred_loss_weight=cfg.prediction_loss_weight,
-                            warm_up=cfg.warm_up_steps,
-                            metrics=log_metrics,
-                            scheduler_class=scheduler_class,
-                            scheduler_kwargs=scheduler_kwargs,
-                            gradient_clip_val=cfg.grad_clip_val,
-                            gradient_clip_algorithm=cfg.grad_clip_alg,
-                            known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
-                            **cfg.model.regs)
-    elif cfg.model.name == "unkrigv5" or cfg.model.name == 'unkrigv5woCRL' or cfg.model.name == 'unkrigv5woCRLRA' or cfg.model.name == 'unkrigv5woRA':
-        imputer = UnnamedKrigFillerV5(model_class=model_cls,
-                            model_kwargs=model_kwargs,
-                            optim_class=getattr(torch.optim, cfg.optimizer.name),
-                            optim_kwargs=dict(cfg.optimizer.hparams),
-                            loss_fn=loss_fn,
-                            scaled_target=cfg.scale_target,
-                            whiten_prob=cfg.whiten_prob,
-                            pred_loss_weight=cfg.prediction_loss_weight,
-                            warm_up=cfg.warm_up_steps,
-                            metrics=log_metrics,
-                            scheduler_class=scheduler_class,
-                            scheduler_kwargs=scheduler_kwargs,
-                            gradient_clip_val=cfg.grad_clip_val,
-                            gradient_clip_algorithm=cfg.grad_clip_alg,
-                            known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
-                            **cfg.model.regs)
-    elif cfg.model.name == "dida":
-        imputer = DidaFiller(model_class=model_cls,
-                            model_kwargs=model_kwargs,
-                            optim_class=getattr(torch.optim, cfg.optimizer.name),
-                            optim_kwargs=dict(cfg.optimizer.hparams),
-                            loss_fn=loss_fn,
-                            scaled_target=cfg.scale_target,
-                            whiten_prob=cfg.whiten_prob,
-                            pred_loss_weight=cfg.prediction_loss_weight,
-                            warm_up=cfg.warm_up_steps,
-                            metrics=log_metrics,
-                            scheduler_class=scheduler_class,
-                            scheduler_kwargs=scheduler_kwargs,
-                            gradient_clip_val=cfg.grad_clip_val,
-                            gradient_clip_algorithm=cfg.grad_clip_alg,
-                            known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
-                            adj=adj,
-                            horizon=cfg.window,
-                            **cfg.model.regs)
-    elif cfg.model.name == "eagle":
-        imputer = EAGLEfiller(model_class=model_cls,
-                            model_kwargs=model_kwargs,
-                            optim_class=getattr(torch.optim, cfg.optimizer.name),
-                            optim_kwargs=dict(cfg.optimizer.hparams),
-                            loss_fn=loss_fn,
-                            scaled_target=cfg.scale_target,
-                            whiten_prob=cfg.whiten_prob,
-                            pred_loss_weight=cfg.prediction_loss_weight,
-                            warm_up=cfg.warm_up_steps,
-                            metrics=log_metrics,
-                            scheduler_class=scheduler_class,
-                            scheduler_kwargs=scheduler_kwargs,
-                            gradient_clip_val=cfg.grad_clip_val,
-                            gradient_clip_algorithm=cfg.grad_clip_alg,
-                            known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
-                            adj=adj,
-                            horizon=cfg.window,
-                            **cfg.model.regs)
-    elif cfg.model.name == "caustg":
-        imputer = CauSTGFiller(model_class=model_cls,
-                            model_kwargs=model_kwargs,
-                            optim_class=getattr(torch.optim, cfg.optimizer.name),
-                            optim_kwargs=dict(cfg.optimizer.hparams),
-                            loss_fn=loss_fn,
-                            scaled_target=cfg.scale_target,
-                            whiten_prob=cfg.whiten_prob,
-                            pred_loss_weight=cfg.prediction_loss_weight,
-                            warm_up=cfg.warm_up_steps,
-                            metrics=log_metrics,
-                            scheduler_class=scheduler_class,
-                            scheduler_kwargs=scheduler_kwargs,
-                            gradient_clip_val=cfg.grad_clip_val,
-                            gradient_clip_algorithm=cfg.grad_clip_alg,
-                            known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
-                            adj=adj,
-                            device=cfg.device,
-                            **cfg.model.regs)
-    elif cfg.model.name == "ignnk":
-        imputer = IGNNKFiller(model_class=model_cls,
-                            model_kwargs=model_kwargs,
-                            optim_class=getattr(torch.optim, cfg.optimizer.name),
-                            optim_kwargs=dict(cfg.optimizer.hparams),
-                            loss_fn=loss_fn,
-                            scaled_target=cfg.scale_target,
-                            whiten_prob=cfg.whiten_prob,
-                            pred_loss_weight=cfg.prediction_loss_weight,
-                            warm_up=cfg.warm_up_steps,
-                            metrics=log_metrics,
-                            scheduler_class=scheduler_class,
-                            scheduler_kwargs=scheduler_kwargs,
-                            gradient_clip_val=cfg.grad_clip_val,
-                            gradient_clip_algorithm=cfg.grad_clip_alg,
-                            known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
-                            adj=adj,
-                            n_o_n_m=cfg.model.n_o_n_m)
-    elif cfg.model.name == "lsjstn":
-        imputer = LSJSTNFiller(model_class=model_cls,
-                            model_kwargs=model_kwargs,
-                            optim_class=getattr(torch.optim, cfg.optimizer.name),
-                            optim_kwargs=dict(cfg.optimizer.hparams),
-                            loss_fn=loss_fn,
-                            scaled_target=cfg.scale_target,
-                            whiten_prob=cfg.whiten_prob,
-                            pred_loss_weight=cfg.prediction_loss_weight,
-                            warm_up=cfg.warm_up_steps,
-                            metrics=log_metrics,
-                            scheduler_class=scheduler_class,
-                            scheduler_kwargs=scheduler_kwargs,
-                            gradient_clip_val=cfg.grad_clip_val,
-                            gradient_clip_algorithm=cfg.grad_clip_alg,
-                            known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
-                            adj=adj)
-    elif cfg.model.name == "dysat":
-        imputer = DYSATFiller(model_class=model_cls,
-                            model_kwargs=model_kwargs,
-                            optim_class=getattr(torch.optim, cfg.optimizer.name),
-                            optim_kwargs=dict(cfg.optimizer.hparams),
-                            loss_fn=loss_fn,
-                            scaled_target=cfg.scale_target,
-                            whiten_prob=cfg.whiten_prob,
-                            pred_loss_weight=cfg.prediction_loss_weight,
-                            warm_up=cfg.warm_up_steps,
-                            metrics=log_metrics,
-                            scheduler_class=scheduler_class,
-                            scheduler_kwargs=scheduler_kwargs,
-                            known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
-                            adj=adj,
-                            horizon=cfg.window)
-    elif cfg.model.name == "dcrnn" or cfg.model.name == "evolvegcn":
-        imputer = StandardFiller(model_class=model_cls,
-                                model_kwargs=model_kwargs,
-                                optim_class=getattr(torch.optim, cfg.optimizer.name),
-                                optim_kwargs=dict(cfg.optimizer.hparams),
-                                loss_fn=loss_fn,
-                                scaled_target=cfg.scale_target,
-                                whiten_prob=cfg.whiten_prob,
-                                pred_loss_weight=cfg.prediction_loss_weight,
-                                warm_up=cfg.warm_up_steps,
-                                metrics=log_metrics,
-                                scheduler_class=scheduler_class,
-                                scheduler_kwargs=scheduler_kwargs,
-                                known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
-                                adj=adj,
-                                horizon=cfg.window)
-    elif cfg.model.name == "increase":
-        imputer = INCREASEFiller(model_class=model_cls,
-                                model_kwargs=model_kwargs,
-                                optim_class=getattr(torch.optim, cfg.optimizer.name),
-                                optim_kwargs=dict(cfg.optimizer.hparams),
-                                loss_fn=loss_fn,
-                                scaled_target=cfg.scale_target,
-                                whiten_prob=cfg.whiten_prob,
-                                pred_loss_weight=cfg.prediction_loss_weight,
-                                warm_up=cfg.warm_up_steps,
-                                metrics=log_metrics,
-                                scheduler_class=scheduler_class,
-                                scheduler_kwargs=scheduler_kwargs,
-                                known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
-                                adj=adj,
-                                horizon=cfg.window,
-                                num_n=cfg.model.hparams.K)
-    else:
-        imputer = Imputer(model_class=model_cls,
-                        model_kwargs=model_kwargs,
-                        optim_class=getattr(torch.optim, cfg.optimizer.name),
-                        optim_kwargs=dict(cfg.optimizer.hparams),
-                        loss_fn=loss_fn,
-                        metrics=log_metrics,
-                        scheduler_class=scheduler_class,
-                        scheduler_kwargs=scheduler_kwargs,
-                        scale_target=cfg.scale_target,
-                        whiten_prob=cfg.whiten_prob,
-                        prediction_loss_weight=cfg.prediction_loss_weight,
-                        impute_only_missing=cfg.impute_only_missing,
-                        warm_up_steps=cfg.warm_up_steps)
+    
+    imputer = GeodeFiller(model_class=model_cls,
+                          model_kwargs=model_kwargs,
+                          optim_class=getattr(torch.optim, cfg.optimizer.name),
+                          optim_kwargs=dict(cfg.optimizer.hparams),
+                          loss_fn=loss_fn,
+                          scaled_target=cfg.scale_target,
+                          whiten_prob=cfg.whiten_prob,
+                          pred_loss_weight=cfg.prediction_loss_weight,
+                          warm_up=cfg.warm_up_steps,
+                          metrics=log_metrics,
+                          scheduler_class=scheduler_class,
+                          scheduler_kwargs=scheduler_kwargs,
+                          gradient_clip_val=cfg.grad_clip_val,
+                          gradient_clip_algorithm=cfg.grad_clip_alg,
+                          known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
+                          **cfg.model.regs)
 
     ########################################
     # logging options                      #
@@ -744,28 +263,14 @@ def run_imputation(cfg: DictConfig):
         mode='min',
     )
     checkpoint_callback.CHECKPOINT_NAME_LAST = "{epoch}-last"
-
-    if cfg.model.name in MODELS:
-        trainer = Trainer(
-            max_epochs=cfg.epochs,
-            default_root_dir=cfg.run.dir,
-            logger=exp_logger,
-            accelerator='gpu' if torch.cuda.is_available() else 'cpu',
-            devices=cfg.device,
-            callbacks=[early_stop_callback, checkpoint_callback],
-            detect_anomaly=False)
-    else:
-        trainer = Trainer(
-            max_epochs=cfg.epochs,
-            default_root_dir=cfg.run.dir,
-            logger=exp_logger,
-            accelerator='gpu' if torch.cuda.is_available() else 'cpu',
-            devices=cfg.device,
-            gradient_clip_val=cfg.grad_clip_val,
-            gradient_clip_algorithm=cfg.grad_clip_alg,
-            callbacks=[early_stop_callback, checkpoint_callback])
-
-
+    trainer = Trainer(
+        max_epochs=cfg.epochs,
+        default_root_dir=cfg.run.dir,
+        logger=exp_logger,
+        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
+        devices=cfg.device,
+        callbacks=[early_stop_callback, checkpoint_callback],
+        detect_anomaly=False)
     trainer.fit(imputer, datamodule=dm, ckpt_path=cfg.call_path)
 
     ########################################
@@ -823,7 +328,6 @@ def run_imputation(cfg: DictConfig):
              eval_setting=cfg.eval_setting,
              node_f=cfg.dataset.node_features)
     )
-
     return res
 
 if __name__ == '__main__':

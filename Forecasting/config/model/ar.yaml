@@ -1,7 +1,0 @@
-# @package _global_
-
-#### Model params #############################################################
-model:
-  name: ar
-  hparams:
-    temporal_order: 3

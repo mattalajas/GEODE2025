@@ -1,24 +1,19 @@
 #### Dataset params ###########################################################
 name: nrel-al
 
-# temporal shift
-shift: false
-
 # spatial shift
 spatial_shift: false
 order: 0
 node_features: c_centrality
 
 # Point
-mode: region
+mode: road
 p_fault: 0.
 p_noise: 0.25
 
 splitting:
   val_len: 0.1
   test_len: 0.2
-  gran: month
-  test_times: [1, 2, 12]
 connectivity:
   method: distance
   threshold: 0.1

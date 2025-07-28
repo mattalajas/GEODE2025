@@ -1,9 +1,0 @@
-#### Dataset params ###########################################################
-name: air_smaller
-masked_sensors: [6, 7, 8, 9, 10, 11]
-splitting:
-  val_len: 0.1
-  test_len: 0.2
-connectivity:
-  method: distance
-  include_self: False
