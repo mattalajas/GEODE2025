@@ -7,7 +7,6 @@ defaults:
 #### Experiment params ########################################################
 hydra:
   run:
-    # dir: logs/unkrigv5/aqi/2025-06-19/19-32-15
     dir: logs/${model.name}/${dataset.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
   sweep:
     dir: logs/${now:%Y-%m-%d-%H-%M-%S}
@@ -19,7 +18,6 @@ tags:
   - ${dataset.name}
 
 # Replace with the last ckpt file to resume training
-# call_path: logs/unkrigv5/aqi/2025-06-19/19-32-15/epoch=82-last.ckpt
 call_path: null
 workers: 0
 num_threads: 1  # limit the number of pytorch threads spawn

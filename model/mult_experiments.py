@@ -3,7 +3,7 @@ import os
 
 from tsl import logger
 from tsl.experiment import Experiment
-from Grin import run_imputation
+from run_exp import run_imputation
 
 if __name__ == '__main__':
     # with torch.autograd.set_detect_anomaly(True):

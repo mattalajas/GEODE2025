@@ -22,9 +22,6 @@ from tsl.utils.casting import torch_to_numpy
 
 from omegaconf import OmegaConf
 
-from my_datasets import AirQualitySmaller, AirQualityAuckland
-
-
 def get_model_class(model_str):
     if model_str == 'rnni':
         model = RNNImputerModel
@@ -42,12 +39,6 @@ def get_model_class(model_str):
 
 
 def get_dataset(dataset_name: str, p_fault=0., p_noise=0.):
-    if dataset_name == 'air':
-        return AirQuality(impute_nans=True, small=True)
-    if dataset_name == 'air_smaller':
-        return AirQualitySmaller('../../AirData/AQI/Stations', impute_nans=True)
-    if dataset_name == 'air_auckland':
-        return AirQualityAuckland('../../AirData/Niwa', t_range=['2022-04-01', '2022-12-01'])
     if dataset_name.endswith('_point'):
         p_fault, p_noise = 0., 0.25
         dataset_name = dataset_name[:-6]
@@ -106,8 +97,7 @@ def load_model_and_infer(cfg_path: str, checkpoint_path: str):
     model_cls = get_model_class(cfg.model.name)
     model_kwargs = {
         'n_nodes': torch_dataset.n_nodes,
-        'input_size': torch_dataset.n_channels,
-        'exog_size': torch_dataset.input_map.u.shape[-1]
+        'input_size': torch_dataset.n_channels
     }
     model_cls.filter_model_args_(model_kwargs)
     model_kwargs.update(cfg.model.hparams)

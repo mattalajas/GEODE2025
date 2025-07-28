@@ -45,7 +45,6 @@ class Geode(BaseModel):
                  hidden_size,
                  output_size,
                  adj,
-                 exog_size,
                  gcn_layers,
                  psd_layers,
                  activation='tanh',
@@ -64,7 +63,6 @@ class Geode(BaseModel):
         self.k = k
         self.att_heads = att_heads
         self.att_window = att_window
-        input_size += exog_size
 
         self.time_emb = RelTemporalEncoding(hidden_size)
         self.init_emb = nn.Linear(input_size, hidden_size)
@@ -89,7 +87,6 @@ class Geode(BaseModel):
         self.layernorm0 = LayerNorm(hidden_size)
         self.layernorm1 = LayerNorm(hidden_size)
         self.layernorm2 = LayerNorm(hidden_size)
-        self.layernorm3 = LayerNorm(hidden_size)
 
         self.gcn1 = DiffConv(in_channels=hidden_size,
                             out_channels=hidden_size,
@@ -102,20 +99,11 @@ class Geode(BaseModel):
                             k=gcn_layers,
                             root_weight=True,
                             activation=activation)
-        
-        self.squeeze1 = MLP(input_size=hidden_size*2,
-                            hidden_size=hidden_size,
-                            output_size=hidden_size,
-                            activation=activation)
 
         self.readout1 = nn.Linear(hidden_size, output_size)
-        self.readout2 = nn.Linear(hidden_size, output_size)
-        self.readout3 = nn.Linear(hidden_size*2, output_size)
-
+        self.readout2 = nn.Linear(hidden_size*2, output_size)
 
         self.adj = adj
-        self.adj_n1 = None
-        self.obs_neighbors = None
 
     def forward(self,
                 x,
@@ -127,11 +115,9 @@ class Geode(BaseModel):
                 edge_weight=None,
                 training=False,
                 reset=False,
-                u=None,
                 transform=None):
         # x: [batches steps nodes features]
         b, t, _, _ = x.size()
-        x = utils.maybe_cat_exog(x, u)
         device = x.device
 
         full_adj = torch.tensor(self.adj).to(device)
@@ -171,10 +157,7 @@ class Geode(BaseModel):
                 init_hops = closest_distances_unweighted(numpy_graph, source_nodes, target_nodes)
                 adj_aug, level_hops = self.get_new_adj(o_adj, self.k, n_add=sub_entry_num, init_hops=init_hops)
             else:
-                if self.adj_n1 is None:
-                    adj_aug = o_adj
-                else:
-                    adj_aug = self.adj_n1
+                adj_aug = o_adj
 
                 numpy_graph = nx.from_numpy_array(adj_aug.cpu().numpy())
                 target_nodes = list(range(adj_aug.shape[0]))[:len(known_set)]
@@ -284,10 +267,10 @@ class Geode(BaseModel):
         # Final Message Passing
         # ========================================
         xh_inv_3 = self.gcn2(xh_inv_3, gcn_adj[0], gcn_adj[1]) + xh_inv_3
-        xh_inv_3 = self.layernorm3(xh_inv_3)
+        xh_inv_3 = self.layernorm2(xh_inv_3)
 
         xh_var_3 = self.gcn2(xh_var_3, gcn_adj[0], gcn_adj[1]) + xh_var_3
-        xh_var_3 = self.layernorm3(xh_var_3)
+        xh_var_3 = self.layernorm2(xh_var_3)
 
         finpreds = self.readout1(xh_inv_3)
         if not training:
@@ -341,7 +324,7 @@ class Geode(BaseModel):
 
             rand_seen = rearrange(rand_seen, 'b (t n) d -> b t n d', t=t)
             fin_vars = torch.cat((seen_invr, rand_seen), dim=-1)
-            fin_irm = self.readout3(fin_vars)
+            fin_irm = self.readout2(fin_vars)
             fin_irm_all.append(fin_irm)
 
         fin_irm_all = torch.stack(fin_irm_all)

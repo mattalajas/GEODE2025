@@ -1,14 +1,13 @@
 name: geode
 hparams:
   hidden_size: 64
-  exog_size: 0
   gcn_layers: 1
   psd_layers: 1
   dropout: 0.4
   intervention_steps: 5
-  cmd_sample_ratio: 0.8
+  mmd_sample_ratio: 0.8
   att_window: 10
   k: 3
 regs:
   y1: 1 # IRM Loss
-  y2: 0.2 # SS-cmd Loss
+  y2: 0.2 # SS-MMD Loss
