@@ -1,4 +1,7 @@
 import torch
+import os
+import random
+from omegaconf import OmegaConf
 from omegaconf import DictConfig
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
@@ -22,7 +25,7 @@ from geode import Geode
 from geode_filler import GeodeFiller
 from utils import test_wise_eval
 
-def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, connectivity=None, 
+def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, connectivity=None, mode='road',
                 spatial_shift=False, order=0, node_features='CC'):
     if dataset_name == 'aqi':
         return add_missing_sensors(AirQuality(),
@@ -32,6 +35,7 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, connec
                                   max_seq=12 * 4, 
                                   masked_sensors=masked_s,
                                   connect=connectivity,
+                                  mode=mode,
                                   spatial_shift=spatial_shift,
                                   order=order,
                                   node_features=node_features)
@@ -43,6 +47,7 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, connec
                                   max_seq=12 * 4, 
                                   masked_sensors=masked_s,
                                   connect=connectivity,
+                                  mode=mode,
                                   spatial_shift=spatial_shift,
                                   order=order,
                                   node_features=node_features)
@@ -54,6 +59,7 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, connec
                                   max_seq=12 * 4, 
                                   masked_sensors=masked_s,
                                   connect=connectivity,
+                                  mode=mode,
                                   spatial_shift=spatial_shift,
                                   order=order,
                                   node_features=node_features)
@@ -70,6 +76,7 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, connec
                                   max_seq=12 * 4,
                                   masked_sensors=masked_s,
                                   connect=connectivity,
+                                  mode=mode,
                                   spatial_shift=spatial_shift,
                                   order=order,
                                   node_features=node_features)
@@ -86,6 +93,7 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, connec
                                   max_seq=12 * 4,
                                   masked_sensors=masked_s,
                                   connect=connectivity,
+                                  mode=mode,
                                   spatial_shift=spatial_shift,
                                   order=order,
                                   node_features=node_features)
@@ -105,6 +113,7 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, connec
                                   max_seq=12 * 4,
                                   masked_sensors=masked_s,
                                   connect=connectivity,
+                                  mode=mode,
                                   spatial_shift=spatial_shift,
                                   order=order,
                                   node_features=node_features)
@@ -124,6 +133,7 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, connec
                                   max_seq=12 * 4,
                                   masked_sensors=masked_s,
                                   connect=connectivity,
+                                  mode=mode,
                                   spatial_shift=spatial_shift,
                                   order=order,
                                   node_features=node_features)
@@ -135,41 +145,60 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, connec
                                   max_seq=12 * 4,
                                   masked_sensors=masked_s,
                                   connect=connectivity,
+                                  mode=mode,
                                   spatial_shift=spatial_shift,
                                   order=order,
                                   node_features=node_features)
     raise ValueError(f"Dataset {dataset_name} not available in this setting.")
 
-def run_imputation(cfg: DictConfig):
-    ########################################
-    # data module                          #
-    ########################################
+def load_model_and_infer(og_path: str, index, dev, node_features=None):
     torch.set_float32_matmul_precision('high')
-    assert cfg.eval_setting in ['train_wise', 'test_wise']
-
+    
+    result = []
+    for root, dirs, files in os.walk(og_path):
+        for name in files:
+            if 'ckpt' in name:
+                result.append(os.path.join(root, name))
+    
+    print(result)
+    assert len(result)
+    checkpoint_path = result[index]
+    
+    # Load configuration
+    cfg = OmegaConf.load(os.path.join(og_path, 'config.yaml'))
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    random.seed(cfg.seed)
+    
+    # Load dataset
     dataset, masked_sensors = get_dataset(cfg.dataset.name,
                             p_fault=cfg.dataset.get('p_fault'),
                             p_noise=cfg.dataset.get('p_noise'),
+                            t_range=cfg.dataset.get('t_range'),
                             masked_s=cfg.dataset.get('masked_sensors'),
+                            agg_func=cfg.dataset.get('agg_func'),
+                            test_month=cfg.dataset.get('test_month'),
+                            location=cfg.dataset.get('location'),
                             connectivity=cfg.dataset.get('connectivity'),
+                            mode=cfg.dataset.get('mode'),
                             spatial_shift=cfg.dataset.get('spatial_shift'),
                             order=cfg.dataset.get('order'),
-                            node_features=cfg.dataset.get('node_features'))
-
+                            node_features=cfg.dataset.get('node_features') if node_features is None else node_features)
     print(f'Masked sensors: {masked_sensors}')
-
-    # get adjacency matrix
+    # covariates = {'u': dataset.datetime_encoded('day').values}
     adj = dataset.get_connectivity(**cfg.dataset.connectivity, layout='dense')
-
-    # instantiate dataset
-    torch_dataset = ImputationDataset(target=dataset.dataframe(),
-                                      mask=dataset.training_mask,
-                                      eval_mask=dataset.eval_mask,
-                                      transform=MaskInput(),
-                                      connectivity=adj,
-                                      window=cfg.window,
-                                      stride=cfg.stride)
-
+    
+    torch_dataset = ImputationDataset(
+        target=dataset.dataframe(),
+        mask=dataset.training_mask,
+        eval_mask=dataset.eval_mask,
+        # covariates=covariates,
+        transform=MaskInput(),
+        connectivity=adj,
+        window=cfg.window,
+        stride=cfg.stride
+    )
+    
     scalers = {'target': StandardScaler(axis=(0, 1))}
     val_len = cfg.dataset.splitting.get('val_len')
     test_len = cfg.dataset.splitting.get('test_len')
@@ -179,149 +208,45 @@ def run_imputation(cfg: DictConfig):
         splitter=dataset.get_splitter(val_len=val_len, test_len=test_len),
         batch_size=cfg.batch_size,
         workers=cfg.workers)
-    dm.setup(stage='fit')
-
-    ########################################
-    # imputer                              #
-    ########################################
-
+    dm.setup(stage='test')
+    
+    # Load model
     model_cls = Geode
-
     model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
     model_cls.filter_model_args_(model_kwargs)
-    loss_fn = torch_metrics.MaskedMAE()
-
     model_kwargs.update(cfg.model.hparams)
-
-    log_metrics = {
-        'mae': torch_metrics.MaskedMAE(),
-        'mse': torch_metrics.MaskedMSE(),
-        'mre': torch_metrics.MaskedMRE()
-    }
-
-    if cfg.lr_scheduler is not None:
-        scheduler_class = getattr(torch.optim.lr_scheduler,
-                                  cfg.lr_scheduler.name)
-        scheduler_kwargs = dict(cfg.lr_scheduler.hparams)
-    else:
-        scheduler_class = scheduler_kwargs = None
+    trainer = Trainer(
+        max_epochs=cfg.epochs,
+        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
+        devices=[dev],
+        gradient_clip_val=cfg.get('grad_clip_val', None),
+        gradient_clip_algorithm=cfg.get('grad_clip_alg', None))
     
-    imputer = GeodeFiller(model_class=model_cls,
+    imputer = GeodeFiller.load_from_checkpoint(checkpoint_path, model_class=model_cls,
                           model_kwargs=model_kwargs,
-                          optim_class=getattr(torch.optim, cfg.optimizer.name),
-                          optim_kwargs=dict(cfg.optimizer.hparams),
-                          loss_fn=loss_fn,
-                          scaled_target=cfg.scale_target,
-                          whiten_prob=cfg.whiten_prob,
-                          pred_loss_weight=cfg.prediction_loss_weight,
-                          warm_up=cfg.warm_up_steps,
-                          metrics=log_metrics,
-                          scheduler_class=scheduler_class,
-                          scheduler_kwargs=scheduler_kwargs,
                           gradient_clip_val=cfg.grad_clip_val,
                           gradient_clip_algorithm=cfg.grad_clip_alg,
                           known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
                           **cfg.model.regs)
-
-    ########################################
-    # logging options                      #
-    ########################################
-
-    if 'wandb' in cfg:
-        exp_logger = WandbLogger(name=cfg.run.name,
-                                 save_dir=cfg.run.dir,
-                                 offline=cfg.wandb.offline,
-                                 project=cfg.wandb.project)
-    elif cfg.logger == 'tensorboard':
-        exp_logger = TensorBoardLogger(save_dir=cfg.run.dir,
-                                       name='tensorboard')
-    else: 
-        exp_logger = None
-
-    ########################################
-    # training                             #
-    ########################################
-
-    early_stop_callback = EarlyStopping(monitor='val_loss',
-                                        patience=cfg.patience,
-                                        mode='min')
-
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=cfg.run.dir,
-        save_top_k=1,
-        save_last=True,
-        monitor='val_loss',
-        mode='min',
-    )
-    checkpoint_callback.CHECKPOINT_NAME_LAST = "{epoch}-last"
-    trainer = Trainer(
-        max_epochs=cfg.epochs,
-        default_root_dir=cfg.run.dir,
-        logger=exp_logger,
-        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
-        devices=cfg.device,
-        callbacks=[early_stop_callback, checkpoint_callback],
-        detect_anomaly=False)
-    trainer.fit(imputer, datamodule=dm, ckpt_path=cfg.call_path)
-
-    ########################################
-    # testing                              #
-    ########################################
-
-    imputer.load_model(checkpoint_callback.best_model_path)
-
-    imputer.freeze()
-    trainer.test(imputer, datamodule=dm)
-
+    imputer.to(torch.device(f'cuda:{dev}'))
+    imputer.eval()
+    
+    # Run inference
+    trainer = torch.utils.data.DataLoader(dm.test_dataloader(), batch_size=cfg.batch_size)
     output = trainer.predict(imputer, dataloaders=dm.test_dataloader())
     output = imputer.collate_prediction_outputs(output)
     output = torch_to_numpy(output)
-    y_hat, y_true, mask = (output['y_hat'], output['y'],
-                           output.get('eval_mask', None))
-    
-    if cfg.eval_setting == 'train_wise':
-        res = dict(test_mae=numpy_metrics.mae(y_hat, y_true, mask),
-                test_mre=numpy_metrics.mre(y_hat, y_true, mask),
-                test_mape=numpy_metrics.mape(y_hat, y_true, mask),
-                test_mse=numpy_metrics.mse(y_hat, y_true, mask),
-                test_rmse=numpy_metrics.rmse(y_hat, y_true, mask))
-    elif cfg.eval_setting == 'test_wise':
-        res = test_wise_eval(y_hat, y_true, mask, 
-                             known_nodes=[i for i in range(adj.shape[0]) if i not in masked_sensors],
-                             adj=adj,
-                             mode='test',
-                             num_groups=cfg.num_groups)
 
-    output = trainer.predict(imputer, dataloaders=dm.val_dataloader())
-    output = imputer.collate_prediction_outputs(output)
-    output = torch_to_numpy(output)
-    y_hat, y_true, mask = (output['y_hat'], output['y'],
-                           output.get('eval_mask', None))
+    y_hat, y_true, mask = (output['y_hat'], output['y'], output.get('eval_mask', None))
+    res = dict(test_mae=numpy_metrics.mae(y_hat, y_true, mask),
+               test_mre=numpy_metrics.mre(y_hat, y_true, mask),
+               test_mape=numpy_metrics.mape(y_hat, y_true, mask),
+               test_rmse=numpy_metrics.rmse(y_hat, y_true, mask))
     
-    if cfg.eval_setting == 'train_wise':
-        res.update(
-            dict(val_mae=numpy_metrics.mae(y_hat, y_true, mask),
-                val_mre=numpy_metrics.mre(y_hat, y_true, mask),
-                val_mape=numpy_metrics.mape(y_hat, y_true, mask),
-                val_mse=numpy_metrics.mse(y_hat, y_true, mask),
-                val_rmse=numpy_metrics.rmse(y_hat, y_true, mask)))
-    elif cfg.eval_setting == 'test_wise':
-        res.update(test_wise_eval(y_hat, y_true, mask, 
-                    known_nodes=[i for i in range(adj.shape[0]) if i not in masked_sensors],
-                    adj=adj, mode='val', num_groups=cfg.num_groups))
-    
-    res.update(
-        dict(model=cfg.model.name,
-             db=cfg.dataset.name,
-             seed=cfg.seed,
-             spatial=cfg.dataset.spatial_shift,
-             eval_setting=cfg.eval_setting,
-             node_f=cfg.dataset.node_features)
-    )
     return res
 
 if __name__ == '__main__':
-    exp = Experiment(run_fn=run_imputation, config_path='config', config_name='default')
-    print(exp)
-    res = exp.run()
-    logger.info(res)
+    config_path = 'config/default.yaml'  # Path to config file
+    checkpoint_path = 'checkpoints/best_model.ckpt'  # Path to model checkpoint
+    results = load_model_and_infer(config_path, checkpoint_path)
+    print("Inference results:", results)

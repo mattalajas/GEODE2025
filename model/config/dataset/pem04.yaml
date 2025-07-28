@@ -4,10 +4,9 @@ name: pem04
 # spatial shift
 spatial_shift: false
 order: 0
-node_features: c_centrality
+node_features: CC
 
 # Point
-mode: road
 p_fault: 0.
 p_noise: 0.25
 

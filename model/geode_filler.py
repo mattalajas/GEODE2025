@@ -370,8 +370,6 @@ class GeodeFiller(Filler):
         self.gradient_clip_algorithm = gradient_clip_algorithm
         self.y1 = y1
         self.y2 = y2
-        
-        # self.ratio = 0.
 
     def trim_seq(self, *seq):
         seq = [s[:, self.trimming[0]:s.size(1) - self.trimming[1]] for s in seq]
@@ -395,9 +393,6 @@ class GeodeFiller(Filler):
             model_kwargs = storage['hyper_parameters']['model_kwargs']
             # check model class and hyperparameters are the same
             assert model_cls == self.model_cls
-            # if model_kwargs is not None:
-            #     for k, v in model_kwargs.items():
-            #         assert v == self.model_kwargs[k], f'{v}'
         else:
             logger.warning("Predictor with already instantiated model is "
                            f"loading a state_dict from {filename}. Cannot "

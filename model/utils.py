@@ -197,7 +197,7 @@ def add_missing_sensors(dataset: TabularDataset,
                        connect = None,
                        spatial_shift = False, 
                        order = 0,
-                       node_features = 'c_centrality',
+                       node_features = 'CC',
                        mode='road'):
     if seed is None:
         seed = np.random.randint(1e9)
@@ -248,7 +248,7 @@ def shift_mask(shape, feature, order, adj):
 
     parts = math.ceil(adj.shape[0] / 4)
 
-    if feature == 'c_centrality':
+    if feature == 'CC':
         # Compute closeness centrality
         closeness = nx.closeness_centrality(G)
         nonzero_c = {node: score for node, score in closeness.items() if score > 0}
@@ -262,7 +262,7 @@ def shift_mask(shape, feature, order, adj):
         f_nodes_mask[:, f_nodes] = True
         mask |= f_nodes_mask
         
-    elif feature == 'degree':
+    elif feature == 'ND':
         degree = dict(nx.degree(G))
         nonzero_d = {node: score for node, score in degree.items() if score > 0}
 
@@ -291,37 +291,4 @@ def sample_mask(shape, p=0.002, p_noise=0., mode="random", adj=None):
         road_mask = np.zeros(shape).astype(bool)
         road_mask[:, rand_mask] = True
         mask |= road_mask
-    if mode == "region":
-        num_vert = (rand(mask.shape[1]) < p_noise).sum().item()
-        regions = region_masking(adj, num_vert)
-        region_mask = np.zeros(shape).astype(bool)
-        region_mask[:, regions] = True
-        mask |= region_mask
-
     return mask.astype('uint8')
-
-def region_masking(adj_matrix, n):
-    num_nodes = adj_matrix.shape[0]
-    if n >= num_nodes:
-        return list(range(num_nodes))
-
-    visited = set()
-    all_nodes = set(range(num_nodes))
-
-    while len(visited) < n:
-        # Start from an unvisited random seed node
-        seed = np.random.choice(list(all_nodes - visited))
-        queue = deque([seed])
-        visited.add(seed)
-
-        while queue and len(visited) < n:
-            current = queue.popleft()
-            neighbors = np.nonzero(adj_matrix[current])[0]  # indices with edge
-
-            for neighbor in neighbors:
-                if neighbor not in visited:
-                    visited.add(neighbor.item())
-                    queue.append(neighbor)
-                    if len(visited) == n:
-                        break
-    return list(visited)

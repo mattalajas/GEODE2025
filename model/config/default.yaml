@@ -7,14 +7,12 @@ defaults:
 #### Experiment params ########################################################
 hydra:
   run:
-    dir: logs/${model.name}/${dataset.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: logs/${dataset.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
   sweep:
     dir: logs/${now:%Y-%m-%d-%H-%M-%S}
-    subdir: ${model.name}/${dataset.name}/${hydra.job.num}
+    subdir: ${dataset.name}/${hydra.job.num}
 
-# seed: 87654321  # automatically set everywhere the seed
 tags:
-  - ${model.name}
   - ${dataset.name}
 
 # Replace with the last ckpt file to resume training

@@ -6,24 +6,27 @@ from tsl.experiment import Experiment
 from run_exp import run_imputation
 
 if __name__ == '__main__':
-    # with torch.autograd.set_detect_anomaly(True):
     exp = Experiment(run_fn=run_imputation, config_path='config', config_name='default')
     print(exp)
     res = exp.run()
     logger.info(res)
-
-    mode = res.pop('mode')
+    
     shift = res.pop('spatial')
     eval_setting = res.pop('eval_setting')
     node_features = res.pop('node_f')
+    base_dir = os.path.join("res")
+
     if shift:
-        csv_path = f"/data/mala711/Thesis/GNNthesis/res/{res['model']}-{mode}-spatial-{node_features}.csv"
+        filename = f"{res['model']}-trainwise-{node_features}.csv"
     else:
         if eval_setting == 'train_wise':
-            csv_path = f"/data/mala711/Thesis/GNNthesis/res/{res['model']}-{mode}.csv"
+            filename = f"{res['model']}-trainwise-RND.csv"
         else:
-            csv_path = f"/data/mala711/Thesis/GNNthesis/res/{res['model']}-{mode}-testwise.csv"
+            filename = f"{res['model']}-testwise.csv"
+    csv_path = os.path.join(base_dir, filename)
     file_exists = os.path.exists(csv_path)
+
+    os.makedirs(base_dir, exist_ok=True)
 
     with open(csv_path, mode="a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=res.keys())

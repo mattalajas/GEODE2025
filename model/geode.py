@@ -332,22 +332,11 @@ class Geode(BaseModel):
         return finpreds, finrecos, fin_irm_all
 
     def get_new_adj(self, adj, k, n_add, scale=1.0, init_hops={}):
-        """
-        Add n_add new nodes to a subgraph adjacency matrix.
-        
-        Parameters:
-        - subgraph_adj (np.ndarray): Initial adjacency matrix (n x n).
-        - n_add (int): Number of nodes to add.
-        - connect_prob (float): Probability of connecting to anchor's neighbors.
-
-        Returns:
-        - new_adj (np.ndarray): Updated adjacency matrix.
-        - new_node_indices (list): Indices of added nodes.
-        """
         current_adj = adj.clone()
         n_current = current_adj.shape[0]
         prev_cur = 0
 
+        # Get partitions
         partitions = np.random.exponential(scale, k)
         partitions = partitions / partitions.sum() * n_add
         partitions = np.round(partitions).astype(int)
@@ -359,8 +348,8 @@ class Geode(BaseModel):
             partitions[-1] = 0
 
         levels = {i:0 for i in range(n_current+n_add)} | init_hops
-        for hops, part in enumerate(partitions):
-            for i in range(part):
+        for _, part in enumerate(partitions):
+            for _ in range(part):
                 n = current_adj.shape[0]
                 new_node_index = n
 
