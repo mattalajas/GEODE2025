@@ -52,7 +52,7 @@ class Geode(BaseModel):
                  dropout=0,
                  intervention_steps=2,
                  horizon=24,
-                 mmd_sample_ratio=1.,
+                 cmd_sample_ratio=1.,
                  att_window=3,
                  k=5,
                  att_heads=8):
@@ -60,7 +60,7 @@ class Geode(BaseModel):
 
         self.steps = intervention_steps
         self.horizon = horizon
-        self.mmd_ratio = mmd_sample_ratio
+        self.cmd_ratio = cmd_sample_ratio
         self.k = k
         self.att_heads = att_heads
         self.att_window = att_window
@@ -298,8 +298,8 @@ class Geode(BaseModel):
         # ========================================
         # Get embedding softmax
         s_batch = b
-        if self.mmd_ratio < 1.0:
-            s_batch = int(b*self.mmd_ratio)
+        if self.cmd_ratio < 1.0:
+            s_batch = int(b*self.cmd_ratio)
             indx = torch.randperm(b, device=device)[:s_batch]
 
             vir_inv = xh_inv_3[indx]
