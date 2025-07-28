@@ -101,17 +101,6 @@ def test_wise_eval(y_hat, y_true, mask, known_nodes, adj, mode, num_groups=4, al
     if remainder:
         cls_gr[-1].extend(sorted_cls[-remainder:])
 
-    # ND
-    degrees = dict(nx.degree(numpy_graph))
-    degrees = {node: score for node, score in degrees.items() if score > 0}
-
-    sorted_nd = sorted([i for i in u_nodes if i in degrees], key=lambda i: degrees[i])
-    # sorted_nd = [x for x, _ in sorted_nd]
-    nd_gr = [sorted_nd[i*group_size : (i+1)*group_size] for i in range(num_groups)]
-    remainder = len(sorted_nd) % num_groups
-    if remainder:
-        nd_gr[-1].extend(sorted_nd[-remainder:])
-
     # KHR
     khr_grouped = closest_distances_unweighted(numpy_graph, u_nodes, k_nodes.tolist())
     khr_grouped = {node: score for node, score in khr_grouped.items() if score < 1e9}
@@ -127,7 +116,6 @@ def test_wise_eval(y_hat, y_true, mask, known_nodes, adj, mode, num_groups=4, al
     # Evaluate
     group_dict = {'LPS': lps_gr,
                 'CC': cls_gr,
-                'ND': nd_gr,
                 'KHR': khr_gr}
     res = {f'{mode}_mae': numpy_metrics.mae(y_hat, y_true, mask),
                f'{mode}_mre': numpy_metrics.mre(y_hat, y_true, mask),
@@ -146,42 +134,13 @@ def test_wise_eval(y_hat, y_true, mask, known_nodes, adj, mode, num_groups=4, al
             
             masked_adj = mask * node_mask
 
-            # nonzero_mask = masked_adj != 0  # shape: D x T x N
-            # active_n = np.any(nonzero_mask, axis=(0, 1, 3))  # shape: N
-            # nonzero_n_indices = np.where(active_n)[0]
-            # print(nonzero_n_indices)
-
             results['mae'].append(numpy_metrics.mae(y_hat, y_true, masked_adj))
             results['mre'].append(numpy_metrics.mre(y_hat, y_true, masked_adj))
             results['rmse'].append(numpy_metrics.rmse(y_hat, y_true, masked_adj))
 
         for metric, val in results.items():
-            wdp_num = 0
-            wsd_num = 0
-            ntotal = u_nodes.shape[0]
-
-            for ind, a1 in enumerate(val):
-                if math.isnan(a1) or a1 == 0:
-                    a1 = 0
-
-                n1 = len(groups[ind])
-                wdp_num += (n1 * np.abs(a1 - res[f'{mode}_{metric}']))
-                wsd_num += (n1 * (a1 - res[f'{mode}_{metric}'])**2)
-
-            wdp = wdp_num / ntotal
-            wsd = np.sqrt(wsd_num / ntotal)
-            wcv = wsd/res[f'{mode}_{metric}']
-
             res[f'max_{metric}_{key}_{mode}'] = max(val)
             res[f'min_{metric}_{key}_{mode}'] = min(val)
-            res[f'wdp_{metric}_{key}_{mode}'] = wdp
-            res[f'wsd_{metric}_{key}_{mode}'] = wsd
-            res[f'wcv_{metric}_{key}_{mode}'] = wcv
-        
-        if num_groups == 5:
-            res[f'all_mae_{key}_{mode}'] = results['mae']
-            res[f'all_mre_{key}_{mode}'] = results['mre']
-            res[f'all_rmse_{key}_{mode}'] = results['rmse']
     
     return res    
 
@@ -279,7 +238,7 @@ def shift_mask(shape, feature, order, adj):
     return mask.astype('uint8')
 
 def sample_mask(shape, p=0.002, p_noise=0., mode="random", adj=None):
-    assert mode in ["random", "road", "mix", "region"], "The missing mode must be 'random' or 'road' or 'mix'."
+    assert mode in ["random", "road", "mix"], "The missing mode must be 'random' or 'road' or 'mix'."
     rand = np.random.random
     mask = np.zeros(shape).astype(bool)
     if mode == "random" or mode == "mix":
