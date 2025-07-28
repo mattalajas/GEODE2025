@@ -9,7 +9,6 @@ from einops import rearrange
 from torch import nn
 from torch.nn import LayerNorm
 from torch_geometric.utils import dense_to_sparse, softmax, scatter
-from tsl.nn import utils
 from tsl.nn.blocks.encoders.mlp import MLP
 from tsl.nn.layers.graph_convs import DiffConv
 from tsl.nn.models.base_model import BaseModel

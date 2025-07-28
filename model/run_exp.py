@@ -282,7 +282,6 @@ def run_imputation(cfg: DictConfig):
     if cfg.eval_setting == 'train_wise':
         res = dict(test_mae=numpy_metrics.mae(y_hat, y_true, mask),
                 test_mre=numpy_metrics.mre(y_hat, y_true, mask),
-                test_mape=numpy_metrics.mape(y_hat, y_true, mask),
                 test_mse=numpy_metrics.mse(y_hat, y_true, mask),
                 test_rmse=numpy_metrics.rmse(y_hat, y_true, mask))
     elif cfg.eval_setting == 'test_wise':
@@ -302,7 +301,6 @@ def run_imputation(cfg: DictConfig):
         res.update(
             dict(val_mae=numpy_metrics.mae(y_hat, y_true, mask),
                 val_mre=numpy_metrics.mre(y_hat, y_true, mask),
-                val_mape=numpy_metrics.mape(y_hat, y_true, mask),
                 val_mse=numpy_metrics.mse(y_hat, y_true, mask),
                 val_rmse=numpy_metrics.rmse(y_hat, y_true, mask)))
     elif cfg.eval_setting == 'test_wise':

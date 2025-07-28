@@ -2,10 +2,7 @@ import torch
 import os
 import random
 from omegaconf import OmegaConf
-from omegaconf import DictConfig
 from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
-from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
 
 import numpy as np
 
@@ -13,9 +10,7 @@ from tsl import logger
 from tsl.data import ImputationDataset, SpatioTemporalDataModule
 from tsl.data.preprocessing import StandardScaler
 from tsl.datasets import AirQuality, MetrLA, PeMS07, PvUS, LargeST, PeMS04
-from tsl.experiment import Experiment
 from tsl.metrics import numpy as numpy_metrics
-from tsl.metrics import torch as torch_metrics
 from tsl.transforms import MaskInput
 from tsl.utils.casting import torch_to_numpy
 
@@ -240,7 +235,6 @@ def load_model_and_infer(og_path: str, index, dev, node_features=None):
     y_hat, y_true, mask = (output['y_hat'], output['y'], output.get('eval_mask', None))
     res = dict(test_mae=numpy_metrics.mae(y_hat, y_true, mask),
                test_mre=numpy_metrics.mre(y_hat, y_true, mask),
-               test_mape=numpy_metrics.mape(y_hat, y_true, mask),
                test_rmse=numpy_metrics.rmse(y_hat, y_true, mask))
     
     return res
