@@ -27,7 +27,7 @@ window: 24
 stride: 1
 
 #### Training params ##########################################################
-epochs: 100
+epochs: 200
 patience: 50
 batch_size: 64
 grad_clip_val: 1
