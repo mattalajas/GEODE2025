@@ -1,24 +1,21 @@
-import torch
+import argparse
 import os
 import random
-from omegaconf import OmegaConf
-from pytorch_lightning import Trainer
 
 import numpy as np
-
-from tsl import logger
+import torch
+from geode import Geode
+from geode_filler import GeodeFiller
+from omegaconf import OmegaConf
+from pytorch_lightning import Trainer
 from tsl.data import ImputationDataset, SpatioTemporalDataModule
 from tsl.data.preprocessing import StandardScaler
-from tsl.datasets import AirQuality, MetrLA, PeMS07, PvUS, LargeST, PeMS04
+from tsl.datasets import AirQuality, MetrLA, PeMS04, PeMS07, PvUS
 from tsl.metrics import numpy as numpy_metrics
 from tsl.transforms import MaskInput
 from tsl.utils.casting import torch_to_numpy
+from utils import add_missing_sensors, test_wise_eval, LargeST
 
-from utils import add_missing_sensors
-
-from geode import Geode
-from geode_filler import GeodeFiller
-from utils import test_wise_eval
 
 def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, connectivity=None, mode='road',
                 spatial_shift=False, order=0, node_features='CC'):
@@ -146,21 +143,10 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, connec
                                   node_features=node_features)
     raise ValueError(f"Dataset {dataset_name} not available in this setting.")
 
-def load_model_and_infer(og_path: str, index, dev, node_features=None):
-    torch.set_float32_matmul_precision('high')
-    
-    result = []
-    for root, dirs, files in os.walk(og_path):
-        for name in files:
-            if 'ckpt' in name:
-                result.append(os.path.join(root, name))
-    
-    print(result)
-    assert len(result)
-    checkpoint_path = result[index]
-    
+def load_model_and_infer(config_path: str, checkpoint_path: str):
+    torch.set_float32_matmul_precision('high')   
     # Load configuration
-    cfg = OmegaConf.load(os.path.join(og_path, 'config.yaml'))
+    cfg = OmegaConf.load(config_path)
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
     random.seed(cfg.seed)
@@ -169,25 +155,18 @@ def load_model_and_infer(og_path: str, index, dev, node_features=None):
     dataset, masked_sensors = get_dataset(cfg.dataset.name,
                             p_fault=cfg.dataset.get('p_fault'),
                             p_noise=cfg.dataset.get('p_noise'),
-                            t_range=cfg.dataset.get('t_range'),
                             masked_s=cfg.dataset.get('masked_sensors'),
-                            agg_func=cfg.dataset.get('agg_func'),
-                            test_month=cfg.dataset.get('test_month'),
-                            location=cfg.dataset.get('location'),
                             connectivity=cfg.dataset.get('connectivity'),
-                            mode=cfg.dataset.get('mode'),
                             spatial_shift=cfg.dataset.get('spatial_shift'),
                             order=cfg.dataset.get('order'),
-                            node_features=cfg.dataset.get('node_features') if node_features is None else node_features)
+                            node_features=cfg.dataset.get('node_features'))
     print(f'Masked sensors: {masked_sensors}')
-    # covariates = {'u': dataset.datetime_encoded('day').values}
     adj = dataset.get_connectivity(**cfg.dataset.connectivity, layout='dense')
     
     torch_dataset = ImputationDataset(
         target=dataset.dataframe(),
         mask=dataset.training_mask,
         eval_mask=dataset.eval_mask,
-        # covariates=covariates,
         transform=MaskInput(),
         connectivity=adj,
         window=cfg.window,
@@ -213,9 +192,10 @@ def load_model_and_infer(og_path: str, index, dev, node_features=None):
     trainer = Trainer(
         max_epochs=cfg.epochs,
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
-        devices=[dev],
+        devices=cfg.device,
         gradient_clip_val=cfg.get('grad_clip_val', None),
-        gradient_clip_algorithm=cfg.get('grad_clip_alg', None))
+        gradient_clip_algorithm=cfg.get('grad_clip_alg', None),
+        logger=False)
     
     imputer = GeodeFiller.load_from_checkpoint(checkpoint_path, model_class=model_cls,
                           model_kwargs=model_kwargs,
@@ -223,24 +203,33 @@ def load_model_and_infer(og_path: str, index, dev, node_features=None):
                           gradient_clip_algorithm=cfg.grad_clip_alg,
                           known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
                           **cfg.model.regs)
-    imputer.to(torch.device(f'cuda:{dev}'))
     imputer.eval()
     
     # Run inference
-    trainer = torch.utils.data.DataLoader(dm.test_dataloader(), batch_size=cfg.batch_size)
     output = trainer.predict(imputer, dataloaders=dm.test_dataloader())
     output = imputer.collate_prediction_outputs(output)
     output = torch_to_numpy(output)
 
     y_hat, y_true, mask = (output['y_hat'], output['y'], output.get('eval_mask', None))
-    res = dict(test_mae=numpy_metrics.mae(y_hat, y_true, mask),
-               test_mre=numpy_metrics.mre(y_hat, y_true, mask),
-               test_rmse=numpy_metrics.rmse(y_hat, y_true, mask))
-    
+    if cfg.eval_setting == 'train_wise':
+        res = dict(test_mae=numpy_metrics.mae(y_hat, y_true, mask),
+                test_mre=numpy_metrics.mre(y_hat, y_true, mask),
+                test_mse=numpy_metrics.mse(y_hat, y_true, mask),
+                test_rmse=numpy_metrics.rmse(y_hat, y_true, mask))
+    elif cfg.eval_setting == 'test_wise':
+        res = test_wise_eval(y_hat, y_true, mask, 
+                             known_nodes=[i for i in range(adj.shape[0]) if i not in masked_sensors],
+                             adj=adj,
+                             mode='test',
+                             num_groups=cfg.num_groups)
     return res
 
 if __name__ == '__main__':
-    config_path = 'config/default.yaml'  # Path to config file
-    checkpoint_path = 'checkpoints/best_model.ckpt'  # Path to model checkpoint
-    results = load_model_and_infer(config_path, checkpoint_path)
+    parser = argparse.ArgumentParser(description='Run model inference with config and checkpoint.')
+    parser.add_argument('--config', type=str, required=True, help='Path to config YAML file.')
+    parser.add_argument('--checkpoint', type=str, required=True, help='Path to model checkpoint.')
+    args = parser.parse_args()
+
+    # Assuming this function is defined elsewhere
+    results = load_model_and_infer(args.config, args.checkpoint)
     print("Inference results:", results)

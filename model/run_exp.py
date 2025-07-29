@@ -9,14 +9,14 @@ import numpy as np
 from tsl import logger
 from tsl.data import ImputationDataset, SpatioTemporalDataModule
 from tsl.data.preprocessing import StandardScaler
-from tsl.datasets import AirQuality, MetrLA, PeMS07, PvUS, LargeST, PeMS04
+from tsl.datasets import AirQuality, MetrLA, PeMS07, PvUS, PeMS04
 from tsl.experiment import Experiment
 from tsl.metrics import numpy as numpy_metrics
 from tsl.metrics import torch as torch_metrics
 from tsl.transforms import MaskInput
 from tsl.utils.casting import torch_to_numpy
 
-from utils import add_missing_sensors
+from utils import add_missing_sensors, LargeST
 
 from geode import Geode
 from geode_filler import GeodeFiller
