@@ -32,11 +32,16 @@ The datasets we used are available under the TSL codebase, and is downloaded wit
 
 ## Usage
 
+All hyperparameter and dataset configurations are located in ```\model\config```. Specifically:
+- ```\model\config\default.yaml``` contains general training configurations and hyperparameters.
+- ```\model\config\dataset\*.yaml``` contains specific dataset configurations.
+- ```\model\config\model\geode.yaml``` contains specific geode hyperparameters.
+
 To train GEODE on all datasets, run the following from the root directory.
 ```
-bash run_exp-geode-trainwise-rnd.bash #For trainwise selection - RND
-bash run_exp-geode-trainwise-rnd.bash #For trainwise selection - CC
-bash run_exp-geode-testwise.bash #For testwise selection
+bash run_exp-geode-trainwise-rnd.bash   #For trainwise selection - RND
+bash run_exp-geode-trainwise-rnd.bash   #For trainwise selection - CC
+bash run_exp-geode-testwise.bash        #For testwise selection
 ```
 
 Saved models are in ```/logs```, while csv results are in ```/res```.
