@@ -3,7 +3,6 @@ hparams:
   hidden_size: 64
   gcn_layers: 1
   psd_layers: 1
-  dropout: 0.4
   intervention_steps: 5
   cmd_sample_ratio: 0.8
   att_window: 10

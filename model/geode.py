@@ -21,7 +21,7 @@ class RelTemporalEncoding(nn.Module):
         Implement the Temporal Encoding (Sinusoid) function.
     '''
 
-    def __init__(self, n_hid, max_len=50, dropout=0.2):  # original max_len=240
+    def __init__(self, n_hid, max_len=50):  # original max_len=240
         super(RelTemporalEncoding, self).__init__()
         position = torch.arange(0., max_len).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, n_hid, 2) *
@@ -47,7 +47,6 @@ class Geode(BaseModel):
                  gcn_layers,
                  psd_layers,
                  activation='tanh',
-                 dropout=0,
                  intervention_steps=2,
                  horizon=24,
                  cmd_sample_ratio=1.,
