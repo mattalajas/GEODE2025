@@ -51,4 +51,5 @@ To test a saved GEODE model, run the following from the root directory.
 python3 test_exp.py --config=<config_path.yaml> --checkpoint=<checkpoint_path.ckpt>
 ```
 
-Config and checkpoint paths are located in ```/logs```.
+Trained model configs and checkpoint paths are located in ```/logs```.
+Training results are located in ```/res```.
