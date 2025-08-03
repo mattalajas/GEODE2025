@@ -25,7 +25,7 @@ We use the following datasets:
 - AQI and AQI-SM
 - METR-LA
 - NREL-AL and NREL-MD
-- PEM07 and PEM04
+- PEMS07 and PEMS04
 - SD
 
 The datasets we used are available under the TSL codebase, and is downloaded within the training pipeline.
