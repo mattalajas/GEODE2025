@@ -33,7 +33,7 @@ batch_size: 32
 grad_clip_val: 1
 grad_clip_alg: 'norm'
 scale_target: True
-device: [2]
+device: [0]
 eval_setting: 'train_wise'
 num_groups: 4
 
