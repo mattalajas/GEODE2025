@@ -53,7 +53,7 @@ Saved models are in ```/logs```, while csv results are in ```/res```.
 
 To test a saved GEODE model, run the following from the root directory.
 ```
-python3 test_exp.py --config=<config_path.yaml> --checkpoint=<checkpoint_path.ckpt>
+python3 model/test_exp.py --config=<config_path.yaml> --checkpoint=<checkpoint_path.ckpt>
 ```
 
 Trained model configs and checkpoint paths are located in ```/logs```.
