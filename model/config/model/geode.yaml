@@ -5,7 +5,7 @@ hparams:
   psd_layers: 1
   intervention_steps: 5
   cmd_sample_ratio: 0.8
-  att_window: 10
+  att_window: 3
   k: 3
 regs:
   y1: 1 # IRM Loss

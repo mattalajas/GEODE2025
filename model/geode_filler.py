@@ -28,7 +28,6 @@ class Filler(pl.LightningModule):
                  optim_kwargs,
                  loss_fn,
                  scaled_target=False,
-                 whiten_prob=0.05,
                  metrics=None,
                  scheduler_class=None,
                  scheduler_kwargs=None,
@@ -42,7 +41,6 @@ class Filler(pl.LightningModule):
         :param optim_kwargs: Optimizer's keyword arguments.
         :param loss_fn: Loss function used for training.
         :param scaled_target: Whether to scale target before computing loss using batch processing information.
-        :param whiten_prob: Probability of removing a value and using it as ground truth for imputation.
         :param metrics: Dictionary of type {'metric1_name':metric1_fn, 'metric2_name':metric2_fn ...}.
         :param scheduler_class: Scheduler class.
         :param scheduler_kwargs: Scheduler's keyword arguments.
@@ -68,10 +66,6 @@ class Filler(pl.LightningModule):
             self.loss_fn = None
 
         self.scaled_target = scaled_target
-
-        # during training whiten ground-truth values with this probability
-        assert 0. <= whiten_prob <= 1.
-        self.keep_prob = 1. - whiten_prob
 
         if metrics is None:
             metrics = dict()
@@ -337,9 +331,6 @@ class GeodeFiller(Filler):
                  optim_kwargs,
                  loss_fn=None,
                  scaled_target=False,
-                 whiten_prob=0.05,
-                 pred_loss_weight=1.,
-                 warm_up=0,
                  metrics=None,
                  scheduler_class=None,
                  scheduler_kwargs=None,
@@ -355,14 +346,10 @@ class GeodeFiller(Filler):
                                                   optim_kwargs=optim_kwargs,
                                                   loss_fn=loss_fn,
                                                   scaled_target=scaled_target,
-                                                  whiten_prob=whiten_prob,
                                                   metrics=metrics,
                                                   scheduler_class=scheduler_class,
                                                   scheduler_kwargs=scheduler_kwargs,
                                                   known_set=known_set)
-        
-        self.tradeoff = pred_loss_weight
-        self.trimming = (warm_up, warm_up)
 
         self.known_set = known_set
         self.inductive = inductive
@@ -370,12 +357,6 @@ class GeodeFiller(Filler):
         self.gradient_clip_algorithm = gradient_clip_algorithm
         self.y1 = y1
         self.y2 = y2
-
-    def trim_seq(self, *seq):
-        seq = [s[:, self.trimming[0]:s.size(1) - self.trimming[1]] for s in seq]
-        if len(seq) == 1:
-            return seq[0]
-        return seq
     
     def load_model(self, filename: str):
         """Load model's weights from checkpoint at :attr:`filename`.
