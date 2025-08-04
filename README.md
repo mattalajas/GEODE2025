@@ -44,7 +44,7 @@ bash run_exp-geode-trainwise-rnd.bash   #For trainwise selection - CC
 bash run_exp-geode-testwise.bash        #For testwise selection
 ```
 
-To train GEODE on a single run, run the following from the root directory.
+To train GEODE on a single run, an example for AQI-36 is provided below. Run the following from the root directory.
 ```
 python3 model/mult_experiments.py 'dataset=aqism' 'model.hparams.k=2' 'model.hparams.psd_layers=2' 'model.hparams.gcn_layers=1' 'optimizer.hparams.lr=0.0001' 'model.regs.y2=0.5' --config-name=default
 ```
