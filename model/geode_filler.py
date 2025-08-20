@@ -501,19 +501,19 @@ class GeodeFiller(Filler):
         if self.y2 != 0:
             cmds = torch.tensor([]).to(x.device)
             for reco in finrecos:
-                B = reco.pop(0)
-                inv_emb_tru = rearrange(reco[0], 'b t d -> (b t) d')
-                inv_emb_vir = rearrange(reco[1], 'b t d -> (b t) d')
+                for t in range(s):
+                    inv_emb_tru = rearrange(reco[0][t], 'b n d -> (b n) d')
+                    inv_emb_vir = rearrange(reco[1][t], 'b n d -> (b n) d')
 
-                og_nt = inv_emb_tru.size(0) // (B*s)
-                cr_nt = inv_emb_vir.size(0) // (B*s)
+                    og_nt = inv_emb_tru.size(0) // (b)
+                    cr_nt = inv_emb_vir.size(0) // (b)
 
-                batches = torch.arange(0, B*s).to(device=x.device)
-                og_batch = torch.repeat_interleave(batches, repeats=(og_nt))
-                cr_batch = torch.repeat_interleave(batches, repeats=(cr_nt))
+                    batches = torch.arange(0, b).to(device=x.device)
+                    og_batch = torch.repeat_interleave(batches, repeats=(og_nt))
+                    cr_batch = torch.repeat_interleave(batches, repeats=(cr_nt))
 
-                cmds = torch.cat([cmds, torch.clamp(cmd(inv_emb_tru, inv_emb_vir, \
-                                                        og_batch, cr_batch, n_moments=2).mean(), min=0).unsqueeze(0)])
+                    cmds = torch.cat([cmds, torch.clamp(cmd(inv_emb_tru, inv_emb_vir, \
+                                                            og_batch, cr_batch, n_moments=3).mean(), min=0).unsqueeze(0)])
 
             recon_loss = cmds.mean()
         else:

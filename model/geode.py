@@ -9,6 +9,7 @@ from einops import rearrange
 from torch import nn
 from torch.nn import LayerNorm
 from torch_geometric.utils import dense_to_sparse, softmax, scatter
+from torch_geometric.nn.models import GCN
 from tsl.nn.blocks.encoders.mlp import MLP
 from tsl.nn.layers.graph_convs import DiffConv
 from tsl.nn.models.base_model import BaseModel
@@ -37,33 +38,15 @@ class RelTemporalEncoding(nn.Module):
         texp = t[:, None].expand(-1, x.shape[1])
         temb = self.lin(self.emb(texp))
         return x + temb
-
-class Geode(BaseModel):
+    
+class GeodeNBCD(nn.Module):
     def __init__(self,
-                 input_size,
                  hidden_size,
-                 output_size,
-                 adj,
-                 gcn_layers,
-                 psd_layers,
-                 activation='tanh',
-                 intervention_steps=2,
-                 horizon=24,
-                 cmd_sample_ratio=1.,
-                 att_window=3,
-                 k=5,
-                 att_heads=8):
-        super(Geode, self).__init__()
-
-        self.steps = intervention_steps
-        self.horizon = horizon
-        self.cmd_ratio = cmd_sample_ratio
-        self.k = k
-        self.att_heads = att_heads
-        self.att_window = att_window
-
+                 att_window,
+                 att_heads,
+                 activation='tanh'):
+        super(GeodeNBCD, self).__init__()
         self.time_emb = RelTemporalEncoding(hidden_size)
-        self.init_emb = nn.Linear(input_size, hidden_size)
 
         self.key = MLP(input_size=hidden_size,
                         hidden_size=hidden_size,
@@ -82,21 +65,141 @@ class Geode(BaseModel):
                             output_size=hidden_size,
                             activation=activation)
 
+        self.layernorm = LayerNorm(hidden_size)
+        self.att_window = att_window
+        self.att_heads = att_heads
+    
+    def forward(self, x_fwd, edge_index):
+        device = x_fwd.device
+        srcs = edge_index[0]
+        tars = edge_index[1]
+
+        tar_nodes = x_fwd[:, :, tars]
+        src_nodes = x_fwd[:, :, srcs]
+
+        B, T, N, D = x_fwd.shape
+        assert T >= 2 * self.att_window + 1
+        assert D % self.att_heads == 0
+        
+        d_k = D // self.att_heads
+
+        # Time encoding
+        tar_nodes = rearrange(tar_nodes, 'b t e d -> t (b e) d')
+        tar_nodes = self.time_emb(tar_nodes, torch.LongTensor(list(range(T))).to(device))
+        tar_fwd = rearrange(tar_nodes, 't (b e) d -> t b e d', b=B, e=len(tars))
+
+        src_nodes = rearrange(src_nodes, 'b t e d -> t (b e) d')
+        src_nodes = self.time_emb(src_nodes, torch.LongTensor(list(range(T))).to(device))
+        src_fwd = rearrange(src_nodes, 't (b e) d -> t b e d', b=B, e=len(srcs))
+
+        # Get the Q, K, V
+        q_mat = self.query(tar_fwd).view(T, B, len(tars), self.att_heads, d_k)
+        k_mat = self.key(src_fwd).view(T, B, len(tars), self.att_heads, d_k) 
+        v_mat = self.value(src_fwd).view(T, B, len(tars), self.att_heads, d_k)
+
+        # Message and attention scores
+        res_atts = (q_mat * k_mat).sum(dim=-1) / math.sqrt(d_k)
+        res_msgs = v_mat
+
+        padded_att = F.pad(res_atts, (0, 0, 0, 0, 0, 0, self.att_window, self.att_window))
+        padded_msg = F.pad(res_msgs, (0, 0, 0, 0, 0, 0, 0, 0, self.att_window, self.att_window))
+        
+        context_att = []
+        context_msg = []
+        for offset in range(-self.att_window, self.att_window + 1):
+            context_att.append(padded_att[self.att_window + offset : self.att_window + offset + T])  # [T, B, E, D]
+            context_msg.append(padded_msg[self.att_window + offset : self.att_window + offset + T])  # [T, B, E, D]
+
+        # [T, B, N*(att_window*2 + 1), D]
+        res_att_og = torch.cat(context_att, dim=2)
+        res_msg = torch.cat(context_msg, dim=2)
+
+        ei_tar = tars.repeat(self.att_window*2 + 1)
+
+        res_att = softmax(res_att_og, ei_tar, dim=2)
+        res = res_msg * res_att.unsqueeze(-1)   
+        res = res.view(T, B, -1, D)
+
+        spu_att = softmax(-res_att_og, ei_tar, dim=2)
+        spu = res_msg * spu_att.unsqueeze(-1)
+        spu = spu.view(T, B, -1, D)
+
+        causal_hat = scatter(res, ei_tar, dim=2, dim_size=N, reduce='add')  # [N,F]
+        spurious_hat = scatter(spu, ei_tar, dim=2, dim_size=N, reduce='add')  # [N,F]
+
+        causal_hat = rearrange(causal_hat, 't b n d -> b t n d')
+        spurious_hat = rearrange(spurious_hat, 't b n d -> b t n d')
+
+        output_invars = self.layernorm(self.out_proj(causal_hat)+x_fwd)
+        output_vars = self.layernorm(self.out_proj(spurious_hat))
+
+        return output_invars, output_vars
+
+class Geode(BaseModel):
+    def __init__(self,
+                 input_size,
+                 hidden_size,
+                 output_size,
+                 adj,
+                 gcn_layers,
+                 psd_layers,
+                 activation='tanh',
+                 intervention_steps=2,
+                 horizon=24,
+                 cmd_sample_ratio=1.,
+                 att_window=3,
+                 k=5,
+                 att_heads=8,
+                 nbcd_layers=2):
+        super(Geode, self).__init__()
+
+        self.steps = intervention_steps
+        self.horizon = horizon
+        self.cmd_ratio = cmd_sample_ratio
+        self.k = k
+        self.att_heads = att_heads
+        self.att_window = att_window
+
+        self.init_emb = nn.Linear(input_size, hidden_size)
+        self.nbcds = nn.ModuleList(GeodeNBCD(hidden_size, att_window,
+                                             att_heads, activation) for _ in range(nbcd_layers))
+
         self.layernorm0 = LayerNorm(hidden_size)
         self.layernorm1 = LayerNorm(hidden_size)
         self.layernorm2 = LayerNorm(hidden_size)
+        # self.layernorm3 = LayerNorm(hidden_size)
 
-        self.gcn1 = DiffConv(in_channels=hidden_size,
-                            out_channels=hidden_size,
-                            k=psd_layers,
-                            root_weight=None,
-                            activation=activation)
+        # self.gcn1 = DiffConv(in_channels=hidden_size,
+        #                     out_channels=hidden_size,
+        #                     k=psd_layers,
+        #                     root_weight=None,
+        #                     activation=activation)
+        
+        self.gcn1 = GCN(in_channels=hidden_size,
+                        hidden_channels=hidden_size,
+                        num_layers=psd_layers,
+                        out_channels=hidden_size,
+                        norm='LayerNorm',
+                        add_self_loops=None,
+                        act=activation)
+        # self.gcn3 = GCN(in_channels=hidden_size,
+        #                 hidden_channels=hidden_size,
+        #                 num_layers=psd_layers,
+        #                 out_channels=hidden_size,
+        #                 norm='LayerNorm',
+        #                 add_self_loops=None,
+        #                 act=activation)
         
         self.gcn2 = DiffConv(in_channels=hidden_size,
                             out_channels=hidden_size,
                             k=gcn_layers,
                             root_weight=True,
                             activation=activation)
+        # self.gcn3 = DiffConv(in_channels=hidden_size,
+        #                     out_channels=hidden_size,
+        #                     k=gcn_layers,
+        #                     root_weight=True,
+        #                     activation=activation)
 
         self.readout1 = nn.Linear(hidden_size, output_size)
         self.readout2 = nn.Linear(hidden_size*2, output_size)
@@ -133,8 +236,10 @@ class Geode(BaseModel):
         # Calculating variant and invariant features using self-attention 
         # across different nodes using their representations
         # ========================================
-        output_invars, output_vars = self.scaled_dot_product_mhattention(x_fwd, edge_index,
-                                                                         self.att_window, self.att_heads)
+        for layer in self.nbcds:
+            x_fwd_caus, output_vars = layer(x_fwd, edge_index) 
+            x_fwd = self.layernorm0(x_fwd_caus + x_fwd)
+        output_invars = x_fwd
 
         # ========================================
         # Create new adjacency matrix 
@@ -248,9 +353,13 @@ class Geode(BaseModel):
 
             xh_inv_0 = self.gcn1(rep_inv, rep_adj[0], rep_adj[1])
             xh_inv_1 = self.layernorm1(xh_inv_0)
+            # xh_inv_1 = self.gcn3(xh_inv_1, rep_adj[0], rep_adj[1])
+            # xh_inv_1 = self.layernorm3(xh_inv_1)
 
             xh_var_0 = self.gcn1(rep_var, rep_adj[0], rep_adj[1])
             xh_var_1 = self.layernorm1(xh_var_0)
+            # xh_var_1 = self.gcn3(xh_var_1, rep_adj[0], rep_adj[1])
+            # xh_var_1 = self.layernorm3(xh_var_1)
 
             cur_indices_tensor = torch.tensor(cur_indices, dtype=torch.long, device=device)
             cur_ind_exp = cur_indices_tensor[None, None, :, None].expand(b, t, -1, xh_inv_1.size(-1))
@@ -258,17 +367,18 @@ class Geode(BaseModel):
             xh_inv_2 = xh_inv_2.scatter(2, cur_ind_exp, xh_inv_1[:, :, -len(cur_indices):, :])
             xh_var_2 = xh_var_2.scatter(2, cur_ind_exp, xh_var_1[:, :, -len(cur_indices):, :])
 
-        xh_inv_3 = xh_inv_2
-        xh_var_3 = xh_var_2
-
         # ========================================
         # Final Message Passing
         # ========================================
-        xh_inv_3 = self.gcn2(xh_inv_3, gcn_adj[0], gcn_adj[1]) + xh_inv_3
+        xh_inv_3 = self.gcn2(xh_inv_2, gcn_adj[0], gcn_adj[1]) + xh_inv_2
         xh_inv_3 = self.layernorm2(xh_inv_3)
+        # xh_inv_3 = self.gcn3(xh_inv_3, gcn_adj[0], gcn_adj[1]) + xh_inv_3
+        # xh_inv_3 = self.layernorm3(xh_inv_3)
 
-        xh_var_3 = self.gcn2(xh_var_3, gcn_adj[0], gcn_adj[1]) + xh_var_3
+        xh_var_3 = self.gcn2(xh_var_2, gcn_adj[0], gcn_adj[1]) + xh_var_2
         xh_var_3 = self.layernorm2(xh_var_3)
+        # xh_var_3 = self.gcn3(xh_var_3, gcn_adj[0], gcn_adj[1]) + xh_var_3
+        # xh_var_3 = self.layernorm3(xh_var_3)
 
         finpreds = self.readout1(xh_inv_3)
         if not training:
@@ -278,14 +388,20 @@ class Geode(BaseModel):
         # CMD of embeddings
         # ========================================
         # Get embedding softmax
-        s_batch = b
+        N = xh_inv_3.shape[2]
         if self.cmd_ratio < 1.0:
-            s_batch = int(b*self.cmd_ratio)
-            indx = torch.randperm(b, device=device)[:s_batch]
-
-            vir_inv = xh_inv_3[indx]
+            n_cmd = int(N*self.cmd_ratio)
+            indx = torch.multinomial(torch.ones(N), n_cmd, replacement=False)
+            indx = set(indx.tolist())
+        else:
+            n_cmd = N
         
         finrecos = []
+
+        det_mask = torch.zeros_like(xh_inv_3).to(dtype=bool, device=device)
+        det_mask[:, :, :len(known_set)] = 1
+        xh_inv_3 = torch.where(det_mask, xh_inv_3.detach(), xh_inv_3) 
+
         for i in range(1, self.k+1):
             prev_group = []
             cur_group = []
@@ -295,16 +411,19 @@ class Geode(BaseModel):
             for j in range(i+1):
                 cur_group.extend(grouped[j])
 
-            emb_com_inv = vir_inv[:, :, prev_group]
-            emb_tru_inv = vir_inv[:, :, cur_group]
+            prev_group = list(set(prev_group) & indx)
+            cur_group = list(set(cur_group) & indx)
+            
+            emb_com_inv = xh_inv_3[:, :, prev_group]
+            emb_tru_inv = xh_inv_3[:, :, cur_group]
 
-            emb_com_inv = rearrange(emb_com_inv, 'b t n d -> b (t n) d')
-            emb_tru_inv = rearrange(emb_tru_inv, 'b t n d -> b (t n) d')
+            emb_com_inv = rearrange(emb_com_inv, 'b t n d -> t b n d')
+            emb_tru_inv = rearrange(emb_tru_inv, 'b t n d -> t b n d')
 
             if emb_tru_inv.numel() == 0:
                 continue
             else:
-                finrecos.append([s_batch, emb_com_inv, emb_tru_inv])
+                finrecos.append([emb_com_inv, emb_tru_inv])
 
         # ========================================
         # Disentanglement module
@@ -393,71 +512,3 @@ class Geode(BaseModel):
             print('error')
 
         return adj_aug_n1, levels
-
-    def scaled_dot_product_mhattention(self, x_fwd, edge_index, att_window, att_heads):
-        device = x_fwd.device
-        srcs = edge_index[0, :].T
-        tars = edge_index[1, :].T
-
-        tar_nodes = x_fwd[:, :, tars]
-        src_nodes = x_fwd[:, :, srcs]
-
-        B, T, N, D = tar_nodes.shape
-        assert T >= 2 * att_window + 1
-        assert D % att_heads == 0
-        
-        d_k = D // att_heads
-
-        # Time encoding
-        tar_nodes = rearrange(tar_nodes, 'b t n d -> t (b n) d')
-        tar_nodes = self.time_emb(tar_nodes, torch.LongTensor(list(range(T))).to(device))
-        tar_fwd = rearrange(tar_nodes, 't (b n) d -> t b n d', b=B, n=N)
-
-        src_nodes = rearrange(src_nodes, 'b t n d -> t (b n) d')
-        src_nodes = self.time_emb(src_nodes, torch.LongTensor(list(range(T))).to(device))
-        src_fwd = rearrange(src_nodes, 't (b n) d -> t b n d', b=B, n=N)
-
-        # Get the Q, K, V
-        q_mat = self.query(tar_fwd).view(T, B, N, att_heads, d_k)
-        k_mat = self.key(src_fwd).view(T, B, N, att_heads, d_k) 
-        v_mat = self.value(src_fwd).view(T, B, N, att_heads, d_k)
-
-        # Message and attention scores
-        res_atts = (q_mat * k_mat).sum(dim=-1) / math.sqrt(d_k)
-        res_msgs = v_mat
-
-        padded_att = F.pad(res_atts, (0, 0, 0, 0, 0, 0, att_window, att_window))
-        padded_msg = F.pad(res_msgs, (0, 0, 0, 0, 0, 0, 0, 0, att_window, att_window))
-        
-        context_att = []
-        context_msg = []
-        for offset in range(-att_window, att_window + 1):
-            context_att.append(padded_att[att_window + offset : att_window + offset + T])  # [T, B, E, D]
-            context_msg.append(padded_msg[att_window + offset : att_window + offset + T])  # [T, B, E, D]
-
-        # [T, B, N*(att_window*2 + 1), D]
-        res_att_og = torch.cat(context_att, dim=2)
-        res_msg = torch.cat(context_msg, dim=2)
-
-        ei_tar = tars.repeat(att_window*2 + 1)
-
-        res_att = softmax(res_att_og, ei_tar, dim=2)
-        t, b, n = res_att.shape[0], res_att.shape[1], res_att.shape[2]
-        res = res_msg * res_att.view(t, b, n, att_heads, 1)  
-        res = res.view(t, b, n, D)
-
-        spu_att = softmax(-res_att_og, ei_tar, dim=2)
-        t, b, n = spu_att.shape[0], spu_att.shape[1], spu_att.shape[2]
-        spu = res_msg * spu_att.view(t, b, n, att_heads, 1)  
-        spu = spu.view(t, b, n, D)
-
-        causal_hat = scatter(res, ei_tar, dim=2, dim_size=x_fwd.shape[2], reduce='add')  # [N,F]
-        spurious_hat = scatter(spu, ei_tar, dim=2, dim_size=x_fwd.shape[2], reduce='add')  # [N,F]
-
-        causal_hat = rearrange(causal_hat, 't b n d -> b t n d')
-        spurious_hat = rearrange(spurious_hat, 't b n d -> b t n d')
-
-        output_invars = self.out_proj(self.layernorm0(causal_hat+x_fwd))
-        output_vars = self.out_proj(self.layernorm0(spurious_hat))
-
-        return output_invars, output_vars
