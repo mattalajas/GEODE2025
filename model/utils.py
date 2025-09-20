@@ -1,12 +1,47 @@
 import math
+from typing import Iterable, Tuple
+from functools import partial
 
 import networkx as nx
 import numpy as np
 import torch
+import tsl
+from torch import Tensor
 from torch_scatter import scatter
+from torch_geometric.data.storage import recursive_apply
+from tsl.data import ImputationDataset
+from tsl.data.preprocessing import Scaler, ScalerModule
 from tsl.datasets.prototypes import TabularDataset
 from tsl.metrics import numpy as numpy_metrics
 from tsl.ops.imputation import to_missing_values_dataset
+from tsl.ops.pattern import broadcast, outer_pattern, take
+from tsl.typing import TensArray
+
+
+def zeros_to_one_(scale):
+    """Set to 1 scales of near constant features, detected by identifying
+    scales close to machine precision, in place.
+    Adapted from :class:`sklearn.preprocessing._data._handle_zeros_in_scale`
+    """
+    if np.isscalar(scale):
+        return 1.0 if np.isclose(scale, 0.) else scale
+    eps = 10 * np.finfo(scale.dtype).eps
+    zeros = np.isclose(scale, 0., atol=eps, rtol=eps)
+    scale[zeros] = 1.0
+    return scale
+
+
+def fit_wrapper(fit_function):
+
+    def fit(obj: "Scaler", x, *args, **kwargs) -> "Scaler":
+        x_type = type(x)
+        x = np.asarray(x)
+        fit_function(obj, x, *args, **kwargs)
+        if x_type is Tensor:
+            obj.torch()
+        return obj
+
+    return fit
 
 def closest_distances_unweighted(G, source_nodes, target_nodes):
     result = {}
@@ -258,10 +293,9 @@ from typing import Dict, Literal, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
-
-from tsl.utils import download_url, extract_zip
 from tsl.datasets.prototypes import DatetimeDataset
 from tsl.datasets.prototypes.casting import to_pandas_freq
+from tsl.utils import download_url, extract_zip
 
 __base_url__ = "https://drive.switch.ch/index.php/s/nJgK7ca28hk7AMU/download"
 __subsets__ = ["CA", "GBA", "GLA", "SD"]
@@ -499,3 +533,872 @@ class LargeST(DatetimeDataset):
         if method == "precomputed":
             # load precomputed adjacency matrix based on road distance
             return self.adj
+
+import itertools
+from typing import List, Optional, Sequence
+
+from tsl.data.datamodule.splitters import Splitter, disjoint_months
+from tsl.data.synch_mode import HORIZON
+from tsl.datasets.prototypes.mixin import MissingValuesMixin
+
+COLS = ['pm10ConcNumIndividual.value', 'pm1ConcNumIndividual.value',
+        'pm2_5ConcNumIndividual.value', 'relHumidInternalIndividual.value']
+AUCKLAND = {
+    'df' :      pd.DataFrame({
+                'locationLatitude': [-36.844079, -36.844113, -36.711932, -36.898491, -36.906652, -36.876728],
+                'locationLongitude': [174.762123, 174.761371, 174.740808, 174.591428, 174.633079, 174.703081]}), 
+    'timezone': 'Pacific/Auckland'}
+
+INVERCARGILL2 = {
+    'df' :      pd.DataFrame({
+                'locationLongitude': [168.354731, 168.350339, 168.350151, 168.374574, 168.387039, 168.350258, 168.381864,
+                                     168.375167, 168.350805, 168.377209, 168.382873, 168.384734, 168.361357, 168.375977,
+                                     168.35045, 168.349358, 168.346235, 168.361723, 168.386655, 168.366703, 168.361048, 
+                                     168.374085, 168.350047, 168.370799, 168.353385, 168.366792, 168.361174, 168.383326,
+                                     168.369778, 168.360898, 168.360781, 168.38856, 168.360558, 168.369855, 168.36128,
+                                     168.355503, 168.379932, 168.375381, 168.366307, 168.377629, 168.354625, 168.374201],
+
+                'locationLatitude': [-46.423463, -46.391143, -46.404305, -46.403735, -46.435166, -46.391083, -46.402722,
+                                     -46.396632, -46.395459, -46.423565, -46.385037, -46.391359, -46.38417, -46.416871,
+                                     -46.384261, -46.378189, -46.379938, -46.396574, -46.423486, -46.423553, -46.410818,
+                                     -46.403778, -46.404272, -46.410898, -46.41079, -46.430023, -46.390393, -46.397899,
+                                     -46.430981, -46.442108, -46.43678, -46.417054, -46.375673, -46.431264, -46.404628, 
+                                     -46.416806, -46.409627, -46.396528, -46.417347, -46.430643, -46.429926, -46.390498]}), 
+    'timezone': 'Pacific/Auckland'}
+
+INVERCARGILL1 = {
+    'df' :      pd.DataFrame({
+                'locationLongitude': [168.382115, 168.354731, 168.367298, 168.387039, 168.372177, 168.382602, 168.354712,
+                                      168.359962, 168.377209, 168.359915, 168.375977, 168.38748, 168.386655, 168.366703,
+                                      168.360128, 168.377406, 168.382387, 168.354391, 168.376304, 168.371295, 168.372183,
+                                      168.366792, 168.35456, 168.371516, 168.366803, 168.371293, 168.387123, 168.382709,
+                                      168.38856, 168.387645, 168.377232, 168.360316, 168.355503, 168.381202, 168.359866,
+                                      168.359854, 168.377629, 168.354625, 168.366307, 168.382259, 168.371009],
+
+                'locationLatitude': [-46.42718, -46.423463, -46.433992, -46.435166, -46.430401, -46.420204, -46.420094,
+                                     -46.426834, -46.423565, -46.420217, -46.416871, -46.430598, -46.423486, -46.423553,
+                                     -46.430016, -46.419827, -46.429942, -46.426854, -46.434382, -46.420081, -46.427286,
+                                     -46.430023, -46.434065, -46.43433, -46.427105, -46.42341, -46.420234, -46.416867,
+                                     -46.417054, -46.426916, -46.426421, -46.434034, -46.416806, -46.43481, -46.416669,
+                                     -46.423492, -46.430643, -46.429926, -46.417347, -46.423572, -46.417033]}), 
+    'timezone': 'Pacific/Auckland'}
+
+LOCATIONS = ['Auckland', 'Invercargill1', 'Invercargill2']
+
+def AirQualityCreate(path, agg_func = 'mean', features=None, t_range=None, location='Auckland'):
+    for feat in features:
+        assert feat in COLS
+
+    assert agg_func in ['mean', 'max', 'min']
+    features = {feat:agg_func for feat in features}
+
+    assert location in LOCATIONS, f'Locations must be {LOCATIONS}'
+    if location == 'Auckland':
+        lat_long_vals = AUCKLAND["df"]
+    elif location == 'Invercargill1':
+        lat_long_vals = INVERCARGILL1['df']
+    elif location == 'Invercargill2':
+        lat_long_vals = INVERCARGILL2['df']
+
+    df = pd.read_csv(path)
+    df['datetime'] = pd.to_datetime(df['time'], utc=True)
+    df['locationLatitude'] = df['locationLatitude'].round(6)
+    df['locationLongitude'] = df['locationLongitude'].round(6)
+    cols_to_keep = ['datetime', 'locationLatitude', 'locationLongitude'] + list(features.keys())
+
+    # Clean dataset
+    if features:
+        df = df[cols_to_keep]
+    if t_range:
+        df = df[(df['datetime'] > pd.to_datetime(t_range[0],unit="ns", utc=True)) 
+                & (df['datetime'] < pd.to_datetime(t_range[1],unit="ns", utc=True))]
+    if not lat_long_vals.empty:
+        df = df.merge(lat_long_vals, on=['locationLatitude', 'locationLongitude'])
+
+    fin_df = df.groupby([pd.Grouper(key='datetime', freq='h'), 'locationLatitude', 'locationLongitude']).agg(features).reset_index()
+
+    unique_stations = fin_df[['locationLatitude', 'locationLongitude']].drop_duplicates().dropna().reset_index(drop=True)
+    unique_stations['station'] = range(1, len(unique_stations) + 1)  
+    
+    fin_df = fin_df.merge(unique_stations, on=['locationLatitude', 'locationLongitude'], how='left')
+
+    # Shape daset
+    unique_datetimes = fin_df["datetime"].unique()
+
+    datetime_range = pd.date_range(start=np.min(unique_datetimes), end=np.max(unique_datetimes), freq='h')
+    unique_stations = fin_df["station"].unique()
+
+    all_combinations = pd.DataFrame(
+        list(itertools.product(datetime_range, unique_stations)),
+        columns=["datetime", "station"]
+    )
+
+    df_complete = all_combinations.merge(fin_df, on=["datetime", "station"], how="left")
+    df_complete[['locationLatitude', 'locationLongitude']] = \
+        df_complete.groupby('station')[['locationLatitude', 'locationLongitude']].transform(lambda x: x.ffill().bfill())
+
+    return df_complete
+
+# niwa_df = AirQualityCreate('../../../AirData/Niwa/allNIWA_clarity.csv', ['pm2_5ConcNumIndividual.value', 'relHumidInternalIndividual.value'], ['2022-04-01', '2022-12-01'])
+
+class AirQualitySplitter(Splitter):
+
+    def __init__(self,
+                 val_len: int = None,
+                 test_months: Sequence = (3, 6, 9, 12)):
+        super(AirQualitySplitter, self).__init__()
+        self._val_len = val_len
+        self.test_months = test_months
+
+    def fit(self, dataset):
+        nontest_idxs, test_idxs = disjoint_months(dataset,
+                                                  months=self.test_months,
+                                                  synch_mode=HORIZON)
+        # take equal number of samples before each month of testing
+        val_len = self._val_len
+        if val_len < 1:
+            val_len = int(val_len * len(nontest_idxs))
+        val_len = val_len // len(self.test_months)
+        # get indices of first day of each testing month
+        delta = np.diff(test_idxs)
+        delta_idxs = np.flatnonzero(delta > delta.min())
+        end_month_idxs = test_idxs[1:][delta_idxs]
+        if len(end_month_idxs) < len(self.test_months):
+            end_month_idxs = np.insert(end_month_idxs, 0, test_idxs[0])
+        # expand month indices
+        month_val_idxs = [
+            np.arange(v_idx - val_len, v_idx) - dataset.window
+            for v_idx in end_month_idxs
+        ]
+        val_idxs = np.concatenate(month_val_idxs) % len(dataset)
+        # remove overlapping indices from training set
+        ovl_idxs, _ = dataset.overlapping_indices(nontest_idxs,
+                                                  val_idxs,
+                                                  synch_mode=HORIZON,
+                                                  as_mask=True)
+        train_idxs = nontest_idxs[~ovl_idxs]
+        self.set_indices(train_idxs, val_idxs, test_idxs)
+
+class AirQualityAuckland(DatetimeDataset, MissingValuesMixin):
+    similarity_options = {'distance'}
+
+    def __init__(self,
+                 root: str = None,
+                 impute_nans: bool = True,
+                 test_months: Sequence = (7, 8),
+                 infer_eval_from: str = 'next',
+                 features: list = ['pm2_5ConcNumIndividual.value'],
+                 agg_func: str = 'mean',
+                 location: str = 'Auckland',
+                 t_range: Optional[list] = None,
+                 freq: Optional[str] = None,
+                 masked_sensors: Optional[Sequence] = None,
+                 p: Optional[float] = 1.):
+        self.root = root
+        self.test_months = test_months
+        self.infer_eval_from = infer_eval_from  # [next, previous]
+        self.features = features
+        self.t_range = t_range
+        self.agg_func = agg_func
+        self.location = location
+
+        if masked_sensors is None:
+            self.masked_sensors = []
+        else:
+            self.masked_sensors = list(masked_sensors)
+
+        if location == 'Auckland':
+            self.save_p = 'auck_aqi_dist'
+        elif location == 'Invercargill1':
+            self.save_p = 'invg1_aqi_dist'
+        elif location == 'Invercargill2':
+            self.save_p = 'invg2_aqi_dist'
+        
+        df, mask, eval_mask, dist = self.load(impute_nans=impute_nans, p=p)
+        super().__init__(target=df,
+                         mask=mask,
+                         freq=freq,
+                         similarity_score='distance',
+                         temporal_aggregation='mean',
+                         spatial_aggregation='mean',
+                         default_splitting_method='air_quality',
+                         name='AQI12')
+        
+        self.add_covariate('dist', dist, pattern='n n')
+        self.set_eval_mask(eval_mask)
+
+        self.df = df
+        # self.masks = mask
+        # self.eval_masks = eval_mask
+        # self.distance = dist
+
+    @property
+    def raw_file_names(self) -> List[str]:
+        return ['allNIWA_clarity.csv']
+
+    @property
+    def required_file_names(self) -> List[str]:
+        return self.raw_file_names + [f'{self.save_p}.npy']
+
+    def build(self):
+        # compute distances from latitude and longitude degrees
+        path = os.path.join(self.root_dir, 'allNIWA_clarity.csv')
+        stations = AirQualityCreate(path, self.agg_func, self.features, self.t_range, self.location)
+        stations = stations.drop_duplicates(subset=["station"])[["station", "locationLatitude", "locationLongitude"]]
+        self.stations = stations
+
+        st_coord = stations.loc[:, ['locationLatitude', 'locationLongitude']]
+        from tsl.ops.similarities import geographical_distance
+        dist = geographical_distance(st_coord, to_rad=True).values
+        np.save(os.path.join(self.root_dir, f'{self.save_p}.npy'), dist)
+
+    def load_raw(self):
+        self.maybe_build()
+        dist = np.load(os.path.join(self.root_dir, f'{self.save_p}.npy'))
+        path = os.path.join(self.root_dir, 'allNIWA_clarity.csv')
+        eval_mask = None
+        df = AirQualityCreate(path, self.agg_func, self.features, self.t_range, self.location)
+        stations = df.drop_duplicates(subset=["station"])[["station", "locationLatitude", "locationLongitude"]]
+        self.stations = stations
+
+        df_pivot = df.pivot(index="datetime", columns="station", values=self.features)
+        df_pivot.columns.names = ["channels", "nodes"]
+        df_pivot.columns = df_pivot.columns.swaplevel(0, 1) 
+        df_pivot.sort_index(axis=1, level=0, inplace=True)
+        df_pivot = df_pivot.rename(columns={feat: ind for ind, feat in enumerate(self.features)})
+        
+        return pd.DataFrame(df_pivot), dist, eval_mask
+
+    def load(self, impute_nans=True, p=1.):
+        # load readings and stations metadata
+        df, dist, eval_mask = self.load_raw()
+        # compute the masks:
+        mask = ((~np.isnan(df.values)) & (df.values != 0)).astype('uint8')  # 1 if value is valid
+        if eval_mask is None:
+            eval_mask = np.zeros((mask.shape))
+        # 1 if value is ground-truth for imputation
+        if len(self.masked_sensors):
+            eval_mask[:, self.masked_sensors] = mask[:, self.masked_sensors]
+        else:
+            eval_mask = sample_mask(mask.shape,
+                                    p=0.,
+                                    p_noise=p,
+                                    mode="road")
+            
+        # eventually replace nans with weekly mean by hour
+        if impute_nans:
+            from tsl.ops.framearray import temporal_mean
+            df = df.fillna(temporal_mean(df))
+        return df, mask, eval_mask, dist
+
+    def get_splitter(self, method: Optional[str] = None, **kwargs):
+        if method == 'air_quality':
+            val_len = kwargs.get('val_len')
+            return AirQualitySplitter(test_months=self.test_months,
+                                      val_len=val_len)
+
+    def compute_similarity(self, method: str, **kwargs):
+        if method == "distance":
+            from tsl.ops.similarities import gaussian_kernel
+
+            # use same theta for both air and air36
+            theta = np.std(self.dist)
+            return gaussian_kernel(self.dist, theta=theta)
+        
+class TrafAirSplitter(Splitter):
+    def __init__(self,
+                 val_len: int = None,
+                 test_months: Sequence = (3, 6, 9, 12)):
+        super(TrafAirSplitter, self).__init__()
+        self._val_len = val_len
+        self.test_months = test_months
+
+    def fit(self, dataset):
+        nontest_idxs, test_idxs = disjoint_months(dataset,
+                                                  months=self.test_months,
+                                                  synch_mode=HORIZON)
+        # take equal number of samples before each month of testing
+        val_len = self._val_len
+        if val_len < 1:
+            val_len = int(val_len * len(nontest_idxs))
+        val_len = val_len // len(self.test_months)
+        # get indices of first day of each testing month
+        delta = np.diff(test_idxs)
+        delta_idxs = np.flatnonzero(delta > delta.min())
+        end_month_idxs = test_idxs[1:][delta_idxs]
+        if len(end_month_idxs) < len(self.test_months):
+            end_month_idxs = np.insert(end_month_idxs, 0, test_idxs[0])
+        # expand month indices
+        month_val_idxs = [
+            np.arange(v_idx - val_len, v_idx) - dataset.window
+            for v_idx in end_month_idxs
+        ]
+        val_idxs = np.concatenate(month_val_idxs) % len(dataset)
+        # remove overlapping indices from training set
+        ovl_idxs, _ = dataset.overlapping_indices(nontest_idxs,
+                                                  val_idxs,
+                                                  synch_mode=HORIZON,
+                                                  as_mask=True)
+        train_idxs = nontest_idxs[~ovl_idxs]
+        self.set_indices(train_idxs, val_idxs, test_idxs)
+
+class AirCross(DatetimeDataset):
+    similarity_options = {"precomputed"}
+
+    def __init__(self,
+                 root: str = None,
+                 test_months: Sequence = (3, 6, 9, 12),
+                 imputation_mode: Literal["nearest", "zero", None] = "zero",
+                 freq: str = "h",
+                 include_traffic: bool = False):
+        # set root path
+        self.root = root
+        self.imputation_mode = imputation_mode
+        self.test_months = test_months
+        self.include_traffic = include_traffic
+
+        assert imputation_mode in ["nearest", "zero", None]
+
+        # Set dataset frequency here to resample when loading
+        if freq is not None:
+            freq = to_pandas_freq(freq)
+        self.freq = freq
+
+        # load dataset
+        readings, mask, adj, air_metadata, tra_metadata, modality = self.load()
+        self.tra_metadata = tra_metadata
+        self.air_metadata = air_metadata
+        self.modality = modality
+        covariates = {"adj": (adj, 'n n')}
+        
+        super().__init__(target=readings,
+                         freq=freq,
+                         mask=mask,
+                         covariates=covariates,
+                         similarity_score="precomputed",
+                         temporal_aggregation="mean",
+                         spatial_aggregation="mean",
+                         default_splitting_method='trafair',
+                         name='AirCross')
+
+    def load_raw(self):
+        # load sensors information
+        air_metadata = pd.read_csv(os.path.join(self.root_dir, 'air_metadata.csv'))
+        self.air_max_nodes = len(air_metadata)
+
+        tra_metadata = pd.read_csv(os.path.join(self.root_dir, 'traffic_metadata.csv'))
+        self.tra_max_nodes = len(tra_metadata)
+
+        readings = pd.read_csv(os.path.join(self.root_dir, 'full_data.csv'), index_col=0, parse_dates=['Time'])
+        modality = np.zeros((len(readings.columns), 1))
+        modality[self.air_max_nodes:] = 1
+
+        if not self.include_traffic:
+            readings = readings.iloc[:, :self.air_max_nodes]
+            modality = modality[:self.air_max_nodes]
+
+        # resample here to aggregate only valid observations and
+        # align to authors' preprocessing
+        if self.freq is not None:
+            readings = readings.apply(pd.to_numeric, errors='coerce')
+            readings = readings.resample(self.freq).mean()
+
+        # load adjacency
+        ar_edge_index, ar_edge_weight = np.load(os.path.join(self.root_dir, 'air_adj.npz')).values()
+        ar_adj = np.eye(self.air_max_nodes, dtype=np.float32)
+        ar_adj[tuple(ar_edge_index)] = ar_edge_weight
+
+        # Get adj for traffic 
+        if self.include_traffic:
+            tr_edge_index, tr_edge_weight = np.load(os.path.join(self.root_dir, 'traffic_adj.npz')).values()
+            cr_edge_index, cr_edge_weight = np.load(os.path.join(self.root_dir, 'cross_adj.npz')).values()
+            # build square adj from coo to add adj as covariate
+
+            tr_adj = np.eye(self.tra_max_nodes, dtype=np.float32)
+            tr_adj[tuple(tr_edge_index)] = tr_edge_weight
+
+            cr_adj = np.zeros((self.air_max_nodes, self.tra_max_nodes), dtype=np.float32)
+            cr_adj[tuple(cr_edge_index)] = cr_edge_weight
+
+            # cross_adj = pd.read_csv(os.path.join(self.root_dir, 'cross_dist.csv'))
+            adj = np.block([
+                [ar_adj,  cr_adj],
+                [cr_adj.T, tr_adj]
+            ])
+        else:
+            adj = ar_adj
+
+        return readings, adj, air_metadata, tra_metadata, modality
+    
+    def get_splitter(self, method: Optional[str] = None, **kwargs):
+        if method == 'trafair':
+            val_len = kwargs.get('val_len')
+            return TrafAirSplitter(test_months=self.test_months,
+                                    val_len=val_len)
+
+    def load(self):
+        readings, adj, air_metadata, tra_metadata, modality = self.load_raw()
+        # impute missing observations using last observed values
+        # in authors' code: readings = readings.fillna(0)
+        mask = ~readings.isna().values
+        if self.imputation_mode == "nearest":
+            readings = readings.ffill().bfill()
+        elif self.imputation_mode == "zero":
+            readings = readings.fillna(0)
+        return readings, mask, adj, air_metadata, tra_metadata, modality
+
+    def compute_similarity(self, method: str, **kwargs):
+        if method == "precomputed":
+            # load precomputed adjacency matrix based on road distance
+            return self.adj
+        
+def add_missing_sensors_cross(dataset: AirCross,
+                              p_noise=0.05,
+                              p_fault=0.01,
+                              min_seq=1,
+                              max_seq=10,
+                              seed=None,
+                              inplace=True,
+                              masked_sensors = [],
+                              connect = None,
+                              spatial_shift = False, 
+                              order = 0,
+                              node_features = 'CC',
+                              mode='road'):
+    if seed is None:
+        seed = np.random.randint(1e9)
+    # Fix seed for random mask generation
+    random = np.random.default_rng(seed)
+
+    # Compute evaluation mask
+    shape = (dataset.length, dataset.air_max_nodes, dataset.n_channels)
+    adj = dataset.get_connectivity(**connect, layout='dense')
+    air_adj = adj[:dataset.air_max_nodes, :dataset.air_max_nodes]  
+    eval_mask = np.zeros_like(dataset.mask)
+
+    if masked_sensors is None:
+        if spatial_shift:
+            tmp_mask = shift_mask(shape, feature=node_features, order=order, 
+                                   adj=air_adj)
+            dataset.seed = seed
+        else:
+            tmp_mask = sample_mask(shape,
+                                    p=p_fault,
+                                    p_noise=p_noise,
+                                    mode=mode,
+                                    adj=air_adj)
+            
+            dataset.p_fault = p_fault
+            dataset.p_noise = p_noise
+            dataset.min_seq = min_seq
+            dataset.max_seq = max_seq
+            dataset.seed = seed
+            dataset.random = random
+
+        # mask = rearrange(eval_mask, "b n 1 -> b n")
+        mask_sum = tmp_mask.sum(0)  # n
+        masked_sensors = (np.where(mask_sum > 0)[0]).tolist()
+        eval_mask[:, :dataset.air_max_nodes] = tmp_mask
+    else:
+        masked_sensors = list(masked_sensors)
+        eval_mask = np.zeros_like(dataset.mask)
+        eval_mask[:, masked_sensors] = dataset.mask[:, masked_sensors]
+
+    # Convert to missing values dataset
+    dataset = to_missing_values_dataset(dataset, eval_mask, inplace)
+
+    test2 = np.sum(dataset.mask, axis=(0))
+    test1 = np.sum(eval_mask, axis=(0))
+
+    # Store evaluation mask params in dataset
+    return dataset, masked_sensors
+
+class StandardScalerSplit(Scaler):
+    """Apply standardization to data by removing mean and scaling to unit
+    variance.
+
+    Args:
+        axis (int): dimensions of input to fit parameters on.
+            (default: 0)
+    """
+
+    def __init__(self, split: int, axis: Union[int, Tuple] = 0):
+        super(StandardScalerSplit, self).__init__()
+        self.axis = axis
+        self.split = split
+
+    @fit_wrapper
+    def fit(self, x: TensArray, mask=None, keepdims=True):
+        r"""Fit scaler's parameters `bias` :math:`\mu` and `scale`
+        :math:`\sigma` as the mean and the standard deviation of :obj:`x`,
+        respectively.
+
+        Args:
+            x: array-like input
+            mask (optional): boolean mask to denote elements of :obj:`x` on
+                which to fit the parameters.
+                (default: :obj:`None`)
+            keepdims (bool): whether to keep the same dimensions as :obj:`x` in
+                the parameters.
+                (default: :obj:`True`)
+        """
+        if mask is not None:
+            x = np.where(mask, x, np.nan)
+            t, n, f = x.shape
+
+            first_half = x[:, :self.split, :] 
+            second_half = x[:, self.split:, :]  
+
+            first = np.nanmean(first_half.astype(np.float32),
+                                axis=self.axis,
+                                keepdims=keepdims).astype(x.dtype)
+            second = np.nanmean(second_half.astype(np.float32),
+                                axis=self.axis,
+                                keepdims=keepdims).astype(x.dtype)
+
+            filled_first = np.tile(first, (1, self.split, 1))
+            filled_second = np.tile(second, (1, n - self.split, 1))
+
+            self.bias = np.concatenate([filled_first, filled_second], axis=1)
+
+            first = np.nanstd(first_half.astype(np.float32),
+                                axis=self.axis,
+                                keepdims=keepdims).astype(x.dtype)
+            second = np.nanstd(second_half.astype(np.float32),
+                                axis=self.axis,
+                                keepdims=keepdims).astype(x.dtype)
+
+            filled_first = np.tile(first, (1, self.split, 1))
+            filled_second = np.tile(second, (1, n - self.split, 1))
+
+            self.scale = np.concatenate([filled_first, filled_second], axis=1)
+        else:
+            t, n, f = x.shape
+
+            first_half = x[:, :self.split, :] 
+            second_half = x[:, self.split:, :]  
+
+            first = first_half.mean(axis=(0, 1), keepdims=True)  # (1, 1, f)
+            second = second_half.mean(axis=(0, 1), keepdims=True)  # (1, 1, f)
+
+            filled_first = np.tile(first, (1, self.split, 1))
+            filled_second = np.tile(second, (1, n - self.split, 1))
+            
+            self.bias = np.concatenate([filled_first, filled_second], axis=1)
+
+            first = first_half.std(axis=(0, 1), keepdims=True)  # (1, 1, f)
+            second = second_half.std(axis=(0, 1), keepdims=True)  # (1, 1, f)
+
+            filled_first = np.tile(first, (1, self.split, 1))
+            filled_second = np.tile(second, (1, n - self.split, 1))
+
+            self.scale = np.concatenate([filled_first, filled_second], axis=1)
+        self.scale = zeros_to_one_(self.scale)
+        return self
+
+    def transform(self, x: TensArray):
+        r"""Apply transformation :math:`f(x) = (x - \mu) / \sigma`."""
+        return (x - self.bias) / (self.scale + tsl.epsilon)
+
+    def inverse_transform(self, x: TensArray):
+        r"""Apply inverse transformation
+        :math:`f(x) = (x \cdot \sigma) + \mu`."""
+        return x * (self.scale + tsl.epsilon) + self.bias
+
+    def fit_transform(self, x: TensArray, *args, **kwargs):
+        r"""Fit scaler's parameters using input :obj:`x` and then transform
+        :obj:`x`."""
+        self.fit(x, *args, **kwargs)
+        return self.transform(x)
+    
+class ScalerSplitModule(ScalerModule):
+    def __init__(self,
+                 scaler: Optional[Union["Scaler", "ScalerModule"]] = None,
+                 *,
+                 bias: Union[Tensor, float] = 0.,
+                 scale: Union[Tensor, float] = 1.,
+                 pattern: Optional[str] = None):
+        super().__init__(scaler, bias=bias, scale=scale, pattern=pattern)
+        self.bias_list = torch.unique(scaler.bias)
+        self.scale_list = torch.unique(scaler.scale)
+
+    def _get_name(self):
+        return self.__class__.__name__
+
+    def transform_tensor(self, x: Tensor, split = None) -> Tensor:
+        if split:
+            temp_bias = torch.zeros_like(x).to(x.device)
+            temp_bias[:, :, :split] = self.bias_list[0]
+            temp_bias[:, :, split:] = self.bias_list[1]
+
+            temp_scale = torch.zeros_like(x).to(x.device)
+            temp_scale[:, :, :split] = self.scale_list[0]
+            temp_scale[:, :, split:] = self.scale_list[1]
+
+            return (x - temp_bias) / temp_scale + tsl.epsilon
+        else:
+            return (x - self.bias) / self.scale + tsl.epsilon
+
+    def inverse_transform_tensor(self, x: Tensor, split = None) -> Tensor:
+        if split:
+            temp_bias = torch.zeros_like(x).to(x.device)
+            temp_bias[:, :, :split] = self.bias_list[0]
+            temp_bias[:, :, split:] = self.bias_list[1]
+
+            temp_scale = torch.zeros_like(x).to(x.device)
+            temp_scale[:, :, :split] = self.scale_list[0]
+            temp_scale[:, :, split:] = self.scale_list[1]
+
+            return x * (temp_scale + tsl.epsilon) + temp_bias
+        else:
+            return x * (self.scale + tsl.epsilon) + self.bias
+
+    def transform(self, x, split=None):
+        split_trans_tensor = partial(self.transform_tensor, split=split)
+        return recursive_apply(x, split_trans_tensor)
+
+    def inverse_transform(self, x, split=None):
+        split_invtr_tensor = partial(self.inverse_transform_tensor, split=split)
+        return recursive_apply(x, split_invtr_tensor)
+    
+    def slice(self,
+              time_index: Union[List, Tensor] = None,
+              node_index: Union[List, Tensor] = None):
+        if self.pattern is None:
+            raise RuntimeError("You are trying to slice a scaler with no "
+                               "pattern.")
+        # move to new object
+        scaler = ScalerSplitModule(self)
+        # shortcut for when scaler is time-unvarying and node_index is None
+        if time_index is None and node_index is None:
+            return scaler
+
+        # if time-unvarying scaler, just apply unsqueezing indexing
+        new_axes, pattern = None, scaler.pattern
+        if time_index is not None and time_index.ndim == 2:
+            new_axes = torch.zeros(1, 1, dtype=torch.long)
+            pattern = 'b ' + scaler.pattern
+
+        # compute actual slicing for each param
+        t, n = self.t_axis, self.n_axis  # axis of time and node dimensions
+        ti_bias = ti_scale = time_index
+        ni_bias = ni_scale = node_index
+        if self.t_axis is not None:
+            ti_bias = time_index if self.bias.size(t) > 1 else new_axes
+            ti_scale = time_index if self.scale.size(t) > 1 else new_axes
+        if self.n_axis is not None:
+            ni_bias = node_index if self.bias.size(n) > 1 else None
+            ni_scale = node_index if self.scale.size(n) > 1 else None
+
+        # slice params
+        scaler.bias = take(scaler.bias,
+                           self.pattern,
+                           time_index=ti_bias,
+                           node_index=ni_bias)
+        scaler.scale = take(scaler.scale,
+                            self.pattern,
+                            time_index=ti_scale,
+                            node_index=ni_scale)
+        # update pattern
+        scaler.pattern = pattern
+
+        return scaler
+
+    # you can also override other methods if needed
+
+class CrossSpatioTemporalDataset(ImputationDataset):
+    def __init__(self,
+                 target,
+                 eval_mask,
+                 index = None,
+                 mask = None,
+                 connectivity  = None,
+                 covariates = None,
+                 input_map = None,
+                 target_map = None,
+                 auxiliary_map = None,
+                 scalers = None,
+                 trend = None,
+                 transform = None,
+                 window: int = 12,
+                 stride: int = 1,
+                 window_lag: int = 1,
+                 precision: Union[int, str] = 32,
+                 name: Optional[str] = None):
+        # call parent constructor
+        super().__init__(target=target,
+                         eval_mask=eval_mask,
+                         index=index,
+                         mask=mask,
+                         connectivity=connectivity,
+                         covariates=covariates,
+                         input_map=input_map,
+                         target_map=target_map,
+                         auxiliary_map=auxiliary_map,
+                         scalers=scalers,
+                         trend=trend,
+                         transform=transform,
+                         window=window,
+                         stride=stride,
+                         window_lag=window_lag,
+                         precision=precision,
+                         name=name)
+
+    def expand_scaler(self, key: str, pattern: Optional[str] = None,
+                      time_index: Union[List, Tensor] = None,
+                      node_index: Union[List, Tensor] = None) \
+            -> Optional[ScalerSplitModule]:
+        # check if there is a scaler
+        if key not in self.keys:
+            raise KeyError(f"{key} not in {self.name}.")
+        elif key not in self.scalers:
+            return None
+        # convert indices
+        time_index = self._get_time_index(time_index, layout='index')
+        node_index = self._get_time_index(node_index, layout='index')
+        # get params
+        if pattern is None:
+            return self.scalers[key]
+        # if there is an out-pattern, create new scaler
+        scaler = ScalerSplitModule(self.scalers[key], pattern=pattern)
+        pattern = self.patterns[key] + ' -> ' + pattern
+        scaler.bias = broadcast(scaler.bias,
+                                pattern,
+                                backend=torch,
+                                time_index=time_index,
+                                node_index=node_index)
+        scaler.scale = broadcast(scaler.scale,
+                                 pattern,
+                                 backend=torch,
+                                 time_index=time_index,
+                                 node_index=node_index)
+        return scaler
+
+    def get_tensor(self, key: str, preprocess: bool = False,
+                   time_index: Union[List, Tensor] = None,
+                   node_index: Union[List, Tensor] = None) \
+            -> Tuple[Tensor, Optional[ScalerSplitModule]]:
+        # get dataset item
+        if key not in self.keys:
+            raise KeyError(f"{key} not in dataset {self.name}.")
+
+        # convert indices
+        time_index = self._get_time_index(time_index, layout='index')
+        node_index = self._get_time_index(node_index, layout='index')
+        x = take(getattr(self, key),
+                 self.patterns[key],
+                 backend=torch,
+                 time_index=time_index,
+                 node_index=node_index)
+
+        # get scaler (if any)
+        scaler = None
+        if key in self.scalers is not None:
+            scaler = self.scalers[key].slice(time_index=time_index,
+                                             node_index=node_index)
+            if preprocess:  # transform tensor
+                x = scaler.transform(x)
+        return x, scaler
+
+    def collate_item_elem(self, key: str,
+                          time_index: Union[List, Tensor] = None,
+                          node_index: Union[List, Tensor] = None) \
+            -> Tuple[Tensor, Optional[ScalerSplitModule]]:
+        # get batch item
+        if key in self.input_map:
+            itm = self.input_map[key]
+        elif key in self.target_map:
+            itm = self.target_map[key]
+        else:
+            raise KeyError(f"{key} not in any batch map of {self.name}.")
+
+        # expand and concatenate tensors
+        x = torch.cat([
+            self.expand_tensor(k, itm.pattern, time_index, node_index)
+            for k in itm.keys
+        ],
+                      dim=itm.cat_dim)
+
+        # get scaler (if any)
+        scaler = None
+        if key in self._batch_scalers:
+            scaler = self._batch_scalers[key].slice(time_index=time_index,
+                                                    node_index=node_index)
+            if itm.preprocess:  # transform tensor
+                x = scaler.transform(x)
+        return x, scaler
+
+    def collate_keys(self,
+                     keys: Iterable,
+                     preprocess: bool = False,
+                     time_index: Union[List, Tensor] = None,
+                     node_index: Union[List, Tensor] = None,
+                     cat_dim: Optional[int] = None,
+                     return_pattern: bool = False):
+        if any([key not in self.keys for key in keys]):
+            unmatch = set(keys).difference(self.keys)
+            raise KeyError(f"{unmatch} not in {self.name}.")
+        pattern = outer_pattern([self.patterns[key] for key in keys])
+        tensors, scalers = list(), list()
+        for key in keys:
+            tensor = self.expand_tensor(key, pattern, time_index, node_index)
+            scaler = self.expand_scaler(key, pattern, time_index, node_index)
+            if preprocess and scaler is not None:
+                tensor = scaler(tensor)
+            tensors.append(tensor)
+            scalers.append(scaler)
+        if len(tensors) == 1:
+            if return_pattern:
+                return tensors[0], scalers[0], pattern
+            return tensors[0], scalers[0]
+        if cat_dim is not None:
+            scalers = ScalerSplitModule.cat(scalers,
+                                       dim=cat_dim,
+                                       sizes=[t.size() for t in tensors])
+            tensors = torch.cat(tensors, dim=cat_dim)
+        if return_pattern:
+            return tensors, scalers, pattern
+        return tensors, scalers
+
+    def get_mask(self, dtype: Union[type, str, np.dtype] = None) -> Tensor:
+        mask = self.mask if self.has_mask else ~torch.isnan(self.target)
+        if dtype is not None:
+            assert dtype in ['bool', 'uint8', bool, torch.bool, torch.uint8]
+            mask = mask.to(dtype)
+        return mask
+
+    def add_scaler(self, key: str, scaler: Union[Scaler, ScalerSplitModule]):
+        r"""Add a :class:`tsl.data.preprocessing.Scaler` for the object indexed
+        by :obj:`key` in the dataset.
+
+        Args:
+            key (str): The name of the variable associated to the scaler. It
+                must be a temporal variable, i.e., :obj:`data` or an exogenous.
+            scaler (Scaler): The :class:`~tsl.data.preprocessing.Scaler`.
+        """
+        if key not in self.keys:
+            raise KeyError(f"{key} not in {self.name}.")
+        # copy to ScalerModule
+        scaler = ScalerSplitModule(scaler)
+        pattern = self.patterns[key]
+        self._check_pattern(scaler.bias,
+                            pattern,
+                            name=f"scaler ({key})",
+                            allow_broadcasting=True)
+        self._check_pattern(scaler.scale,
+                            pattern,
+                            name=f"scaler ({key})",
+                            allow_broadcasting=True)
+        if key == 'target' and self.trend is not None:
+            self.__target_bias = scaler.bias
+            scaler.bias = scaler.bias + self.trend
+        scaler.pattern = pattern
+        self.scalers[key] = scaler
+        # cache batch scaler if target tensor is in a multi-key batch item
+        for bm in [self.input_map, self.target_map, self.auxiliary_map]:
+            for bm_key, bm_item in bm.items():
+                if key in bm_item.keys and len(bm_item.keys) > 1:
+                    tensor, scaler = self.collate_keys(bm_item.keys,
+                                                       cat_dim=bm_item.cat_dim,
+                                                       return_pattern=False)
+                    self._batch_scalers[bm_key] = scaler
