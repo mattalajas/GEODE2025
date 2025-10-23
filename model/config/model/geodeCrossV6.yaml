@@ -1,0 +1,15 @@
+name: geodeCrossV6
+hparams:
+  hidden_size: 64
+  gcn_layers: 1
+  psd_layers: 1
+  intervention_steps: 5
+  cmd_sample_ratio: 1
+  tra_sample_ratio: 1
+  att_window: 1
+  nbcd_layers: 2
+  k: 3
+regs:
+  y1: 0.8 # IRM Loss
+  y2: 0.1 # Contastive Loss
+  temp: 0.25 # InfoNCE temp

@@ -229,7 +229,12 @@ class Geode(BaseModel):
             o_adj = full_adj[known_set, :]
             o_adj = o_adj[:, known_set]
 
+        # Check if nodes arent connected to anything, 
+        # if so add self loops
+        zero_inds = torch.where((o_adj.sum(0) + o_adj.sum(1)) == 0)[0]
+        o_adj[zero_inds, zero_inds] = 1.
         edge_index, _ = dense_to_sparse(o_adj)
+
         x_fwd = self.init_emb(x)
 
         # ========================================
@@ -240,6 +245,9 @@ class Geode(BaseModel):
             x_fwd_caus, output_vars = layer(x_fwd, edge_index) 
             x_fwd = self.layernorm0(x_fwd_caus + x_fwd)
         output_invars = x_fwd
+
+        o_adj[zero_inds, zero_inds] = 0.
+        edge_index, _ = dense_to_sparse(o_adj)
 
         # ========================================
         # Create new adjacency matrix 
@@ -394,6 +402,7 @@ class Geode(BaseModel):
             indx = torch.multinomial(torch.ones(N), n_cmd, replacement=False)
             indx = set(indx.tolist())
         else:
+            indx = set(list(range(N)))
             n_cmd = N
         
         finrecos = []
@@ -420,7 +429,7 @@ class Geode(BaseModel):
             emb_com_inv = rearrange(emb_com_inv, 'b t n d -> t b n d')
             emb_tru_inv = rearrange(emb_tru_inv, 'b t n d -> t b n d')
 
-            if emb_tru_inv.numel() == 0:
+            if emb_tru_inv.numel() == 0 or emb_com_inv.numel() == 0:
                 continue
             else:
                 finrecos.append([emb_com_inv, emb_tru_inv])

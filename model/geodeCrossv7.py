@@ -11,11 +11,21 @@ from torch.nn import LayerNorm
 from torch_geometric.utils import dense_to_sparse, softmax, scatter
 from torch_geometric.nn.models import GCN
 from tsl.nn.blocks.encoders.mlp import MLP
-from tsl.nn.layers.graph_convs import DiffConv
+from tsl.nn.layers.graph_convs import DiffConv, GATConv
 from tsl.nn.models.base_model import BaseModel
 from utils import closest_distances_unweighted
 
 EPSILON = 1e-8
+ACTIVATIONS = {
+    'relu': F.relu,
+    'leakyrelu': F.leaky_relu,
+    'elu': F.elu,
+    'tanh': torch.tanh,
+    'gelu': F.gelu,
+    'selu': F.selu,
+    'sigmoid': torch.sigmoid,
+    'softplus': F.softplus
+}
 
 class RelTemporalEncoding(nn.Module):
     '''
@@ -64,12 +74,13 @@ class GeodeNBCD(nn.Module):
                             hidden_size=hidden_size,
                             output_size=hidden_size,
                             activation=activation)
+        self.dist_embedding = nn.Linear(1, hidden_size)
 
         self.layernorm = LayerNorm(hidden_size)
         self.att_window = att_window
         self.att_heads = att_heads
     
-    def forward(self, x_fwd, edge_index):
+    def forward(self, x_fwd, edge_index, edge_weight=None):
         device = x_fwd.device
         srcs = edge_index[0]
         tars = edge_index[1]
@@ -91,6 +102,21 @@ class GeodeNBCD(nn.Module):
         src_nodes = rearrange(src_nodes, 'b t e d -> t (b e) d')
         src_nodes = self.time_emb(src_nodes, torch.LongTensor(list(range(T))).to(device))
         src_fwd = rearrange(src_nodes, 't (b e) d -> t b e d', b=B, e=len(srcs))
+
+        # Distance encoding
+        if edge_weight is not None:
+            tar_fwd = rearrange(tar_fwd, 't b e d -> e (b t) d', b=B, e=len(srcs))
+            src_fwd = rearrange(src_fwd, 't b e d -> e (b t) d', b=B, e=len(srcs))
+
+            edge_weight = 2*edge_weight - 1 # scale to [-1, 1]
+            dist_emb = self.dist_embedding(edge_weight[None, :].T)
+            dist_emb = dist_emb.unsqueeze(1).repeat(1, B*T, 1)  # [E, B*T, D]
+
+            tar_fwd = tar_fwd + dist_emb
+            src_fwd = src_fwd + dist_emb
+
+            tar_fwd = rearrange(tar_fwd, 'e (b t) d -> t b e d', b=B, t=T)
+            src_fwd = rearrange(src_fwd, 'e (b t) d -> t b e d', b=B, t=T)
 
         # Get the Q, K, V
         q_mat = self.query(tar_fwd).view(T, B, len(tars), self.att_heads, d_k)
@@ -135,7 +161,7 @@ class GeodeNBCD(nn.Module):
 
         return output_invars, output_vars
 
-class GeodeCrossV2(BaseModel):
+class GeodeCrossV7(BaseModel):
     def __init__(self,
                  input_size,
                  hidden_size,
@@ -147,34 +173,32 @@ class GeodeCrossV2(BaseModel):
                  intervention_steps=2,
                  horizon=24,
                  cmd_sample_ratio=1.,
+                 tra_sample_ratio=1.,
                  att_window=3,
                  k=5,
                  att_heads=8,
-                 nbcd_layers=2):
-        super(GeodeCrossV2, self).__init__()
+                 nbcd_layers=1):
+        super(GeodeCrossV7, self).__init__()
 
         self.steps = intervention_steps
         self.horizon = horizon
         self.cmd_ratio = cmd_sample_ratio
+        self.tra_ratio = tra_sample_ratio
         self.k = k
         self.att_heads = att_heads
         self.att_window = att_window
+        
+        self.activation = ACTIVATIONS[activation]
 
         self.init_emb = nn.Linear(input_size, hidden_size)
         self.init_emb_tr = nn.Linear(input_size, hidden_size)
-        self.nbcds = nn.ModuleList(GeodeNBCD(hidden_size, att_window,
-                                             att_heads, activation) for _ in range(nbcd_layers))
+        self.nbcds_air = GeodeNBCD(hidden_size, att_window, att_heads, activation)
+        self.nbcds_tra = GeodeNBCD(hidden_size, att_window, att_heads, activation)
 
         self.layernorm0 = LayerNorm(hidden_size)
         self.layernorm1 = LayerNorm(hidden_size)
         self.layernorm2 = LayerNorm(hidden_size)
         self.layernorm3 = LayerNorm(hidden_size)
-
-        # self.gcn1 = DiffConv(in_channels=hidden_size,
-        #                     out_channels=hidden_size,
-        #                     k=psd_layers,
-        #                     root_weight=None,
-        #                     activation=activation)
         
         self.gcn1 = GCN(in_channels=hidden_size,
                         hidden_channels=hidden_size,
@@ -184,11 +208,16 @@ class GeodeCrossV2(BaseModel):
                         add_self_loops=None,
                         act=activation)
         
-        self.gcn_tr = DiffConv(in_channels=hidden_size,
+        self.gcn_tr = nn.ModuleList(
+                        GATConv(in_channels=hidden_size,
                             out_channels=hidden_size,
-                            k=gcn_layers,
-                            root_weight=True,
-                            activation=activation)
+                            heads=att_heads,
+                            edge_dim=1) for _ in range(gcn_layers))
+        
+        # self.gat_cross = GATConv(in_channels=hidden_size,
+        #                          out_channels=hidden_size,
+        #                          heads=att_heads,
+        #                          edge_dim=1)
         
         # self.gcn3 = GCN(in_channels=hidden_size,
         #                 hidden_channels=hidden_size,
@@ -198,35 +227,20 @@ class GeodeCrossV2(BaseModel):
         #                 add_self_loops=None,
         #                 act=activation)
         
-        self.gcn2 = DiffConv(in_channels=hidden_size,
+        # self.gcn2 = DiffConv(in_channels=hidden_size,
+        #                     out_channels=hidden_size,
+        #                     k=gcn_layers,
+        #                     root_weight=True,
+        #                     activation=activation)
+        
+        self.gcn2 = nn.ModuleList(
+                        GATConv(in_channels=hidden_size,
                             out_channels=hidden_size,
-                            k=gcn_layers,
-                            root_weight=True,
-                            activation=activation)
-
-        self.q_cross = MLP(input_size=hidden_size,
-                        hidden_size=hidden_size,
-                        output_size=hidden_size,
-                        activation=activation)
-        self.k_cross = MLP(input_size=hidden_size,
-                        hidden_size=hidden_size,
-                        output_size=hidden_size,
-                        activation=activation)
-        self.v_cross = MLP(input_size=hidden_size,
-                        hidden_size=hidden_size,
-                        output_size=hidden_size,
-                        activation=activation)
-        self.out_proj = MLP(input_size=hidden_size,
-                            hidden_size=hidden_size,
-                            output_size=hidden_size,
-                            activation=activation)
-        self.dist_emb = MLP(input_size=1,
-                            hidden_size=hidden_size,
-                            output_size=1,
-                            activation=activation)
+                            heads=att_heads,
+                            edge_dim=1) for _ in range(gcn_layers))
 
         self.readout1 = nn.Linear(hidden_size, output_size)
-        self.readout2 = nn.Linear(hidden_size*2, hidden_size)
+        self.readout2 = nn.Linear(hidden_size*2, output_size)
 
         self.adj = adj
 
@@ -244,7 +258,7 @@ class GeodeCrossV2(BaseModel):
                 reset=False,
                 transform=None):
         # x: [batches steps nodes features]
-        b, t, _, _ = x.size()
+        b, t, og_n, _ = x.size()
         device = x.device
 
         full_adj = torch.tensor(self.adj).to(device)
@@ -267,17 +281,40 @@ class GeodeCrossV2(BaseModel):
         zero_inds = torch.where((o_adj.sum(0) + o_adj.sum(1)) == 0)[0]
         o_adj[zero_inds, zero_inds] = 1.
 
-        edge_index, _ = dense_to_sparse(o_adj)
+        edge_index, edge_weight = dense_to_sparse(o_adj)
         x_fwd = self.init_emb(x)
 
         # ========================================
         # Calculating variant and invariant features using self-attention 
         # across different nodes using their representations
         # ========================================
-        for layer in self.nbcds:
-            x_fwd_caus, output_vars = layer(x_fwd, edge_index) 
-            x_fwd = self.layernorm0(x_fwd_caus + x_fwd)
-        output_invars = x_fwd
+        output_invars_air, output_vars_air = self.nbcds_air(x_fwd, edge_index) #, edge_weight) 
+
+        # ========================================
+        # Traffic infusion
+        # ========================================
+        traf_adj = dense_to_sparse(t_adj)
+        t_fwd = self.init_emb_tr(x_exog)
+
+        for layer in self.gcn_tr:
+            t_fwd_caus, _ = layer(t_fwd, traf_adj[0], traf_adj[1]) 
+            t_fwd_caus = self.activation(t_fwd_caus)
+            t_fwd = self.layernorm0(t_fwd_caus + t_fwd)
+        tr_embs = t_fwd
+
+        cr_embs = torch.cat((x_fwd, tr_embs), dim=2)
+        cr_edge_index, cr_edge_weight = dense_to_sparse(c_adj.T)
+        cr_edge_index[0] += x_fwd.shape[2]
+        
+        exp_edge_index = torch.zeros(size=(2, cr_edge_index.shape[1]*2), dtype=torch.long).to(device)
+        exp_edge_index[0] = torch.cat([cr_edge_index[0], cr_edge_index[1]], dim=0)
+        exp_edge_index[1] = torch.cat([cr_edge_index[1], cr_edge_index[0]], dim=0)
+        cr_edge_weight = torch.cat([cr_edge_weight, cr_edge_weight], dim=0)
+
+        output_invars_tra, output_vars_tra = self.nbcds_tra(cr_embs, exp_edge_index) #, cr_edge_weight) 
+
+        output_vars = self.layernorm1(output_vars_air + output_vars_tra[:, :, :x_fwd.shape[2]])
+        output_invars = self.layernorm1(output_invars_air + output_invars_tra[:, :, :x_fwd.shape[2]])
 
         # ========================================
         # Create new adjacency matrix 
@@ -353,7 +390,7 @@ class GeodeCrossV2(BaseModel):
             else:
                 grouped[threshold].append(key)
 
-        ################# Curriculum learning ########################
+        ################# Curriculum learning #################
         # Add loop here that goes at every khop
         # [batch, time, node, node]
         gcn_adj = dense_to_sparse(adj.to(torch.float32))
@@ -367,7 +404,7 @@ class GeodeCrossV2(BaseModel):
         xh_inv_2 = xh_inv_2.scatter(2, cur_ind_exp, xh_inv[:, :, grouped[0], :])
         xh_var_2 = xh_var_2.scatter(2, cur_ind_exp, xh_var[:, :, grouped[0], :])
 
-        for kh in range(1, self.k+1):
+        for kh in range(self.k, self.k+1):
             # Pass if there are no k-hop reach nodes
             if grouped[kh] == []:
                 continue
@@ -395,12 +432,12 @@ class GeodeCrossV2(BaseModel):
             rep_adj = dense_to_sparse(rep_adj.to(torch.float32))
 
             xh_inv_0 = self.gcn1(rep_inv, rep_adj[0], rep_adj[1])
-            xh_inv_1 = self.layernorm1(xh_inv_0)
+            xh_inv_1 = self.layernorm2(xh_inv_0)
             # xh_inv_1 = self.gcn3(xh_inv_1, rep_adj[0], rep_adj[1])
             # xh_inv_1 = self.layernorm3(xh_inv_1)
 
             xh_var_0 = self.gcn1(rep_var, rep_adj[0], rep_adj[1])
-            xh_var_1 = self.layernorm1(xh_var_0)
+            xh_var_1 = self.layernorm2(xh_var_0)
             # xh_var_1 = self.gcn3(xh_var_1, rep_adj[0], rep_adj[1])
             # xh_var_1 = self.layernorm3(xh_var_1)
 
@@ -413,32 +450,21 @@ class GeodeCrossV2(BaseModel):
         # ========================================
         # Final Message Passing
         # ========================================
-        xh_inv_3 = self.gcn2(xh_inv_2, gcn_adj[0], gcn_adj[1]) + xh_inv_2
-        xh_inv_3 = self.layernorm2(xh_inv_3)
-        # xh_inv_4 = self.gcn3(xh_inv_4, gcn_adj[0], gcn_adj[1]) + xh_inv_4
-        # xh_inv_4 = self.layernorm3(xh_inv_4)
+        for layer in self.gcn2:
+            xh_inv_2_tmp, _ = layer(xh_inv_2, gcn_adj[0], gcn_adj[1])
+            xh_inv_2_tmp = self.activation(xh_inv_2_tmp)
+            xh_inv_2 = self.layernorm3(xh_inv_2_tmp + xh_inv_2)
+        
+            xh_var_2_tmp, _ = layer(xh_var_2, gcn_adj[0], gcn_adj[1])
+            xh_var_2_tmp = self.activation(xh_var_2_tmp)
+            xh_var_2 = self.layernorm3(xh_var_2_tmp + xh_var_2)
 
-        xh_var_3 = self.gcn2(xh_var_2, gcn_adj[0], gcn_adj[1]) + xh_var_2
-        xh_var_3 = self.layernorm2(xh_var_3)
-        # xh_var_4 = self.gcn3(xh_var_4, gcn_adj[0], gcn_adj[1]) + xh_var_4
-        # xh_var_4 = self.layernorm3(xh_var_4)
+        xh_inv_3 = xh_inv_2
+        xh_var_3 = xh_var_2
 
-        # ========================================
-        # Traffic infusion
-        # ========================================
-        traf_adj = dense_to_sparse(t_adj)
-        t_fwd = self.init_emb_tr(x_exog)
-        tr_embs = self.gcn_tr(t_fwd, traf_adj[0], traf_adj[1])
-
-        # TODO: Add layernorm and residuals and check if you can add distance component
-        xh_inv_4 = self.scaled_dot_product_mhattention(xh_inv_3, tr_embs, c_adj, None, self.att_heads) + xh_inv_3
-        xh_inv_4 = self.layernorm3(xh_inv_4)
-
-        finpreds = self.readout1(xh_inv_4)
+        finpreds = self.readout1(xh_inv_3)
         if not training:
             return finpreds
-        
-        # TODO: Figure out how to do self-supervised learning on the virtual nodes
         
         # ========================================
         # Disentanglement module
@@ -458,58 +484,55 @@ class GeodeCrossV2(BaseModel):
             fin_vars = torch.cat((seen_invr, rand_seen), dim=-1)
             fin_irm = self.readout2(fin_vars)
 
-            fin_irm_att = self.scaled_dot_product_mhattention(fin_irm, tr_embs, c_adj, None, self.att_heads) + fin_irm
-            fin_irm_att = self.layernorm3(fin_irm_att)
-
-            fin_irm_att = self.readout1(fin_irm_att)
-
-            fin_irm_all.append(fin_irm_att)
+            fin_irm_all.append(fin_irm)
 
         fin_irm_all = torch.stack(fin_irm_all)
 
         # ========================================
-        # CMD of embeddings
+        # Get cosine similarity for each embedding and get mask 
         # ========================================
-        # Get embedding softmax
-        N = xh_inv_3.shape[2]
+        N_a = og_n
         if self.cmd_ratio < 1.0:
-            n_cmd = int(N*self.cmd_ratio)
-            indx = torch.multinomial(torch.ones(N), n_cmd, replacement=False)
-            indx = set(indx.tolist())
+            n_air = int(N_a*self.cmd_ratio)
+            ar_indx = torch.multinomial(torch.ones(N_a), n_air, replacement=False).to(device) + add_nodes
         else:
-            indx = set(list(range(N)))
-            n_cmd = N
+            ar_indx = torch.arange(N_a, add_nodes + N_a).to(device)
+            n_air = N_a
         
-        finrecos = []
-
+        N_t = t_adj.shape[0]
+        if self.cmd_ratio < 1.0:
+            n_tra = int(N_t*self.cmd_ratio)
+            tr_indx = torch.multinomial(torch.ones(N_t), n_tra, replacement=False).to(device)
+        else:
+            tr_indx = torch.arange(N_t).to(device)
+            n_tra = N_t
+        
         det_mask = torch.zeros_like(xh_inv_3).to(dtype=bool, device=device)
         det_mask[:, :, :len(known_set)] = 1
         xh_inv_3 = torch.where(det_mask, xh_inv_3.detach(), xh_inv_3) 
 
-        for i in range(1, self.k+1):
-            prev_group = []
-            cur_group = []
+        air_nodes = xh_inv_3[:, :, ar_indx]
+        air_nodes = rearrange(air_nodes, 'b t n d -> (b t) n d')
+        air_nodes = F.normalize(air_nodes, dim=-1, eps=EPSILON)
 
-            for j in range(i):
-                prev_group.extend(grouped[j])
-            for j in range(i+1):
-                cur_group.extend(grouped[j])
+        traf_nodes = output_invars_tra[:, :, -t_adj.shape[0]:]
+        traf_nodes = traf_nodes[:, :, tr_indx]
+        traf_nodes = rearrange(traf_nodes, 'b t n d -> (b t) n d')
+        traf_nodes = F.normalize(traf_nodes, dim=-1, eps=EPSILON)
 
-            prev_group = list(set(prev_group) & indx)
-            cur_group = list(set(cur_group) & indx)
-            
-            emb_com_inv = xh_inv_3[:, :, prev_group]
-            emb_tru_inv = xh_inv_3[:, :, cur_group]
+        samp_mask = c_adj[ar_indx, :]
+        samp_mask = samp_mask[:, tr_indx]
+        samp_mask = samp_mask.unsqueeze(0).repeat(b*t, 1, 1)
 
-            emb_com_inv = rearrange(emb_com_inv, 'b t n d -> t b n d')
-            emb_tru_inv = rearrange(emb_tru_inv, 'b t n d -> t b n d')
+        sim_mat = torch.matmul(air_nodes, traf_nodes.transpose(-1, -2))
+        # temp_mask = samp_mask.clone()
+        # temp_mask[samp_mask == 0] = 1.
+        # sim_mat = sim_mat * temp_mask
 
-            if emb_tru_inv.numel() == 0 or emb_com_inv.numel() == 0:
-                continue
-            else:
-                finrecos.append([emb_com_inv, emb_tru_inv])
+        samp_mask[samp_mask > 0] = 1.
+        finsim = [sim_mat, samp_mask]
 
-        return finpreds, fin_irm_all, finrecos
+        return finpreds, fin_irm_all, finsim
 
     def get_new_adj(self, adj, k, n_add, cross_adj, scale=1.0, init_hops={}):
         current_adj = adj.clone()
@@ -595,41 +618,3 @@ class GeodeCrossV2(BaseModel):
             current_c_adj = c_expanded
 
         return adj_aug_n1, levels, current_c_adj
-
-    def scaled_dot_product_mhattention(self, air_emb, traf_emb, cross_dist, mask, n_head):
-        # Compute the dot products between Q and K, then scale by the square root of the key dimension
-        _, t, na, d = air_emb.shape
-        _, _, nt, _ = traf_emb.shape
-
-        air_emb = rearrange(air_emb, 'b t n d -> (b t) n d')
-        traf_emb = rearrange(traf_emb, 'b t n d -> (b t) n d')
-
-        b = air_emb.shape[0]
-
-        Q = self.q_cross(air_emb)
-        K = self.k_cross(traf_emb)
-        V = self.v_cross(traf_emb)
-
-        assert d % n_head == 0
-
-        Q = Q.view(b, na, n_head, d//n_head).transpose(1, 2)  # (B, num_heads, T, head_dim)
-        K = K.view(b, nt, n_head, d//n_head).transpose(1, 2)
-        V = V.view(b, nt, n_head, d//n_head).transpose(1, 2)
-
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / torch.sqrt(torch.tensor(d//n_head, dtype=torch.float32))
-
-        # scores = scores + dists
-        # test = torch.rand_like(scores).to(device=scores.device)
-        # Apply mask if provided (useful for masked self-attention in transformers)
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, float('-1e16'))            
-
-        # Softmax to normalize scores, producing attention weights
-        attention_weights = F.softmax(scores, dim=-1)
-
-        # Value should be aggregated using the attention weights as adjacency matrix weights
-        output = torch.matmul(attention_weights, V)
-        fin_output = self.out_proj(output.transpose(1, 2).contiguous().view(b, na, d))
-
-        fin_output = rearrange(fin_output, '(b t) n d -> b t n d', t=t)
-        return fin_output

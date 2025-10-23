@@ -202,7 +202,8 @@ def add_missing_sensors(dataset: TabularDataset,
     if masked_sensors is None:
         if spatial_shift:
             eval_mask = shift_mask(shape, feature=node_features, order=order, 
-                                   adj=dataset.get_connectivity(**connect, layout='dense'))
+                                   adj=dataset.get_connectivity(**connect, layout='dense'),
+                                   p_noise=p_noise)
             dataset.seed = seed
         else:
             eval_mask = sample_mask(shape,
@@ -235,11 +236,11 @@ def add_missing_sensors(dataset: TabularDataset,
     # Store evaluation mask params in dataset
     return dataset, masked_sensors
 
-def shift_mask(shape, feature, order, adj):
+def shift_mask(shape, feature, order, adj, p_noise=0.05):
     mask = np.zeros(shape).astype(bool)
     G = nx.from_numpy_array(adj)
 
-    parts = math.ceil(adj.shape[0] / 4)
+    parts = math.ceil(adj.shape[0]*p_noise)
 
     if feature == 'CC':
         # Compute closeness centrality
@@ -848,11 +849,13 @@ class AirCross(DatetimeDataset):
     def __init__(self,
                  root: str = None,
                  test_months: Sequence = (3, 6, 9, 12),
+                 years: Sequence = (),
                  imputation_mode: Literal["nearest", "zero", None] = "zero",
                  freq: str = "h",
                  include_traffic: bool = False):
         # set root path
         self.root = root
+        self.years = years
         self.imputation_mode = imputation_mode
         self.test_months = test_months
         self.include_traffic = include_traffic
@@ -886,10 +889,10 @@ class AirCross(DatetimeDataset):
         air_metadata = pd.read_csv(os.path.join(self.root_dir, 'air_metadata.csv'))
         self.air_max_nodes = len(air_metadata)
 
-        tra_metadata = pd.read_csv(os.path.join(self.root_dir, 'traffic_metadata.csv'))
-        self.tra_max_nodes = len(tra_metadata)
-
         readings = pd.read_csv(os.path.join(self.root_dir, 'full_data.csv'), index_col=0, parse_dates=['Time'])
+        if len(self.years) != 0:
+            readings = readings[readings.index.year.isin(self.years)]
+
         modality = np.zeros((len(readings.columns), 1))
         modality[self.air_max_nodes:] = 1
 
@@ -909,7 +912,11 @@ class AirCross(DatetimeDataset):
         ar_adj[tuple(ar_edge_index)] = ar_edge_weight
 
         # Get adj for traffic 
+        tra_metadata = pd.DataFrame()
         if self.include_traffic:
+            tra_metadata = pd.read_csv(os.path.join(self.root_dir, 'traffic_metadata.csv'))
+            self.tra_max_nodes = len(tra_metadata)
+
             tr_edge_index, tr_edge_weight = np.load(os.path.join(self.root_dir, 'traffic_adj.npz')).values()
             cr_edge_index, cr_edge_weight = np.load(os.path.join(self.root_dir, 'cross_adj.npz')).values()
             # build square adj from coo to add adj as covariate
@@ -979,7 +986,7 @@ def add_missing_sensors_cross(dataset: AirCross,
     if masked_sensors is None:
         if spatial_shift:
             tmp_mask = shift_mask(shape, feature=node_features, order=order, 
-                                   adj=air_adj)
+                                   adj=air_adj, p_noise=p_noise)
             dataset.seed = seed
         else:
             tmp_mask = sample_mask(shape,

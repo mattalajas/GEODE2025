@@ -1,13 +1,13 @@
 #### Dataset params ###########################################################
-name: aircross
+name: aircross_auck
 
 # spatial shift
 spatial_shift: False
 order: 0
 node_features: CC
 include_traffic: False
-test_months: [3, 6, 9, 12]
-years: [2018]
+test_months: [9, 10, 11, 12]
+years: [2020, 2021]
 
 # Point
 mode: 'region'

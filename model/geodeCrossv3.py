@@ -135,7 +135,7 @@ class GeodeNBCD(nn.Module):
 
         return output_invars, output_vars
 
-class GeodeCrossV2(BaseModel):
+class GeodeCrossV3(BaseModel):
     def __init__(self,
                  input_size,
                  hidden_size,
@@ -151,7 +151,7 @@ class GeodeCrossV2(BaseModel):
                  k=5,
                  att_heads=8,
                  nbcd_layers=2):
-        super(GeodeCrossV2, self).__init__()
+        super(GeodeCrossV3, self).__init__()
 
         self.steps = intervention_steps
         self.horizon = horizon
@@ -162,8 +162,8 @@ class GeodeCrossV2(BaseModel):
 
         self.init_emb = nn.Linear(input_size, hidden_size)
         self.init_emb_tr = nn.Linear(input_size, hidden_size)
-        self.nbcds = nn.ModuleList(GeodeNBCD(hidden_size, att_window,
-                                             att_heads, activation) for _ in range(nbcd_layers))
+        self.nbcds_air = GeodeNBCD(hidden_size, att_window, att_heads, activation)
+        self.nbcds_tra = GeodeNBCD(hidden_size, att_window, att_heads, activation)
 
         self.layernorm0 = LayerNorm(hidden_size)
         self.layernorm1 = LayerNorm(hidden_size)
@@ -226,7 +226,7 @@ class GeodeCrossV2(BaseModel):
                             activation=activation)
 
         self.readout1 = nn.Linear(hidden_size, output_size)
-        self.readout2 = nn.Linear(hidden_size*2, hidden_size)
+        self.readout2 = nn.Linear(hidden_size*2, output_size)
 
         self.adj = adj
 
@@ -274,10 +274,25 @@ class GeodeCrossV2(BaseModel):
         # Calculating variant and invariant features using self-attention 
         # across different nodes using their representations
         # ========================================
-        for layer in self.nbcds:
-            x_fwd_caus, output_vars = layer(x_fwd, edge_index) 
-            x_fwd = self.layernorm0(x_fwd_caus + x_fwd)
-        output_invars = x_fwd
+        x_fwd_caus, output_vars_air = self.nbcds_air(x_fwd, edge_index) 
+        output_invars_air = self.layernorm0(x_fwd_caus + x_fwd)
+
+        # ========================================
+        # Traffic infusion
+        # ========================================
+        traf_adj = dense_to_sparse(t_adj)
+        t_fwd = self.init_emb_tr(x_exog)
+        tr_embs = self.gcn_tr(t_fwd, traf_adj[0], traf_adj[1])
+
+        cr_embs = torch.cat((x_fwd, tr_embs), dim=2)
+        cr_edge_index, _ = dense_to_sparse(c_adj.T)
+        cr_edge_index[0] += x_fwd.shape[2]
+
+        x_fwd_caus, output_vars_tra = self.nbcds_tra(cr_embs, cr_edge_index) 
+        output_invars_tra = self.layernorm3(x_fwd_caus + cr_embs)
+
+        output_vars = output_vars_air + output_vars_tra[:, :, :x_fwd.shape[2]]
+        output_invars = output_invars_air + output_invars_tra[:, :, :x_fwd.shape[2]]
 
         # ========================================
         # Create new adjacency matrix 
@@ -423,22 +438,9 @@ class GeodeCrossV2(BaseModel):
         # xh_var_4 = self.gcn3(xh_var_4, gcn_adj[0], gcn_adj[1]) + xh_var_4
         # xh_var_4 = self.layernorm3(xh_var_4)
 
-        # ========================================
-        # Traffic infusion
-        # ========================================
-        traf_adj = dense_to_sparse(t_adj)
-        t_fwd = self.init_emb_tr(x_exog)
-        tr_embs = self.gcn_tr(t_fwd, traf_adj[0], traf_adj[1])
-
-        # TODO: Add layernorm and residuals and check if you can add distance component
-        xh_inv_4 = self.scaled_dot_product_mhattention(xh_inv_3, tr_embs, c_adj, None, self.att_heads) + xh_inv_3
-        xh_inv_4 = self.layernorm3(xh_inv_4)
-
-        finpreds = self.readout1(xh_inv_4)
+        finpreds = self.readout1(xh_inv_3)
         if not training:
             return finpreds
-        
-        # TODO: Figure out how to do self-supervised learning on the virtual nodes
         
         # ========================================
         # Disentanglement module
@@ -458,12 +460,7 @@ class GeodeCrossV2(BaseModel):
             fin_vars = torch.cat((seen_invr, rand_seen), dim=-1)
             fin_irm = self.readout2(fin_vars)
 
-            fin_irm_att = self.scaled_dot_product_mhattention(fin_irm, tr_embs, c_adj, None, self.att_heads) + fin_irm
-            fin_irm_att = self.layernorm3(fin_irm_att)
-
-            fin_irm_att = self.readout1(fin_irm_att)
-
-            fin_irm_all.append(fin_irm_att)
+            fin_irm_all.append(fin_irm)
 
         fin_irm_all = torch.stack(fin_irm_all)
 
