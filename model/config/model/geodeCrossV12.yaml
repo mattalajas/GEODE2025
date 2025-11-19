@@ -1,4 +1,4 @@
-name: geodeCrossV7
+name: geodeCrossV12
 hparams:
   hidden_size: 64
   gcn_layers: 1
@@ -10,6 +10,5 @@ hparams:
   nbcd_layers: 1
   k: 3
 regs:
-  y1: 0.3 # IRM Loss
-  y2: 1.0 # Contastive Loss
-  temp: 0.25 # InfoNCE temp
+  y1: 1.0 # Cross Loss
+  y2: 0.5 # Contastive Loss

@@ -5,12 +5,13 @@ name: aircross_sp
 spatial_shift: False
 order: 0
 node_features: CC
-include_traffic: False
+include_exog: False
 test_months: [3, 6, 9, 12]
 years: [2022, 2023]
 
 # Point
 mode: 'region'
+exog: traffic # traffic, temp, humd
 p_fault: 0.
 p_noise: 0.25
 

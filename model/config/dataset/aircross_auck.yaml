@@ -5,7 +5,7 @@ name: aircross_auck
 spatial_shift: False
 order: 0
 node_features: CC
-include_traffic: False
+include_exog: False
 test_months: [9, 10, 11, 12]
 years: [2020, 2021]
 
