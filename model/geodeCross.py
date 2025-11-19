@@ -11,6 +11,7 @@ from torch.nn import LayerNorm
 from torch_geometric.utils import dense_to_sparse, softmax, scatter
 from torch_geometric.nn.models import GCN
 from tsl.nn.blocks.encoders.mlp import MLP
+from tsl.nn.blocks.encoders import TransformerLayer
 from tsl.nn.layers.graph_convs import DiffConv
 from tsl.nn.models.base_model import BaseModel
 from utils import closest_distances_unweighted
@@ -169,6 +170,13 @@ class GeodeCross(BaseModel):
         self.layernorm1 = LayerNorm(hidden_size)
         self.layernorm2 = LayerNorm(hidden_size)
         self.layernorm3 = LayerNorm(hidden_size)
+
+        self.temp_tra = TransformerLayer(input_size=hidden_size,
+                                         hidden_size=hidden_size,
+                                         ff_size=hidden_size,
+                                         n_heads=att_heads,
+                                         axis='time',
+                                         activation=activation)
 
         # self.gcn1 = DiffConv(in_channels=hidden_size,
         #                     out_channels=hidden_size,
@@ -415,6 +423,8 @@ class GeodeCross(BaseModel):
         # ========================================
         traf_adj = dense_to_sparse(t_adj)
         t_fwd = self.init_emb_tr(x_exog)
+        t_fwd = self.temp_tra(t_fwd)
+        
         tr_embs = self.gcn_tr(t_fwd, traf_adj[0], traf_adj[1])
 
         # TODO: Add layernorm and residuals and check if you can add distance component

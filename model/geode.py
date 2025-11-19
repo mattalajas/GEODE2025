@@ -242,8 +242,8 @@ class Geode(BaseModel):
         # across different nodes using their representations
         # ========================================
         for layer in self.nbcds:
-            x_fwd_caus, output_vars = layer(x_fwd, edge_index) 
-            x_fwd = self.layernorm0(x_fwd_caus + x_fwd)
+            x_fwd, output_vars = layer(x_fwd, edge_index) 
+            # x_fwd = self.layernorm0(x_fwd_caus + x_fwd)
         output_invars = x_fwd
 
         o_adj[zero_inds, zero_inds] = 0.

@@ -11,17 +11,30 @@ from geodeCrossv4 import GeodeCrossV4
 from geodeCrossv5 import GeodeCrossV5
 from geodeCrossv6 import GeodeCrossV6
 from geodeCrossv7 import GeodeCrossV7
+from geodeCrossv8 import GeodeCrossV8
+from geodeCrossv9 import GeodeCrossV9
+from geodeCrossv10 import GeodeCrossV10
+from geodeCrossv11 import GeodeCrossV11
+from geodeCrossv12 import GeodeCrossV12
+from geodeCrossv13 import GeodeCrossV13
+from geodeCrossv14 import GeodeCrossV14
+from geodeCrossc1 import GeodeCrossC1
 from geodeCross_filler import GeodeCrossFiller
 from geodeCross_fillerV4 import GeodeCrossFillerV4
+from geodeCross_fillerV5 import GeodeCrossFillerV5
+from geodeCross_fillerV6 import GeodeCrossFillerV6
+from geodeCross_fillerV7 import GeodeCrossFillerV7
+from geodeCross_fillerV8 import GeodeCrossFillerV8
+from geodeCross_fillerC1 import GeodeCrossFillerC1
 from geodeNAall import GeodeNAall
 from KITS import KITS
 from KITS_filler import GCNCycVirtualFiller
 from omegaconf import DictConfig
-from pytorch_lightning import Trainer
+from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
 from tsl import logger
-from tsl.data import ImputationDataset, SpatioTemporalDataModule
+from tsl.data import ImputationDataset
 from tsl.data.preprocessing import StandardScaler
 from tsl.datasets import AirQuality, MetrLA, PeMS04, PeMS07, PvUS
 from tsl.experiment import Experiment
@@ -30,8 +43,8 @@ from tsl.metrics import torch as torch_metrics
 from tsl.transforms import MaskInput
 from tsl.utils.casting import torch_to_numpy
 from utils import (AirCross, AirQualityAuckland, CrossSpatioTemporalDataset,
-                   LargeST, StandardScalerSplit, add_missing_sensors,
-                   add_missing_sensors_cross, test_wise_eval)
+                   LargeST, StandardScalerSplit, SpatioTemporalDataModule,
+                   add_missing_sensors, add_missing_sensors_cross, test_wise_eval)
 
 
 def get_model_class(model_str):
@@ -53,6 +66,22 @@ def get_model_class(model_str):
         model = GeodeCrossV6
     elif model_str == 'geodeCrossV7':
         model = GeodeCrossV7
+    elif model_str == 'geodeCrossV8':
+        model = GeodeCrossV8
+    elif model_str == 'geodeCrossV9':
+        model = GeodeCrossV9
+    elif model_str == 'geodeCrossV10':
+        model = GeodeCrossV10
+    elif model_str == 'geodeCrossV11':
+        model = GeodeCrossV11
+    elif model_str == 'geodeCrossV12':
+        model = GeodeCrossV12
+    elif model_str == 'geodeCrossV13':
+        model = GeodeCrossV13
+    elif model_str == 'geodeCrossV14':
+        model = GeodeCrossV14
+    elif model_str == 'geodeCrossC1':
+        model = GeodeCrossC1
     elif model_str == 'kits':
         model = KITS
     else:
@@ -62,7 +91,7 @@ def get_model_class(model_str):
 def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, connectivity=None, 
                 spatial_shift=False, order=0, node_features='CC', t_range = ['2022-04-01', '2022-12-01'], 
                 agg_func = 'mean', test_months=[5], location='Auckland', 
-                years = [], include_traffic=False):
+                years = [], include_exog=False, exog='traffic'):
     
     if dataset_name == 'air_auckland' or dataset_name == 'air_invercargill1' or dataset_name == 'air_invercargill2':
         air_data = AirQualityAuckland('data', t_range=t_range, masked_sensors=masked_s, 
@@ -196,7 +225,7 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, connec
                                   node_features=node_features)
     if dataset_name == 'aircross':
         return add_missing_sensors_cross(AirCross(root='data/AirCrossSF', test_months=test_months,
-                                                  years=years, include_traffic=include_traffic),
+                                                  years=years, include_exog=include_exog, exog=exog),
                                         p_fault=p_fault,
                                         p_noise=p_noise,
                                         min_seq=12,
@@ -208,7 +237,7 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, connec
                                         node_features=node_features)
     if dataset_name == 'aircross_la':
         return add_missing_sensors_cross(AirCross(root='data/AirCrossLA', test_months=test_months,
-                                                  years=years, include_traffic=include_traffic),
+                                                  years=years, include_exog=include_exog, exog=exog),
                                         p_fault=p_fault,
                                         p_noise=p_noise,
                                         min_seq=12,
@@ -220,7 +249,7 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, connec
                                         node_features=node_features)
     if dataset_name == 'aircross_sp':
         return add_missing_sensors_cross(AirCross(root='data/AirCrossSpain', test_months=test_months,
-                                                  years=years, include_traffic=include_traffic),
+                                                  years=years, include_exog=include_exog, exog=exog),
                                         p_fault=p_fault,
                                         p_noise=p_noise,
                                         min_seq=12,
@@ -232,7 +261,7 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, connec
                                         node_features=node_features)
     if dataset_name == 'aircross_auck':
         return add_missing_sensors_cross(AirCross(root='data/AucklandCross', test_months=test_months,
-                                                  years=years, include_traffic=include_traffic),
+                                                  years=years, include_exog=include_exog),
                                         p_fault=p_fault,
                                         p_noise=p_noise,
                                         min_seq=12,
@@ -252,10 +281,7 @@ def run_imputation(cfg: DictConfig):
     torch.set_float32_matmul_precision('high')
     # Load configuration
     
-    print(cfg.seed)
-    torch.manual_seed(cfg.seed)
-    np.random.seed(cfg.seed)
-    random.seed(cfg.seed)
+    seed_everything(cfg.seed, workers=True)
 
     assert cfg.eval_setting in ['train_wise', 'test_wise']
 
@@ -272,7 +298,8 @@ def run_imputation(cfg: DictConfig):
                             location=cfg.dataset.get('location'),
                             test_months=cfg.dataset.get('test_months', (3, 6, 9, 12)),
                             years=cfg.dataset.get('years', []),
-                            include_traffic=cfg.dataset.get('include_traffic', False))
+                            include_exog=cfg.dataset.get('include_exog', False),
+                            exog=cfg.dataset.get('exog', 'traffic'))
 
     print(f'Masked sensors: {masked_sensors}')
 
@@ -280,7 +307,7 @@ def run_imputation(cfg: DictConfig):
     adj = dataset.get_connectivity(**cfg.dataset.connectivity, layout='dense')
 
     # instantiate dataset
-    if cfg.dataset.get('include_traffic', False):
+    if cfg.dataset.get('include_exog', False):
         covariates = {'modality': dataset.modality}
         torch_dataset = CrossSpatioTemporalDataset(target=dataset.dataframe(),
                                                     mask=dataset.training_mask,
@@ -308,12 +335,16 @@ def run_imputation(cfg: DictConfig):
 
     val_len = cfg.dataset.splitting.get('val_len')
     test_len = cfg.dataset.splitting.get('test_len')
+
+    g = torch.Generator()
+    g.manual_seed(cfg.seed)
     dm = SpatioTemporalDataModule(
         dataset=torch_dataset,
         scalers=scalers,
         splitter=dataset.get_splitter(val_len=val_len, test_len=test_len),
         batch_size=cfg.batch_size,
-        workers=cfg.workers)
+        workers=cfg.workers,
+        generator=g)
     dm.setup(stage='fit')
 
     ########################################
@@ -328,7 +359,11 @@ def run_imputation(cfg: DictConfig):
         or cfg.model.name == 'geodeCross' or cfg.model.name == 'geodeCrossV2' \
         or cfg.model.name == 'geodeCrossV3' or cfg.model.name == 'geodeCrossV4' \
         or cfg.model.name == 'geodeCrossV5' or cfg.model.name == 'geodeCrossV6' \
-        or cfg.model.name == 'geodeCrossV7':
+        or cfg.model.name == 'geodeCrossV7' or cfg.model.name == 'geodeCrossV8' \
+        or cfg.model.name == 'geodeCrossV9' or cfg.model.name == 'geodeCrossV10' \
+        or cfg.model.name == 'geodeCrossV11' or cfg.model.name == 'geodeCrossV12' \
+        or cfg.model.name == 'geodeCrossC1' or cfg.model.name == 'geodeCrossV13' \
+        or cfg.model.name == 'geodeCrossV14':
         model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
 
     model_cls.filter_model_args_(model_kwargs)
@@ -397,6 +432,77 @@ def run_imputation(cfg: DictConfig):
     elif cfg.model.name =='geodeCrossV4' or cfg.model.name == 'geodeCrossV5' or \
         cfg.model.name == 'geodeCrossV6' or cfg.model.name == 'geodeCrossV7':
         imputer = GeodeCrossFillerV4(model_class=model_cls,
+                            model_kwargs=model_kwargs,
+                            optim_class=getattr(torch.optim, cfg.optimizer.name),
+                            optim_kwargs=dict(cfg.optimizer.hparams),
+                            loss_fn=loss_fn,
+                            scaled_target=cfg.scale_target,
+                            metrics=log_metrics,
+                            scheduler_class=scheduler_class,
+                            scheduler_kwargs=scheduler_kwargs,
+                            gradient_clip_val=cfg.grad_clip_val,
+                            gradient_clip_algorithm=cfg.grad_clip_alg,
+                            known_set = [i for i in range(dataset.air_max_nodes) if i not in masked_sensors],
+                            **cfg.model.regs)
+    elif cfg.model.name =='geodeCrossV8':
+        imputer = GeodeCrossFillerV5(model_class=model_cls,
+                            model_kwargs=model_kwargs,
+                            optim_class=getattr(torch.optim, cfg.optimizer.name),
+                            optim_kwargs=dict(cfg.optimizer.hparams),
+                            loss_fn=loss_fn,
+                            scaled_target=cfg.scale_target,
+                            metrics=log_metrics,
+                            scheduler_class=scheduler_class,
+                            scheduler_kwargs=scheduler_kwargs,
+                            gradient_clip_val=cfg.grad_clip_val,
+                            gradient_clip_algorithm=cfg.grad_clip_alg,
+                            known_set = [i for i in range(dataset.air_max_nodes) if i not in masked_sensors],
+                            **cfg.model.regs)
+    elif cfg.model.name =='geodeCrossV9' or cfg.model.name =='geodeCrossV10':
+        imputer = GeodeCrossFillerV6(model_class=model_cls,
+                            model_kwargs=model_kwargs,
+                            optim_class=getattr(torch.optim, cfg.optimizer.name),
+                            optim_kwargs=dict(cfg.optimizer.hparams),
+                            loss_fn=loss_fn,
+                            scaled_target=cfg.scale_target,
+                            metrics=log_metrics,
+                            scheduler_class=scheduler_class,
+                            scheduler_kwargs=scheduler_kwargs,
+                            gradient_clip_val=cfg.grad_clip_val,
+                            gradient_clip_algorithm=cfg.grad_clip_alg,
+                            known_set = [i for i in range(dataset.air_max_nodes) if i not in masked_sensors],
+                            **cfg.model.regs)
+    elif cfg.model.name =='geodeCrossV11':
+        imputer = GeodeCrossFillerV7(model_class=model_cls,
+                            model_kwargs=model_kwargs,
+                            optim_class=getattr(torch.optim, cfg.optimizer.name),
+                            optim_kwargs=dict(cfg.optimizer.hparams),
+                            loss_fn=loss_fn,
+                            scaled_target=cfg.scale_target,
+                            metrics=log_metrics,
+                            scheduler_class=scheduler_class,
+                            scheduler_kwargs=scheduler_kwargs,
+                            gradient_clip_val=cfg.grad_clip_val,
+                            gradient_clip_algorithm=cfg.grad_clip_alg,
+                            known_set = [i for i in range(dataset.air_max_nodes) if i not in masked_sensors],
+                            **cfg.model.regs)
+    elif cfg.model.name =='geodeCrossV12' or cfg.model.name =='geodeCrossV13' \
+        or cfg.model.name =='geodeCrossV14':
+        imputer = GeodeCrossFillerV8(model_class=model_cls,
+                            model_kwargs=model_kwargs,
+                            optim_class=getattr(torch.optim, cfg.optimizer.name),
+                            optim_kwargs=dict(cfg.optimizer.hparams),
+                            loss_fn=loss_fn,
+                            scaled_target=cfg.scale_target,
+                            metrics=log_metrics,
+                            scheduler_class=scheduler_class,
+                            scheduler_kwargs=scheduler_kwargs,
+                            gradient_clip_val=cfg.grad_clip_val,
+                            gradient_clip_algorithm=cfg.grad_clip_alg,
+                            known_set = [i for i in range(dataset.air_max_nodes) if i not in masked_sensors],
+                            **cfg.model.regs)
+    elif cfg.model.name =='geodeCrossC1':
+        imputer = GeodeCrossFillerC1(model_class=model_cls,
                             model_kwargs=model_kwargs,
                             optim_class=getattr(torch.optim, cfg.optimizer.name),
                             optim_kwargs=dict(cfg.optimizer.hparams),

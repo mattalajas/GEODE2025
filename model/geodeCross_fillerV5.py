@@ -330,7 +330,7 @@ class Filler(pl.LightningModule):
                 cfg['monitor'] = metric
         return cfg
 
-class GeodeCrossFillerV4(Filler):
+class GeodeCrossFillerV5(Filler):
     def __init__(self,
                  model_class,
                  model_kwargs,
@@ -348,7 +348,7 @@ class GeodeCrossFillerV4(Filler):
                  y1 = 1,
                  y2 = 1,
                  temp = 0.1):
-        super(GeodeCrossFillerV4, self).__init__(model_class=model_class,
+        super(GeodeCrossFillerV5, self).__init__(model_class=model_class,
                                                   model_kwargs=model_kwargs,
                                                   optim_class=optim_class,
                                                   optim_kwargs=optim_kwargs,
@@ -522,13 +522,20 @@ class GeodeCrossFillerV4(Filler):
             exp_sim = torch.exp(sim)
             exp_pos = exp_sim * sim_mask
 
-            loss_per_anchor = torch.log(exp_pos.sum(dim=-1) + 1e-8) - torch.log(exp_sim.sum(dim=-1) + 1e-8)
+            # exp_sim = rearrange(exp_sim, "b n m -> b n (m)")
+            exp_pos = rearrange(exp_pos, "b n m -> b (n m)")
+            sim_mask = rearrange(sim_mask, "b n m -> b (n m)")
 
-            # weights = (sim_mask.sum(dim=-1) > 0).float() / (sim_mask.sum(dim=-1) + 1e-8)
-            # weights = weights / (weights.sum() + 1e-8)
+            # exp_neg = rearrange(exp_sim, "(b n m -> b n m", b=b)
+            exp_den = exp_sim.sum(dim=-1) + 1e-8
 
-            # contra_loss = ((-loss_per_anchor) * weights).sum()
-            contra_loss = -loss_per_anchor.mean()
+            exp_den = exp_den[:, :, None].expand(-1, -1, exp_sim.shape[-1])
+            exp_den = rearrange(exp_den, "b n m -> b (n m)")
+            
+            log_den = torch.log(exp_den)
+            log_prob = -(torch.log(exp_pos + 1e-8) - log_den)
+            
+            contra_loss = (log_prob * sim_mask).sum() / (sim_mask.sum() + 1e-8)
         else:
             contra_loss = 0
 

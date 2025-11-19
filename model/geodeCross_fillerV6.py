@@ -155,14 +155,16 @@ class Filler(pl.LightningModule):
         batch_data.pop("edge_index", None)
 
         # Compute outputs and rescale
-        finpreds, _, _ = self.predict_batch(batch, split, preprocess=False, postprocess=True)
+        res, _, _ = self.predict_batch(batch, split, preprocess=False, postprocess=True)
+        finpreds, finsim = res[0], res[1]
         finpreds = finpreds[:, :, reverse, :]
         mask = mask[:, :, reverse, :]
         
         output = dict(y=y,
                       y_hat=finpreds,
                       mask=mask,
-                      eval_mask=eval_mask)
+                      eval_mask=eval_mask,
+                      finsim=finsim)
         return output
 
     @staticmethod
@@ -238,7 +240,9 @@ class Filler(pl.LightningModule):
             y_hat = self.forward(**batch_data)
         # Rescale outputs
         if postprocess:
-            y_hat = self._postprocess(y_hat, y_hat.shape[2], batch_preprocessing)
+            y_pred = y_hat[0]
+            y_pred = self._postprocess(y_pred, y_pred.shape[2], batch_preprocessing)
+            y_hat = [y_pred, y_hat[1]]
         if return_target:
             y = batch_data.get('y')
             mask = batch_data.get('mask', None)
@@ -287,6 +291,7 @@ class Filler(pl.LightningModule):
             batch_data.pop("edge_index", None)
 
             y_hat, _, _ = self.predict_batch(batch, split, preprocess=preprocess, postprocess=postprocess)
+            y_hat = y_hat[0]
 
             if isinstance(y_hat, (list, tuple)):
                 y_hat = y_hat[0]
@@ -330,7 +335,7 @@ class Filler(pl.LightningModule):
                 cfg['monitor'] = metric
         return cfg
 
-class GeodeCrossFillerV4(Filler):
+class GeodeCrossFillerV6(Filler):
     def __init__(self,
                  model_class,
                  model_kwargs,
@@ -348,7 +353,7 @@ class GeodeCrossFillerV4(Filler):
                  y1 = 1,
                  y2 = 1,
                  temp = 0.1):
-        super(GeodeCrossFillerV4, self).__init__(model_class=model_class,
+        super(GeodeCrossFillerV6, self).__init__(model_class=model_class,
                                                   model_kwargs=model_kwargs,
                                                   optim_class=optim_class,
                                                   optim_kwargs=optim_kwargs,
@@ -616,7 +621,8 @@ class GeodeCrossFillerV4(Filler):
         batch_data["mask"] = mask
 
         # Compute predictions and compute loss
-        imputation, _, _ = self.predict_batch(batch, preprocess=False, postprocess=False)
+        res, _, _ = self.predict_batch(batch, preprocess=False, postprocess=False)
+        imputation = res[0]
 
         if self.scaled_target:
             target = batch.transform['y'].transform(y, split)
@@ -675,7 +681,9 @@ class GeodeCrossFillerV4(Filler):
         y = batch_data.pop('y')[:, :, :split]
 
         # Compute outputs and rescale
-        imputation, _, _ = self.predict_batch(batch, split, preprocess=False, postprocess=True)
+        res, _, _ = self.predict_batch(batch, split, preprocess=False, postprocess=True)
+        imputation = res[0]
+
         imputation = imputation[:, :, reverse, :]
         test_loss = self.loss_fn(imputation, y, eval_mask)
 

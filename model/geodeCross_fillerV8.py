@@ -155,14 +155,16 @@ class Filler(pl.LightningModule):
         batch_data.pop("edge_index", None)
 
         # Compute outputs and rescale
-        finpreds, _, _ = self.predict_batch(batch, split, preprocess=False, postprocess=True)
+        res, _, _ = self.predict_batch(batch, split, preprocess=False, postprocess=True)
+        finpreds, finsim = res[0], res[1]
         finpreds = finpreds[:, :, reverse, :]
         mask = mask[:, :, reverse, :]
         
         output = dict(y=y,
                       y_hat=finpreds,
                       mask=mask,
-                      eval_mask=eval_mask)
+                      eval_mask=eval_mask,
+                      finsim=finsim)
         return output
 
     @staticmethod
@@ -238,7 +240,9 @@ class Filler(pl.LightningModule):
             y_hat = self.forward(**batch_data)
         # Rescale outputs
         if postprocess:
-            y_hat = self._postprocess(y_hat, y_hat.shape[2], batch_preprocessing)
+            y_pred = y_hat[0]
+            y_pred = self._postprocess(y_pred, y_pred.shape[2], batch_preprocessing)
+            y_hat = [y_pred, y_hat[1]]
         if return_target:
             y = batch_data.get('y')
             mask = batch_data.get('mask', None)
@@ -287,6 +291,7 @@ class Filler(pl.LightningModule):
             batch_data.pop("edge_index", None)
 
             y_hat, _, _ = self.predict_batch(batch, split, preprocess=preprocess, postprocess=postprocess)
+            y_hat = y_hat[0]
 
             if isinstance(y_hat, (list, tuple)):
                 y_hat = y_hat[0]
@@ -330,7 +335,7 @@ class Filler(pl.LightningModule):
                 cfg['monitor'] = metric
         return cfg
 
-class GeodeCrossFillerV4(Filler):
+class GeodeCrossFillerV8(Filler):
     def __init__(self,
                  model_class,
                  model_kwargs,
@@ -346,9 +351,8 @@ class GeodeCrossFillerV4(Filler):
                  gradient_clip_algorithm=None,
                  known_set=None,
                  y1 = 1,
-                 y2 = 1,
-                 temp = 0.1):
-        super(GeodeCrossFillerV4, self).__init__(model_class=model_class,
+                 y2 = 1):
+        super(GeodeCrossFillerV8, self).__init__(model_class=model_class,
                                                   model_kwargs=model_kwargs,
                                                   optim_class=optim_class,
                                                   optim_kwargs=optim_kwargs,
@@ -365,7 +369,6 @@ class GeodeCrossFillerV4(Filler):
         self.gradient_clip_algorithm = gradient_clip_algorithm
         self.y1 = y1
         self.y2 = y2
-        self.temp = temp
     
     def load_model(self, filename: str):
         """Load model's weights from checkpoint at :attr:`filename`.
@@ -484,7 +487,7 @@ class GeodeCrossFillerV4(Filler):
 
         # Compute predictions and compute loss
         res, _, _ = self.predict_batch(batch, preprocess=False, postprocess=False)
-        finpreds, fin_irm_all_s, finsim = res[0], res[1], res[2]
+        finpreds, fincross, finsim = res[0], res[1], res[2]
 
         b = x.shape[0]
         if self.scaled_target:
@@ -492,48 +495,38 @@ class GeodeCrossFillerV4(Filler):
         else:
             target = y
             finpreds = self._postprocess(finpreds, finpreds.shape[2], batch_preprocessing)
-            fin_irm_all_s = self._postprocess(fin_irm_all_s, fin_irm_all_s.shape[2], batch_preprocessing)
+            fincross = self._postprocess(fincross, fincross.shape[2], batch_preprocessing)
 
         opt1.zero_grad()
 
-        # IRM Loss
+        # Cross Loss
         if self.y1 != 0:
-            irm_target = target[:, :, :len(known_set)]
-            irm_mask = eval_mask[:, :, :len(known_set)]
-            steps = self.model.steps
-            env_loss = torch.tensor([]).to(x.device)
-            for i in range(steps):
-                env_loss = torch.cat(
-                            [env_loss,
-                            self.loss_fn(fin_irm_all_s[i], irm_target, irm_mask.bool()).unsqueeze(0)])
-            env_mean = env_loss.mean()
-            env_var = torch.var(env_loss * steps)
-            irm_loss = env_var + env_mean
+            cross_loss = self.loss_fn(fincross, target, eval_mask.bool())
         else:
-            irm_loss = 0
+            cross_loss = 0
 
         if self.y2 != 0:
-            sim_mat, sim_mask = finsim
-            sim = sim_mat / self.temp
+            cmds = torch.tensor([]).to(x.device)
+            for node in range(finsim[0].shape[0]):
+                    inv_emb_air = rearrange(finsim[0][node], 'b t d -> (b t) d')
+                    inv_emb_cro = rearrange(finsim[1][node], 'b t d -> (b t) d')
 
-            sim_max, _ = torch.max(sim, dim=-1, keepdim=True)
-            sim = sim - sim_max.detach()
+                    og_air = inv_emb_air.size(0) // (b)
+                    og_cro = inv_emb_cro.size(0) // (b)
 
-            exp_sim = torch.exp(sim)
-            exp_pos = exp_sim * sim_mask
+                    batches = torch.arange(0, b).to(device=x.device)
+                    air_batch = torch.repeat_interleave(batches, repeats=(og_air))
+                    cro_batch = torch.repeat_interleave(batches, repeats=(og_cro))
 
-            loss_per_anchor = torch.log(exp_pos.sum(dim=-1) + 1e-8) - torch.log(exp_sim.sum(dim=-1) + 1e-8)
+                    cmds = torch.cat([cmds, torch.clamp(cmd(inv_emb_air, inv_emb_cro, \
+                                                            air_batch, cro_batch, n_moments=3).mean(), min=0).unsqueeze(0)])
 
-            # weights = (sim_mask.sum(dim=-1) > 0).float() / (sim_mask.sum(dim=-1) + 1e-8)
-            # weights = weights / (weights.sum() + 1e-8)
-
-            # contra_loss = ((-loss_per_anchor) * weights).sum()
-            contra_loss = -loss_per_anchor.mean()
+            cmd_loss = cmds.mean()
         else:
-            contra_loss = 0
+            cmd_loss = 0
 
         main_loss = self.loss_fn(finpreds, target, eval_mask.bool()) 
-        loss = main_loss + self.y1 * irm_loss + self.y2 * contra_loss
+        loss = main_loss + self.y1 * cross_loss + self.y2 * cmd_loss
         
         self.manual_backward(loss)
 
@@ -555,15 +548,15 @@ class GeodeCrossFillerV4(Filler):
                  logger=True,
                  prog_bar=False)
 
-        self.log('InfoNCE Loss', 
-                 contra_loss,
+        self.log('Reconstruction Loss', 
+                 cmd_loss,
                  on_step=False,
                  on_epoch=True,
                  logger=True,
                  prog_bar=False)
     
         self.log('IRM error', 
-                 irm_loss,                  
+                 cross_loss,                  
                  on_step=False,
                  on_epoch=True,
                  logger=True,
@@ -616,7 +609,8 @@ class GeodeCrossFillerV4(Filler):
         batch_data["mask"] = mask
 
         # Compute predictions and compute loss
-        imputation, _, _ = self.predict_batch(batch, preprocess=False, postprocess=False)
+        res, _, _ = self.predict_batch(batch, preprocess=False, postprocess=False)
+        imputation = res[0]
 
         if self.scaled_target:
             target = batch.transform['y'].transform(y, split)
@@ -675,7 +669,9 @@ class GeodeCrossFillerV4(Filler):
         y = batch_data.pop('y')[:, :, :split]
 
         # Compute outputs and rescale
-        imputation, _, _ = self.predict_batch(batch, split, preprocess=False, postprocess=True)
+        res, _, _ = self.predict_batch(batch, split, preprocess=False, postprocess=True)
+        imputation = res[0]
+
         imputation = imputation[:, :, reverse, :]
         test_loss = self.loss_fn(imputation, y, eval_mask)
 
