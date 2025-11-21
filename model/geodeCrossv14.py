@@ -393,6 +393,7 @@ class GeodeCrossV14(BaseModel):
         # test1 = xh_cro.sum(dim=(0, 1, 3))
         # test = xh_cro_2.sum(dim=(0, 1, 3))
 
+        # Pseudoencoding for main embeddings 
         for kh in range(1, self.k+1):
             # Pass if there are no k-hop reach nodes
             if grouped[kh] == []:
@@ -401,51 +402,51 @@ class GeodeCrossV14(BaseModel):
             # Organise the khop nodes 
             # Get the indices of vertices within k-hop reach
             rep_indices = []
-            bef_indices = []
             cur_indices = grouped[kh]
             for i in range(kh+1):
                 rep_indices += grouped[i]
-            for i in range(kh):
-                bef_indices += grouped[i]
 
             alt_adj = adj.clone()
-            alt_adj_cro = c_adj.clone()
 
             if kh < self.k:
                 rep_adj = alt_adj[:, rep_indices]
                 rep_adj = rep_adj[rep_indices, :]
 
-                rep_adj_cro = alt_adj_cro[rep_indices, :]
-
                 rep_air = xh_air_2[:, :, rep_indices, :]
-                rep_cro = xh_cro_2[:, :, rep_indices + exog_inds, :]
             else:
                 rep_adj = alt_adj
-                rep_adj_cro = alt_adj_cro
-
                 rep_air = xh_air_2
-                rep_cro = xh_cro_2
 
             air_adj = dense_to_sparse(rep_adj.to(torch.float32))
-            cro_adj, _ = dense_to_sparse(rep_adj_cro.T.to(torch.float32))
-            cro_adj[0] += rep_adj_cro.shape[0]
 
             xh_air_0 = self.gcn1(rep_air, air_adj[0], air_adj[1])
             xh_air_1 = self.layernorm1(xh_air_0)
 
-            xh_cro_0 = self.gcn1(rep_cro, cro_adj)
-            xh_cro_1 = self.layernorm1(xh_cro_0)
-
             cur_indices_tensor = torch.tensor(cur_indices, dtype=torch.long, device=device)
             cur_ind_exp = cur_indices_tensor[None, None, :, None].expand(b, t, -1, xh_air_1.size(-1))
 
-            xh_air_2 = xh_air_2.scatter(2, cur_ind_exp, xh_air_1[:, :, len(bef_indices):, :])
-            xh_cro_2 = xh_cro_2.scatter(2, cur_ind_exp, xh_cro_1[:, :, len(bef_indices):len(bef_indices)+len(cur_indices), :])
+            xh_air_2 = xh_air_2.scatter(2, cur_ind_exp, xh_air_1[:, :, -len(cur_indices):, :])
 
+        # Normal encoding for cross embeddings
+        for i in range(1, kh+1):
+            cur_indices += grouped[i]
+
+        rep_cro = xh_cro_2
+        cro_adj, _ = dense_to_sparse(c_adj.T.to(torch.float32))
+        cro_adj[0] += c_adj.shape[0]     
+
+        xh_cro_0 = self.gcn1(rep_cro, cro_adj)
+        xh_cro_1 = self.layernorm1(xh_cro_0)
+
+        cur_indices_tensor = torch.tensor(cur_indices, dtype=torch.long, device=device)
+        cur_ind_exp = cur_indices_tensor[None, None, :, None].expand(b, t, -1, xh_air_1.size(-1))
+
+        xh_cro_2 = xh_cro_2.scatter(2, cur_ind_exp, xh_cro_1[:, :, len(grouped[0]):len(grouped[0])+len(cur_indices), :])
+        xh_cro_2 = xh_cro_2[:, :, :xh_air_2.shape[2]]
+        
         # test2 = xh_cro_2.sum(dim = (0, 1, 3))
         # index_diff = (test2.flatten() != test1.flatten()).nonzero().flatten()
 
-        xh_cro_2 = xh_cro_2[:, :, :xh_air_2.shape[2]]
         # ========================================
         # Final Message Passing
         # ========================================
