@@ -238,8 +238,13 @@ def add_missing_sensors(dataset: TabularDataset,
 
 def shift_mask(shape, feature, order, adj, p_noise=0.05):
     mask = np.zeros(shape).astype(bool)
-    G = nx.from_numpy_array(adj)
+    
+    try:
+        adj = adj.numpy()
+    except:
+        pass
 
+    G = nx.from_numpy_array(adj)
     parts = math.ceil(adj.shape[0]*p_noise)
 
     if feature == 'CC':
@@ -853,7 +858,7 @@ class AirCross(DatetimeDataset):
                  imputation_mode: Literal["nearest", "zero", None] = "zero",
                  freq: str = "h",
                  include_exog: bool = False,
-                 exog: str = 'traffic'):
+                 exog: str = 'humd'):
         # set root path
         self.root = root
         self.years = years
@@ -961,67 +966,6 @@ class AirCross(DatetimeDataset):
         if method == "precomputed":
             # load precomputed adjacency matrix based on road distance
             return self.adj
-        
-def add_missing_sensors_cross(dataset: AirCross,
-                              p_noise=0.05,
-                              p_fault=0.01,
-                              min_seq=1,
-                              max_seq=10,
-                              seed=None,
-                              inplace=True,
-                              masked_sensors = [],
-                              connect = None,
-                              spatial_shift = False, 
-                              order = 0,
-                              node_features = 'CC',
-                              mode='road'):
-    if seed is None:
-        seed = np.random.randint(1e9)
-    # Fix seed for random mask generation
-    random = np.random.default_rng(seed)
-
-    # Compute evaluation mask
-    shape = (dataset.length, dataset.air_max_nodes, dataset.n_channels)
-    adj = dataset.get_connectivity(**connect, layout='dense')
-    air_adj = adj[:dataset.air_max_nodes, :dataset.air_max_nodes]  
-    eval_mask = np.zeros_like(dataset.mask)
-
-    if masked_sensors is None:
-        if spatial_shift:
-            tmp_mask = shift_mask(shape, feature=node_features, order=order, 
-                                   adj=air_adj, p_noise=p_noise)
-            dataset.seed = seed
-        else:
-            tmp_mask = sample_mask(shape,
-                                    p=p_fault,
-                                    p_noise=p_noise,
-                                    mode=mode,
-                                    adj=air_adj)
-            
-            dataset.p_fault = p_fault
-            dataset.p_noise = p_noise
-            dataset.min_seq = min_seq
-            dataset.max_seq = max_seq
-            dataset.seed = seed
-            dataset.random = random
-
-        # mask = rearrange(eval_mask, "b n 1 -> b n")
-        mask_sum = tmp_mask.sum(0)  # n
-        masked_sensors = (np.where(mask_sum > 0)[0]).tolist()
-        eval_mask[:, :dataset.air_max_nodes] = tmp_mask
-    else:
-        masked_sensors = list(masked_sensors)
-        eval_mask = np.zeros_like(dataset.mask)
-        eval_mask[:, masked_sensors] = dataset.mask[:, masked_sensors]
-
-    # Convert to missing values dataset
-    dataset = to_missing_values_dataset(dataset, eval_mask, inplace)
-
-    test2 = np.sum(dataset.mask, axis=(0))
-    test1 = np.sum(eval_mask, axis=(0))
-
-    # Store evaluation mask params in dataset
-    return dataset, masked_sensors
 
 class StandardScalerSplit(Scaler):
     """Apply standardization to data by removing mean and scaling to unit
@@ -1638,3 +1582,529 @@ class SpatioTemporalDataModule(LightningDataModule):
             -> Optional[DataLoader]:
         """"""
         return self.get_dataloader('test', shuffle, batch_size)
+
+import math
+from typing import Mapping, Type
+
+import numpy as np
+import torch
+from torch import nn
+from tqdm import tqdm
+
+from tsl.datasets import TabularDataset
+from tsl.ops.connectivity import parse_connectivity
+from tsl.typing import SparseTensArray
+from tsl.utils.casting import torch_to_numpy
+from tsl.utils.python_utils import foo_signature
+
+from torch_geometric.utils import dense_to_sparse
+
+
+class CrossGaussianNoiseSyntheticDataset(TabularDataset):
+    r"""A generator of synthetic datasets from an input model and input graph.
+
+    The input model must be implemented as a :class:`torch.nn.Module` and must
+    return the observation at the next step and (optionally) the hidden state
+    for the next step. Gaussian noise will be added to the output of the model
+    at each step.
+
+    Args:
+        num_features (int): Number of features in the generated dataset.
+        num_nodes (int): Number of nodes in the graph.
+        num_steps (int): Number of steps to generate.
+        connectivity (SparseTensArray): Connectivity of the underlying graph.
+        model (torch.nn.Module): Model used to generate data. If :obj:`None`,
+            it will attempt to create model from ``model_class`` and
+            ``model_kwargs``.
+        model_class (type, optional): Class of the model used to generate the
+            data.
+            (default: :obj:`None`)
+        model_kwargs (dict, optional): Keyword arguments needed to initialize
+            the model.
+            (default: :obj:`None`)
+        sigma_noise (float): Standard deviation of the noise.
+            (default: :obj:`0.2`)
+        name (str, optional): Name for the generated dataset.
+            (default: :obj:`None`)
+        seed (int, optional): Seed for the random number generator.
+            (default: :obj:`None`)
+    """
+
+    seed: int = None
+
+    def __init__(self,
+                 num_features: int,
+                 num_nodes: int,
+                 split: int,
+                 num_steps: int,
+                 connectivity: SparseTensArray,
+                 min_window: int = 1,
+                 o_model: nn.Module = None,
+                 o_model_class: Type = None,
+                 o_model_kwargs: Mapping = None,
+                 o_sigma_noise: float = .2,
+                 e_model: nn.Module = None,
+                 e_model_class: Type = None,
+                 e_model_kwargs: Mapping = None,
+                 e_sigma_noise: float = .2,
+                 include_exog: bool = True,
+                 name: str = None,
+                 seed: int = 42,
+                 **kwargs):
+        self.name = name
+        self._num_nodes = num_nodes
+        self._num_features = num_features
+        self._num_steps = num_steps
+        self._min_window = min_window
+        self._include_exog = include_exog
+        if seed is not None:
+            self.seed = seed
+
+        if o_model is not None:
+            self.o_model = o_model
+        else:
+            self.o_model = o_model_class(**o_model_kwargs)
+
+        self._model_forward_signature = foo_signature(o_model.forward)
+
+        self.o_sigma_noise = o_sigma_noise
+
+        if e_model is not None:
+            self.e_model = e_model
+        else:
+            self.e_model = e_model_class(**e_model_kwargs)
+
+        self._model_forward_signature = foo_signature(e_model.forward)
+
+        self.e_sigma_noise = e_sigma_noise
+
+        if connectivity is not None:
+            self.connectivity = parse_connectivity(connectivity,
+                                                   target_layout='edge_index',
+                                                   num_nodes=num_nodes)
+        else:
+            self.connectivity = None
+        self._main_num = split
+        self._exog_num = connectivity.shape[1] - split
+
+        target, optimal_pred, mask, modality = self.load()
+        self.modality = modality
+        super().__init__(target=target, mask=mask, name=name, **kwargs)
+
+        self.add_covariate('optimal_pred', optimal_pred, 't n f')
+
+    def load_raw(self, *args, **kwargs):
+        return self.generate_data(self.seed)
+
+    # @property
+    # def mae_optimal_model(self):
+    #     r""":math:`\mathbb{E}[|\mathbf{X}|]` of a Gaussian
+    #     :math:`\mathbf{X} \sim \mathcal{N}(0, \sigma^2)`, computed as
+    #     :math:`\varepsilon = \sqrt{\frac{2}{\pi}}\sigma`.
+    #     """
+    #     return math.sqrt(2.0 / math.pi) * self.o_sigma_noise
+
+    def _filter_forward_kwargs(self, kwargs):
+        if not self._model_forward_signature['has_kwargs']:
+            kwargs = {
+                k: v
+                for k, v in kwargs.items()
+                if k in self._model_forward_signature['signature']
+            }
+        return kwargs
+
+    def _model_forward(self, *args, **kwargs):
+        kwargs = self._filter_forward_kwargs(kwargs)
+        out = self.o_model(*args, **kwargs)
+        if len(out) != 2:
+            return out, None
+        # Assumes that if the output has length 2,
+        # then it will contain [output, hidden_state].
+        return out
+
+    def _e_model_forward(self, *args, **kwargs):
+        kwargs = self._filter_forward_kwargs(kwargs)
+        out = self.e_model(*args, **kwargs)
+        if len(out) != 2:
+            return out, None
+        # Assumes that if the output has length 2,
+        # then it will contain [output, hidden_state].
+        return out
+
+    def generate_data(self, seed=None):
+        """"""
+        rng = torch.Generator()
+        if seed is not None:
+            rng.manual_seed(seed)
+
+        # initialize with noise
+        x = torch.empty(
+            (self._num_steps + self._min_window, self._num_nodes,
+             self._num_features)).normal_(generator=rng) * self.o_sigma_noise
+
+        y_opt = torch.empty(
+            (self._num_steps, self._num_nodes, self._num_features))
+
+        if self.connectivity is None:
+            edge_index = edge_weight = None
+        else:
+            edge_index, edge_weight = self.connectivity
+
+            if edge_weight is None:
+                edge_weight = torch.ones(edge_index.shape[1])
+
+            adj = torch.eye(self._num_nodes, dtype=torch.float32)
+            adj[tuple(edge_index)] = edge_weight
+
+            o_edge_index, o_edge_weight = dense_to_sparse(adj[:self._main_num, :self._main_num]) # N N
+            e_edge_index, e_edge_weight = dense_to_sparse(adj[self._main_num:, self._main_num:]) # M M
+
+            c_adj = adj[:self._main_num, self._main_num:]
+            # c_edge_index, c_edge_weight = dense_to_sparse(c_adj) # N M
+
+        with torch.no_grad():
+            eh_t = None
+            oh_t = None
+            for t in tqdm(range(self._min_window,
+                                self._min_window + self._num_steps),
+                          desc=f"Generating {self.__class__.__name__} data"):
+                # ft modelling 
+                e_t, eh_t = self._e_model_forward(x[None, t - self._min_window:t, self._main_num:],
+                                               h=eh_t,
+                                               t=t,
+                                               edge_index=e_edge_index,
+                                               edge_weight=e_edge_weight)
+                f_t = e_t + torch.zeros_like(e_t).normal_(generator=rng) * self.e_sigma_noise
+                x[t:t + 1, self._main_num:] = f_t[0]
+
+                Uf_t = c_adj @ f_t
+
+                # Adding to original graph
+                o_t, oh_t = self._model_forward(x[None, t - self._min_window:t, :self._main_num],
+                                               h=oh_t,
+                                               t=t,
+                                               edge_index=o_edge_index,
+                                               edge_weight=o_edge_weight)
+                x_t = torch.tanh(o_t + Uf_t)
+                
+                y_opt[t - self._min_window:t + 1 - self._min_window, :self._main_num] = x_t[0]
+                # add noise
+                x_t = x_t + torch.zeros_like(x_t).normal_(
+                    generator=rng) * self.o_sigma_noise
+                x[t:t + 1, :self._main_num] = x_t[0]
+
+        x = torch_to_numpy(x[self._min_window:])
+        y_opt = torch_to_numpy(y_opt)
+
+        modality = np.zeros((self._num_nodes, 1))
+        modality[self._main_num:] = 1
+
+        # Just take the original graph if not including exogeneous data
+        if not self._include_exog:
+            if self.connectivity is not None:
+                self.connectivity = parse_connectivity(o_edge_index,
+                                                    target_layout='edge_index',
+                                                    num_nodes=self._main_num)
+            else:
+                self.connectivity = None
+            
+            x = x[:, :self._main_num]
+            y_opt = y_opt[:, :self._main_num]
+
+        return x, y_opt, np.ones_like(x), modality
+
+    def get_connectivity(self, layout: str = 'edge_index', **kwargs):
+        """"""
+        if self.connectivity is not None:
+            return parse_connectivity(connectivity=self.connectivity,
+                                      target_layout=layout,
+                                      num_nodes=self.n_nodes)
+        return None
+
+from typing import List, Union
+
+import numpy as np
+import torch
+from numpy import ndarray
+from torch import Tensor
+from torch_geometric.utils import add_self_loops
+
+from tsl.nn.layers.graph_convs.gpvar import GraphPolyVAR
+from tsl.ops.graph_generators import build_tri_community_graph
+
+class _GPVAR(GraphPolyVAR):
+    def forward(self, x, edge_index, edge_weight=None):
+        out = super(_GPVAR, self).forward(x, edge_index, edge_weight)
+        return torch.tanh(out)
+
+SIZES_X = [10, 10, 10, 10]
+PROB_X = [[0.30, 0.01, 0.01, 0.01],
+          [0.01, 0.30, 0.01, 0.01],
+          [0.01, 0.01, 0.30, 0.01],
+          [0.01, 0.01, 0.01, 0.30]]
+
+SIZES_Y = [15, 15, 15]
+PROB_Y = [[0.30, 0.01, 0.01],
+          [0.01, 0.30, 0.01],
+          [0.01, 0.01, 0.30]]
+
+# Cross-layer bipartite SBM
+# Y has 2 blocks, X has 2 blocks
+SIZES_XY = ([15, 15, 15], [10, 10, 10, 10])
+PROB_XY = [[0.25, 0.00, 0.00],
+           [0.10, 0.10, 0.00],
+           [0.00, 0.10, 0.10],
+           [0.00, 0.00, 0.25]]
+
+DEFAULT_SBM_PARAMS = {'sizes_x': SIZES_X, 'prob_x': PROB_X,
+                      'sizes_y': SIZES_Y, 'prob_y': PROB_Y,
+                      'sizes_xy': SIZES_XY, 'prob_xy': PROB_XY}
+
+class CrossGPVARDataset(CrossGaussianNoiseSyntheticDataset):
+    """Generator for synthetic datasets from a graph polynomial VAR filter on
+    triangular community graphs as shown in the paper `"AZ-whiteness test: a
+    test for uncorrelated noise on spatio-temporal graphs"
+    <https://arxiv.org/abs/2204.11135>`_ (Zambon et al., NeurIPS 22).
+
+    Args:
+        num_communities (int): Number of communities (triangles) in the graph.
+        num_steps (int): Length of the generated sequence.
+        filter_params (iterable): Parameters of the graph polynomial filter
+            used to generate the dataset.
+        sigma_noise (float): Standard deviation of the noise.
+        norm (str): The normalization used for edges and edge weights. The
+            available options are: :obj:`'gcn'`, :obj:`'asym'` and
+            :obj:`'none'`.
+            (default: :obj:`'none'`)
+        name (optional, str): Name of the dataset.
+    """
+
+    def __init__(self,
+                 num_steps: int,
+                 o_filter_params: Union[List, Tensor, ndarray],
+                 e_filter_params: Union[List, Tensor, ndarray],
+                 o_sigma_noise: float = .2,
+                 o_norm: str = 'none',
+                 e_sigma_noise: float = .2,
+                 e_norm: str = 'none',
+                 sbm_params: dict = DEFAULT_SBM_PARAMS,
+                 include_exog: bool = True,
+                 name: str = None):
+        if name is None:
+            name = "GP-VAR"
+
+        # TODO: Change the graph generation process 
+        # node_idx, edge_index, _ = build_tri_community_graph(
+        #     num_communities=num_communities)
+        # num_nodes = len(node_idx)
+        # # add self loops
+        # edge_index, _ = add_self_loops(edge_index=torch.tensor(edge_index),
+        #                                num_nodes=num_nodes)
+        # split = 5
+
+        Gx, Gy, Gxy, A_aug = generate_multiplex_sbm(
+            **sbm_params,
+            seed=42
+        )
+        num_nodes = A_aug.shape[0]
+        self.air_max_nodes = len(Gx.nodes)
+
+        edge_index = []
+        edge_weight = []
+
+        for i, row in enumerate(A_aug):
+            for j, el in enumerate(row):
+                if el > 0 and i != j and np.isfinite(el):
+                    edge_index.append([i, j])
+                    edge_weight.append(el)
+
+        edge_index = np.array(edge_index).T
+        edge_weight = np.array(edge_weight)
+
+        # Calculate the filters
+        if not isinstance(o_filter_params, Tensor):
+            o_filter_params = torch.as_tensor(o_filter_params, dtype=torch.float32)
+        if not isinstance(e_filter_params, Tensor):
+            e_filter_params = torch.as_tensor(e_filter_params, dtype=torch.float32)
+
+        o_filter = _GPVAR.from_params(filter_params=o_filter_params,
+                                    norm=o_norm,
+                                    cached=True)
+        e_filter = _GPVAR.from_params(filter_params=e_filter_params,
+                                    norm=e_norm,
+                                    cached=True)  
+
+        super(CrossGPVARDataset, self).__init__(num_features=1,
+                                           num_nodes=num_nodes,
+                                           num_steps=num_steps,
+                                           split=self.air_max_nodes,
+                                           connectivity=edge_index,
+                                           min_window=o_filter.temporal_order,
+                                           o_model=o_filter,
+                                           o_sigma_noise=o_sigma_noise,
+                                           e_model=e_filter,
+                                           e_sigma_noise=e_sigma_noise,
+                                           include_exog=include_exog,
+                                           name=name)
+        
+
+import numpy as np
+import networkx as nx
+
+def generate_multiplex_sbm(
+    sizes_x,
+    prob_x,
+    sizes_y,
+    prob_y,
+    sizes_xy,
+    prob_xy,
+    seed=None
+):
+    """
+    Generate a multiplex graph with:
+    - Layer X: SBM(sizes_x, prob_x)  → placed in UPPER block
+    - Layer Y: SBM(sizes_y, prob_y)  → placed in LOWER block
+    - Cross-layer edges via bipartite SBM(sizes_xy, prob_xy)
+
+    Returns:
+        Gx, Gy, Gxy, A_aug
+    """
+
+    rng = np.random.default_rng(seed)
+
+    # -----------------------------
+    # 1. Layer X (SBM) – goes to upper-left
+    # -----------------------------
+    Gx = nx.stochastic_block_model(
+        sizes_x, prob_x, seed=seed
+    )
+    n_x = sum(sizes_x)
+
+    # -----------------------------
+    # 2. Layer Y (SBM) – goes to lower-right
+    # -----------------------------
+    Gy = nx.stochastic_block_model(
+        sizes_y, prob_y, seed=(seed + 1 if seed else None)
+    )
+    n_y = sum(sizes_y)
+
+    # -----------------------------
+    # 3. Cross-layer bipartite SBM
+    # -----------------------------
+    sizes_y_xy, sizes_x_xy = sizes_xy
+    B_xy = prob_xy
+
+    Gxy = nx.Graph()
+
+    # X nodes: block labels
+    x_blocks = []
+    for b, size in enumerate(sizes_x_xy):
+        x_blocks += [b] * size
+
+    # Y nodes: block labels
+    y_blocks = []
+    for b, size in enumerate(sizes_y_xy):
+        y_blocks += [b] * size
+
+    # Add bipartite node sets:
+    #  - X nodes: 0 .. n_x - 1  (bipartite = 0)
+    #  - Y nodes: n_x .. n_x+n_y-1 (bipartite = 1)
+
+    for i in range(n_x):
+        Gxy.add_node(i, bipartite=0, block=x_blocks[i])
+
+    for j in range(n_y):
+        Gxy.add_node(j + n_x, bipartite=1, block=y_blocks[j])
+
+    # Sample bipartite edges
+    for i in range(n_x):
+        for j in range(n_y):
+            bi = x_blocks[i]
+            bj = y_blocks[j]
+            if rng.random() < B_xy[bi][bj]:
+                Gxy.add_edge(i, j + n_x)
+
+    # -----------------------------
+    # 4. Build supra-adjacency
+    # -----------------------------
+    A_aug = np.zeros((n_x + n_y, n_x + n_y))
+
+    # Layer X (upper-left)
+    Ax = nx.to_numpy_array(Gx)
+    A_aug[:n_x, :n_x] = Ax
+
+    # Layer Y (lower-right)
+    Ay = nx.to_numpy_array(Gy)
+    A_aug[n_x:, n_x:] = Ay
+
+    # Cross-layer adjacency
+    Axy = nx.to_numpy_array(Gxy)
+
+    # X → Y block (upper-right)
+    A_aug[:n_x, n_x:] = Axy[:n_x, n_x:]
+
+    # Y → X block (lower-left)
+    A_aug[n_x:, :n_x] = Axy[n_x:, :n_x]
+
+    return Gx, Gy, Gxy, A_aug
+
+def add_missing_sensors_cross(dataset: AirCross | CrossGPVARDataset,
+                              p_noise=0.05,
+                              p_fault=0.01,
+                              min_seq=1,
+                              max_seq=10,
+                              seed=None,
+                              inplace=True,
+                              masked_sensors = [],
+                              connect = None,
+                              spatial_shift = False, 
+                              order = 0,
+                              node_features = 'CC',
+                              mode='road'):
+    if seed is None:
+        seed = np.random.randint(1e9)
+    # Fix seed for random mask generation
+    random = np.random.default_rng(seed)
+
+    # Compute evaluation mask
+    shape = (dataset.length, dataset.air_max_nodes, dataset.n_channels)
+    adj = dataset.get_connectivity(**connect, layout='dense')
+    air_adj = adj[:dataset.air_max_nodes, :dataset.air_max_nodes]  
+    eval_mask = np.zeros_like(dataset.mask)
+
+    if masked_sensors is None:
+        if spatial_shift:
+            tmp_mask = shift_mask(shape, feature=node_features, order=order, 
+                                   adj=air_adj, p_noise=p_noise)
+            dataset.seed = seed
+        else:
+            tmp_mask = sample_mask(shape,
+                                    p=p_fault,
+                                    p_noise=p_noise,
+                                    mode=mode,
+                                    adj=air_adj)
+            
+            dataset.p_fault = p_fault
+            dataset.p_noise = p_noise
+            dataset.min_seq = min_seq
+            dataset.max_seq = max_seq
+            dataset.seed = seed
+            dataset.random = random
+
+        # mask = rearrange(eval_mask, "b n 1 -> b n")
+        mask_sum = tmp_mask.sum(0)  # n
+        masked_sensors = (np.where(mask_sum > 0)[0]).tolist()
+        eval_mask[:, :dataset.air_max_nodes] = tmp_mask
+    else:
+        masked_sensors = list(masked_sensors)
+        eval_mask = np.zeros_like(dataset.mask)
+        eval_mask[:, masked_sensors] = dataset.mask[:, masked_sensors]
+
+    # Convert to missing values dataset
+    dataset = to_missing_values_dataset(dataset, eval_mask, inplace)
+
+    test2 = np.sum(dataset.mask, axis=(0))
+    test1 = np.sum(eval_mask, axis=(0))
+
+    # Store evaluation mask params in dataset
+    return dataset, masked_sensors

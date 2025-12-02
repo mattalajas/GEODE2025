@@ -13,6 +13,7 @@ from torch_geometric.nn.models import GCN
 from tsl.nn.blocks.encoders.mlp import MLP
 from tsl.nn.layers.graph_convs import DiffConv, GATConv
 from tsl.nn import utils
+from tsl.nn.blocks.encoders import TransformerLayer
 from tsl.nn.layers.base import MultiHeadAttention
 from tsl.nn.models.base_model import BaseModel
 from utils import closest_distances_unweighted
@@ -95,7 +96,7 @@ class SpatioTemporalTransformerLayer(nn.Module):
         x = x + self.mlp(x)
         return x
     
-class GeodeCrossV13(BaseModel):
+class GeodeCrossC2(BaseModel):
     def __init__(self,
                  input_size,
                  hidden_size,
@@ -109,11 +110,11 @@ class GeodeCrossV13(BaseModel):
                  horizon=24,
                  cmd_sample_ratio=1.,
                  tra_sample_ratio=1.,
-                 att_window=3,
                  k=5,
                  att_heads=8,
-                 dropout=0.1):
-        super(GeodeCrossV13, self).__init__()
+                 dropout=0.1,
+                 threshold=0.1):
+        super(GeodeCrossC2, self).__init__()
 
         self.steps = intervention_steps
         self.horizon = horizon
@@ -121,7 +122,7 @@ class GeodeCrossV13(BaseModel):
         self.tra_ratio = tra_sample_ratio
         self.k = k
         self.att_heads = att_heads
-        self.att_window = att_window
+        self.adj_thres = threshold
 
         if not cro_layers:
             cro_layers = gcn_layers
@@ -138,45 +139,21 @@ class GeodeCrossV13(BaseModel):
                                                        causal=False,
                                                        activation=activation,
                                                        dropout=dropout)
-        # self.cros_tras = SpatioTemporalTransformerLayer(input_size=hidden_size,
-        #                                                hidden_size=hidden_size,
-        #                                                ff_size=hidden_size,
-        #                                                n_heads=att_heads,
-        #                                                causal=False,
-        #                                                activation=activation,
-        #                                                dropout=dropout)
 
-        self.layernorm00 = LayerNorm(hidden_size)
-        self.layernorm01 = LayerNorm(hidden_size)
         self.layernorm0 = LayerNorm(hidden_size)
         self.layernorm1 = LayerNorm(hidden_size)
         self.layernorm2 = LayerNorm(hidden_size)
         self.layernorm3 = LayerNorm(hidden_size)
+        self.layernorm4 = LayerNorm(hidden_size)
+
         
-        self.gcn_air = GCN(in_channels=hidden_size,
+        self.gcn1 = GCN(in_channels=hidden_size,
                         hidden_channels=hidden_size,
                         num_layers=psd_layers,
                         out_channels=hidden_size,
                         norm='LayerNorm',
                         add_self_loops=None,
                         act=activation)
-        self.gcn_cr = GCN(in_channels=hidden_size,
-                        hidden_channels=hidden_size,
-                        num_layers=psd_layers,
-                        out_channels=hidden_size,
-                        norm='LayerNorm',
-                        add_self_loops=None,
-                        act=activation)
-        # self.gcn_air = DiffConv(in_channels=hidden_size,
-        #                     out_channels=hidden_size,
-        #                     k=psd_layers,
-        #                     root_weight=None,
-        #                     activation=activation)
-        # self.gcn_cr = DiffConv(in_channels=hidden_size,
-        #                     out_channels=hidden_size,
-        #                     k=psd_layers,
-        #                     root_weight=None,
-        #                     activation=activation)
 
         self.gcn_tr = DiffConv(in_channels=hidden_size,
                             out_channels=hidden_size,
@@ -190,29 +167,36 @@ class GeodeCrossV13(BaseModel):
         #                     heads=att_heads,
         #                     edge_dim=1) for _ in range(gcn_layers))
 
-        # self.temp_air = TransformerLayer(input_size=hidden_size,
-        #                                  hidden_size=hidden_size,
-        #                                  ff_size=hidden_size,
-        #                                  n_heads=att_heads,
-        #                                  axis='time',
-        #                                  causal=False,
-        #                                  activation=activation,
-        #                                  dropout=dropout)
-        # self.temp_tra = TransformerLayer(input_size=hidden_size,
-        #                                  hidden_size=hidden_size,
-        #                                  ff_size=hidden_size,
-        #                                  n_heads=att_heads,
-        #                                  axis='time',
-        #                                  causal=False,
-        #                                  activation=activation,
-        #                                  dropout=dropout)
-        
+        self.temp_exog = TransformerLayer(input_size=hidden_size,
+                                         hidden_size=hidden_size,
+                                         ff_size=hidden_size,
+                                         n_heads=att_heads,
+                                         axis='time',
+                                         causal=False,
+                                         activation=activation,
+                                         dropout=dropout)
+        self.cross_tras = TransformerLayer(input_size=hidden_size,
+                                         hidden_size=hidden_size,
+                                         ff_size=hidden_size,
+                                         n_heads=att_heads,
+                                         axis='nodes',
+                                         causal=False,
+                                         activation=activation,
+                                         dropout=dropout)
         
         self.gcn2 = DiffConv(in_channels=hidden_size,
                             out_channels=hidden_size,
                             k=gcn_layers,
                             root_weight=True,
                             activation=activation)
+        
+        # self.cross_tras = SpatioTemporalTransformerLayer(input_size=hidden_size,
+        #                                                hidden_size=hidden_size,
+        #                                                ff_size=hidden_size,
+        #                                                n_heads=att_heads,
+        #                                                causal=False,
+        #                                                activation=activation,
+        #                                                dropout=dropout)
         
         # self.gcn2 = nn.ModuleList(
         #                 GATConv(in_channels=hidden_size,
@@ -257,17 +241,6 @@ class GeodeCrossV13(BaseModel):
 
             c_adj = full_adj[known_set, split:]
 
-        # Check if nodes arent connected to anything, 
-        # if so add self loops
-        zero_inds = torch.where((o_adj.sum(0) + o_adj.sum(1)) == 0)[0]
-        o_adj[zero_inds, zero_inds] = 1.
-
-        edge_index, edge_weight = dense_to_sparse(o_adj)
-        a_fwd = self.init_emb(x)
-
-        # ========================================
-        # Get cross module embeddings
-        # ========================================
         # Sample traffic nodes
         N_t = t_adj.shape[0]
         if self.tra_ratio < 1.0:
@@ -281,45 +254,18 @@ class GeodeCrossV13(BaseModel):
         t_adj_sam = t_adj_sam[:, tr_indx]
         x_exog = x_exog[:, :, tr_indx]
 
-        # Get traffic embeddings
-        traf_adj = dense_to_sparse(t_adj_sam)
-        t_fwd = self.init_emb_tr(x_exog)
+        # Check if nodes arent connected to anything, 
+        # if so add self loops
+        zero_inds = torch.where((o_adj.sum(0) + o_adj.sum(1)) == 0)[0]
+        o_adj[zero_inds, zero_inds] = 1.
 
-        # for layer in self.gcn_tr:
-        #     t_fwd_caus, _ = layer(t_fwd, traf_adj[0], traf_adj[1]) 
-        #     t_fwd_caus = self.activation(t_fwd_caus)
-        #     t_fwd = self.layernorm0(t_fwd_caus + t_fwd)
-
-        t_fwd_caus = self.gcn_tr(t_fwd, traf_adj[0], traf_adj[1]) + t_fwd
-        t_fwd = self.layernorm0(t_fwd_caus)
-
-        # Intiialise cross embeddings
-        cr_embs = torch.cat((a_fwd, t_fwd), dim=2)
-        c_adj = c_adj[:, tr_indx]
-
-        ar_adj = torch.zeros((o_adj.shape[0], o_adj.shape[0])).to(device)
-        cr_adj = torch.ones((tr_indx.shape[0], o_adj.shape[0])).to(device)
-        # cr_adj_z = torch.zeros((o_adj.shape[0], tr_indx.shape[0])).to(device)
-        tr_adj = torch.zeros((tr_indx.shape[0], tr_indx.shape[0])).to(device)
-        
-        rows = [
-            [ar_adj, cr_adj.T],
-            [cr_adj, tr_adj]
-        ]
-
-        cross_adj = torch.cat(
-            [torch.cat(row, dim=1) for row in rows],  # concat within each row (horizontally)
-            dim=0                                     # concat across rows (vertically)
-        )
+        edge_index, edge_weight = dense_to_sparse(o_adj)
+        a_fwd = self.init_emb(x)
 
         # ========================================
         # Calculating spatiotemporal attention for both embeddings
         # ========================================
-        a_fwd = self.layernorm00(self.full_tras(a_fwd, o_adj) + a_fwd)
-        cr_embs = self.layernorm01(self.full_tras(cr_embs, cross_adj) + cr_embs)
-
-        output_air = a_fwd
-        output_cro = cr_embs
+        output_air = self.full_tras(a_fwd, o_adj)
         # output_cro = cr_embs[:, :, :a_fwd.shape[2]]
 
         # ========================================
@@ -332,7 +278,8 @@ class GeodeCrossV13(BaseModel):
             o_adj = o_adj[:, arrange]
 
             c_adj = full_adj[arrange, split:]
-            c_adj = torch.ones_like(c_adj[:, tr_indx]).to(device)
+            c_adj = c_adj[:, tr_indx]
+            # c_adj = torch.ones_like(c_adj[:, tr_indx]).to(device)
 
         if training:
             # inductive
@@ -360,7 +307,8 @@ class GeodeCrossV13(BaseModel):
             n_adj = n_adj[:, arrange]
 
             c_adj = full_adj[arrange, split:]
-            c_adj = torch.ones_like(c_adj[:, tr_indx]).to(device)
+            c_adj = c_adj[:, tr_indx]
+            # c_adj = torch.ones_like(c_adj[:, tr_indx]).to(device)
             
             numpy_graph = nx.from_numpy_array(n_adj.cpu().numpy())
             target_nodes = list(range(n_adj.shape[0]))[:len(known_set)]
@@ -379,16 +327,14 @@ class GeodeCrossV13(BaseModel):
             sub_entry = torch.zeros(b, t, add_nodes, d).to(device)
 
             xh_air = torch.cat([output_air, sub_entry], dim=2)  # b t n2 d
-            xh_cro = torch.cat([output_cro[:, :, :og_n], sub_entry, output_cro[:, :, og_n:]], dim=2)
         else:
             xh_air = output_air
-            xh_cro = output_cro
 
         # ========================================
         # Curriculum based pseudo-labelling
         # ========================================
 
-        # Get the paritions of each index
+        # Get the partitions of each index
         threshold = self.k
         grouped = {label: [] for label in list(range(self.k+1))}
         for key, value in level_hops.items():
@@ -404,53 +350,88 @@ class GeodeCrossV13(BaseModel):
         gcn_adj = dense_to_sparse(adj.to(torch.float32))
         
         xh_air_2 = torch.zeros_like(xh_air).to(device=device)
-        xh_cro_2 = torch.zeros_like(xh_cro).to(device=device)
 
         cur_indices_tensor = torch.tensor(grouped[0], dtype=torch.long, device=device)
         cur_ind_exp = cur_indices_tensor[None, None, :, None].expand(b, t, -1, xh_air.size(-1))
         xh_air_2 = xh_air_2.scatter(2, cur_ind_exp, xh_air[:, :, grouped[0], :])
 
-        cro_inds = grouped[0] + list(range(xh_air_2.shape[2], xh_cro_2.shape[2]))
-        cur_indices_tensor = torch.tensor(cro_inds, dtype=torch.long, device=device)
-        cur_ind_exp = cur_indices_tensor[None, None, :, None].expand(b, t, -1, xh_air.size(-1))
-        xh_cro_2 = xh_cro_2.scatter(2, cur_ind_exp, xh_cro[:, :, cro_inds, :])
-
         # test1 = xh_cro.sum(dim=(0, 1, 3))
         # test = xh_cro_2.sum(dim=(0, 1, 3))
 
-        for kh in range(self.k, self.k+1):
+        # Pseudoencoding for main embeddings 
+        for kh in range(1, self.k+1):
+            # Pass if there are no k-hop reach nodes
+            if grouped[kh] == []:
+                continue
+
             # Organise the khop nodes 
             # Get the indices of vertices within k-hop reach
             rep_indices = []
-            cur_indices = []
+            cur_indices = grouped[kh]
             for i in range(kh+1):
                 rep_indices += grouped[i]
-            for i in range(1, kh+1):
-                cur_indices += grouped[i]
 
-            rep_air = xh_air_2
-            rep_cro = xh_cro_2
+            alt_adj = adj.clone()
 
-            air_adj = dense_to_sparse(adj.to(torch.float32))
-            cro_adj, _ = dense_to_sparse(c_adj.T.to(torch.float32))
-            cro_adj[0] += c_adj.shape[0]
+            if kh < self.k:
+                rep_adj = alt_adj[:, rep_indices]
+                rep_adj = rep_adj[rep_indices, :]
 
-            xh_air_0 = self.gcn_air(rep_air, air_adj[0], air_adj[1])
+                rep_air = xh_air_2[:, :, rep_indices, :]
+            else:
+                rep_adj = alt_adj
+                rep_air = xh_air_2
+
+            air_adj = dense_to_sparse(rep_adj.to(torch.float32))
+
+            xh_air_0 = self.gcn1(rep_air, air_adj[0], air_adj[1])
             xh_air_1 = self.layernorm1(xh_air_0)
-
-            xh_cro_0 = self.gcn_cr(rep_cro, cro_adj)
-            xh_cro_1 = self.layernorm1(xh_cro_0)
 
             cur_indices_tensor = torch.tensor(cur_indices, dtype=torch.long, device=device)
             cur_ind_exp = cur_indices_tensor[None, None, :, None].expand(b, t, -1, xh_air_1.size(-1))
 
             xh_air_2 = xh_air_2.scatter(2, cur_ind_exp, xh_air_1[:, :, -len(cur_indices):, :])
-            xh_cro_2 = xh_cro_2.scatter(2, cur_ind_exp, xh_cro_1[:, :, len(grouped[0]):len(grouped[0])+len(cur_indices), :])
-
         # test2 = xh_cro_2.sum(dim = (0, 1, 3))
         # index_diff = (test2.flatten() != test1.flatten()).nonzero().flatten()
 
-        xh_cro_2 = xh_cro_2[:, :, :xh_air_2.shape[2]]
+        # ========================================
+        # Get cross module embeddings
+        # ========================================
+        # Get traffic embeddings
+        traf_adj = dense_to_sparse(t_adj_sam)
+        t_fwd = self.init_emb_tr(x_exog)
+        t_fwd = self.temp_exog(t_fwd)
+
+        # for layer in self.gcn_tr:
+        #     t_fwd_caus, _ = layer(t_fwd, traf_adj[0], traf_adj[1]) 
+        #     t_fwd_caus = self.activation(t_fwd_caus)
+        #     t_fwd = self.layernorm0(t_fwd_caus + t_fwd)
+
+        t_fwd_caus = self.gcn_tr(t_fwd, traf_adj[0], traf_adj[1]) + t_fwd
+        t_fwd = self.layernorm0(t_fwd_caus)
+
+        # Intiialise cross embeddings
+        cr_embs = torch.cat((xh_air_2, t_fwd), dim=2)
+        # c_adj = c_adj[:, tr_indx]
+
+        ar_adj = torch.zeros((adj.shape[0], adj.shape[0])).to(device)
+        # cr_adj = (c_adj > self.adj_thres).to(dtype=int)
+        cr_adj = torch.ones((t_adj_sam.shape[0], adj.shape[0])).to(device)
+        tr_adj = torch.zeros((t_adj_sam.shape[0], t_adj_sam.shape[0])).to(device)
+        
+        rows = [
+            [ar_adj, cr_adj.T],
+            [cr_adj, tr_adj]
+        ]
+
+        cross_adj = torch.cat(
+            [torch.cat(row, dim=1) for row in rows],  # concat within each row (horizontally)
+            dim=0                                     # concat across rows (vertically)
+        )
+
+        xh_cro_2 = self.cross_tras(cr_embs, cross_adj)
+        xh_air_3 = self.layernorm3(xh_cro_2[:, :, :xh_air_2.shape[2]] + xh_air_2)
+
         # ========================================
         # Final Message Passing
         # ========================================
@@ -463,14 +444,8 @@ class GeodeCrossV13(BaseModel):
         #     xh_cro_2_tmp = self.activation(xh_cro_2_tmp)
         #     xh_cro_2 = self.layernorm3(xh_cro_2_tmp + xh_cro_2)
 
-        xh_air_2 = self.gcn2(xh_air_2, gcn_adj[0], gcn_adj[1]) + xh_air_2
-        xh_air_2 = self.layernorm3(xh_air_2)
-
-        xh_cro_2 = self.gcn2(xh_cro_2, gcn_adj[0], gcn_adj[1]) + xh_cro_2
-        xh_cro_2 = self.layernorm3(xh_cro_2)
-
-        xh_air_3 = xh_air_2
-        xh_cro_3 = xh_cro_2
+        xh_air_3 = self.gcn2(xh_air_3, gcn_adj[0], gcn_adj[1]) + xh_air_3
+        xh_air_3 = self.layernorm4(xh_air_3)
 
         finpreds = self.readout1(xh_air_3)
 
@@ -480,34 +455,46 @@ class GeodeCrossV13(BaseModel):
         N_a = xh_air_3.shape[2]
         if self.cmd_ratio < 1.0:
             n_air = int(N_a*self.cmd_ratio)
-            ar_indx = torch.multinomial(torch.ones(N_a), n_air, replacement=False).to(device)
+            ar_indx = torch.multinomial(torch.ones(N_a), n_air, replacement=False)
+            ar_indx = set(ar_indx.tolist())
         else:
-            ar_indx = torch.arange(N_a).to(device)
+            ar_indx = set(list(range(N_a)))
             n_air = N_a
+
+        finrecos = []
         
         det_mask = torch.zeros_like(xh_air_3).to(dtype=bool, device=device)
         det_mask[:, :, :len(known_set)] = 1
         xh_air_3 = torch.where(det_mask, xh_air_3.detach(), xh_air_3) 
 
-        air_nodes = xh_air_3[:, :, ar_indx]
-        air_nodes = rearrange(air_nodes, 'b t n d -> t b n d')
+        for i in range(1, self.k+1):
+            prev_group = []
+            cur_group = []
 
-        cro_nodes = xh_cro_3[:, :, ar_indx]
-        cro_nodes = rearrange(cro_nodes, 'b t n d -> t b n d')
+            for j in range(i):
+                prev_group.extend(grouped[j])
+            for j in range(i+1):
+                cur_group.extend(grouped[j])
 
-        # temp_mask = samp_mask.clone()
-        # temp_mask[samp_mask == 0] = 1.
-        # sim_mat = sim_mat * temp_mask
+            prev_group = list(set(prev_group) & ar_indx)
+            cur_group = list(set(cur_group) & ar_indx)
+            
+            emb_com_inv = xh_air_3[:, :, prev_group]
+            emb_tru_inv = xh_air_3[:, :, cur_group]
 
-        finsim = [air_nodes, cro_nodes]
+            emb_com_inv = rearrange(emb_com_inv, 'b t n d -> t b n d')
+            emb_tru_inv = rearrange(emb_tru_inv, 'b t n d -> t b n d')
 
-        fincross = self.readout1(xh_cro_3)
+            if emb_tru_inv.numel() == 0 or emb_com_inv.numel() == 0:
+                continue
+            else:
+                finrecos.append([emb_com_inv, emb_tru_inv])
 
         if not training:
-            return finpreds, fincross
+            return finpreds
         else:
-            return finpreds, fincross, finsim
-
+            return finpreds, finrecos
+        
     def get_new_adj(self, adj, k, n_add, cross_adj, scale=1.0, init_hops={}):
         current_adj = adj.clone()
         current_c_adj = cross_adj.clone()
@@ -575,23 +562,20 @@ class GeodeCrossV13(BaseModel):
             print('error')
         
         # Create the new cross adjacency matrix using weighted average
-        # for _ in range(n_add):
-        #     n, _ = current_c_adj.shape
+        for _ in range(n_add):
+            n, _ = current_c_adj.shape
 
-        #     # Initialize new cross matrix
-        #     c_expanded = torch.zeros(size=(n + 1, t_nodes)).to(device=adj.device)
-        #     c_expanded[:n, :] = current_c_adj
+            # Initialize new cross matrix
+            c_expanded = torch.zeros(size=(n + 1, t_nodes)).to(device=adj.device)
+            c_expanded[:n, :] = current_c_adj
 
-        #     # Take weighted average of the distances 
-        #     # distances = adj_aug_n1[n, :n].unsqueeze(1)
-        #     # new_entry = distances * current_c_adj
-        #     # new_entry = new_entry.sum(0) / distances.sum()
+            # Take weighted average of the distances 
+            distances = adj_aug_n1[n, :n].unsqueeze(1)
+            new_entry = distances * current_c_adj
+            new_entry = new_entry.sum(0) / distances.sum()
 
-        #     new_entry = torch.ones(t_nodes).to(device=adj.device)
-        #     c_expanded[-1, :] = new_entry
+            c_expanded[-1, :] = new_entry
 
-        #     current_c_adj = c_expanded
-        
-        new_c_adj = torch.ones((adj_aug_n1.shape[0], t_nodes)).to(device=adj.device)
+            current_c_adj = c_expanded
 
-        return adj_aug_n1, levels, new_c_adj
+        return adj_aug_n1, levels, current_c_adj

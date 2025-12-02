@@ -507,9 +507,9 @@ class GeodeCrossFillerV8(Filler):
 
         if self.y2 != 0:
             cmds = torch.tensor([]).to(x.device)
-            for node in range(finsim[0].shape[0]):
-                    inv_emb_air = rearrange(finsim[0][node], 'b t d -> (b t) d')
-                    inv_emb_cro = rearrange(finsim[1][node], 'b t d -> (b t) d')
+            for i in range(finsim[0].shape[0]):
+                    inv_emb_air = rearrange(finsim[0][i], 'b t d -> (b t) d')
+                    inv_emb_cro = rearrange(finsim[1][i], 'b t d -> (b t) d')
 
                     og_air = inv_emb_air.size(0) // (b)
                     og_cro = inv_emb_cro.size(0) // (b)

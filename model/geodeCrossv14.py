@@ -13,6 +13,7 @@ from torch_geometric.nn.models import GCN
 from tsl.nn.blocks.encoders.mlp import MLP
 from tsl.nn.layers.graph_convs import DiffConv, GATConv
 from tsl.nn import utils
+from tsl.nn.blocks.encoders import TransformerLayer
 from tsl.nn.layers.base import MultiHeadAttention
 from tsl.nn.models.base_model import BaseModel
 from utils import closest_distances_unweighted
@@ -144,7 +145,14 @@ class GeodeCrossV14(BaseModel):
         self.layernorm2 = LayerNorm(hidden_size)
         self.layernorm3 = LayerNorm(hidden_size)
         
-        self.gcn1 = GCN(in_channels=hidden_size,
+        self.gcn_air = GCN(in_channels=hidden_size,
+                        hidden_channels=hidden_size,
+                        num_layers=psd_layers,
+                        out_channels=hidden_size,
+                        norm='LayerNorm',
+                        add_self_loops=None,
+                        act=activation)
+        self.gcn_cr = GCN(in_channels=hidden_size,
                         hidden_channels=hidden_size,
                         num_layers=psd_layers,
                         out_channels=hidden_size,
@@ -164,7 +172,7 @@ class GeodeCrossV14(BaseModel):
         #                     heads=att_heads,
         #                     edge_dim=1) for _ in range(gcn_layers))
 
-        # self.temp_air = TransformerLayer(input_size=hidden_size,
+        # self.temp_exog = TransformerLayer(input_size=hidden_size,
         #                                  hidden_size=hidden_size,
         #                                  ff_size=hidden_size,
         #                                  n_heads=att_heads,
@@ -172,21 +180,28 @@ class GeodeCrossV14(BaseModel):
         #                                  causal=False,
         #                                  activation=activation,
         #                                  dropout=dropout)
-        # self.temp_tra = TransformerLayer(input_size=hidden_size,
+        # self.cross_tras = TransformerLayer(input_size=hidden_size,
         #                                  hidden_size=hidden_size,
         #                                  ff_size=hidden_size,
         #                                  n_heads=att_heads,
-        #                                  axis='time',
+        #                                  axis='nodes',
         #                                  causal=False,
         #                                  activation=activation,
         #                                  dropout=dropout)
-        
         
         self.gcn2 = DiffConv(in_channels=hidden_size,
                             out_channels=hidden_size,
                             k=gcn_layers,
                             root_weight=True,
                             activation=activation)
+        
+        # self.cross_tras = SpatioTemporalTransformerLayer(input_size=hidden_size,
+        #                                                hidden_size=hidden_size,
+        #                                                ff_size=hidden_size,
+        #                                                n_heads=att_heads,
+        #                                                causal=False,
+        #                                                activation=activation,
+        #                                                dropout=dropout)
         
         # self.gcn2 = nn.ModuleList(
         #                 GATConv(in_channels=hidden_size,
@@ -362,7 +377,7 @@ class GeodeCrossV14(BaseModel):
         # Curriculum based pseudo-labelling
         # ========================================
 
-        # Get the paritions of each index
+        # Get the partitions of each index
         threshold = self.k
         grouped = {label: [] for label in list(range(self.k+1))}
         for key, value in level_hops.items():
@@ -419,7 +434,7 @@ class GeodeCrossV14(BaseModel):
 
             air_adj = dense_to_sparse(rep_adj.to(torch.float32))
 
-            xh_air_0 = self.gcn1(rep_air, air_adj[0], air_adj[1])
+            xh_air_0 = self.gcn_air(rep_air, air_adj[0], air_adj[1])
             xh_air_1 = self.layernorm1(xh_air_0)
 
             cur_indices_tensor = torch.tensor(cur_indices, dtype=torch.long, device=device)
@@ -435,7 +450,7 @@ class GeodeCrossV14(BaseModel):
         cro_adj, _ = dense_to_sparse(c_adj.T.to(torch.float32))
         cro_adj[0] += c_adj.shape[0]     
 
-        xh_cro_0 = self.gcn1(rep_cro, cro_adj)
+        xh_cro_0 = self.gcn_cr(rep_cro, cro_adj)
         xh_cro_1 = self.layernorm1(xh_cro_0)
 
         cur_indices_tensor = torch.tensor(cur_indices, dtype=torch.long, device=device)

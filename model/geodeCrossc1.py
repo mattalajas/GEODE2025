@@ -11,121 +11,80 @@ from torch.nn import LayerNorm
 from torch_geometric.utils import dense_to_sparse, softmax, scatter
 from torch_geometric.nn.models import GCN
 from tsl.nn.blocks.encoders.mlp import MLP
-from tsl.nn.blocks.encoders import TransformerLayer, SpatioTemporalTransformerLayer
-from tsl.nn.layers.graph_convs import DiffConv
+from tsl.nn.layers.graph_convs import DiffConv, GATConv
+from tsl.nn import utils
+from tsl.nn.blocks.encoders import TransformerLayer
+from tsl.nn.layers.base import MultiHeadAttention
 from tsl.nn.models.base_model import BaseModel
 from utils import closest_distances_unweighted
 
 EPSILON = 1e-8
 
-class RelTemporalEncoding(nn.Module):
-    '''
-        Implement the Temporal Encoding (Sinusoid) function.
-    '''
+class SpatioTemporalTransformerLayer(nn.Module):
+    r"""A :class:`~tsl.nn.blocks.encoders.TransformerLayer` which attend both
+    the spatial and temporal dimensions by stacking two
+    :class:`~tsl.nn.layers.base.MultiHeadAttention` layers.
 
-    def __init__(self, n_hid, max_len=50):  # original max_len=240
-        super(RelTemporalEncoding, self).__init__()
-        position = torch.arange(0., max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, n_hid, 2) *
-                             -(math.log(10000.0) / n_hid))
-        emb = nn.Embedding(max_len, n_hid)
-        emb.weight.data[:, 0::2] = torch.sin(position * div_term) / math.sqrt(n_hid)
-        emb.weight.data[:, 1::2] = torch.cos(position * div_term) / math.sqrt(n_hid)
-        emb.requires_grad = False
-        self.emb = emb
-        self.lin = nn.Linear(n_hid, n_hid)
+    Args:
+        input_size (int): Input size.
+        hidden_size (int): Dimension of the learned representations.
+        ff_size (int): Units in the MLP after self attention.
+        n_heads (int, optional): Number of parallel attention heads.
+        causal (bool, optional): If :obj:`True`, then causally mask attention
+            scores in temporal attention.
+            (default: :obj:`True`)
+        activation (str, optional): Activation function.
+        dropout (float, optional): Dropout probability.
+    """
 
-    def forward(self, x, t):
-        texp = t[:, None].expand(-1, x.shape[1])
-        temb = self.lin(self.emb(texp))
-        return x + temb
-    
-class GeodeNBCD(nn.Module):
     def __init__(self,
+                 input_size,
                  hidden_size,
-                 att_window,
-                 att_heads,
-                 activation='tanh'):
-        super(GeodeNBCD, self).__init__()
-        self.time_emb = RelTemporalEncoding(hidden_size)
+                 ff_size=None,
+                 n_heads=1,
+                 causal=True,
+                 activation='elu',
+                 dropout=0.):
+        super(SpatioTemporalTransformerLayer, self).__init__()
+        self.temporal_att = MultiHeadAttention(embed_dim=hidden_size,
+                                               qdim=input_size,
+                                               kdim=input_size,
+                                               vdim=input_size,
+                                               heads=n_heads,
+                                               axis='time',
+                                               causal=causal)
 
-        self.key = MLP(input_size=hidden_size,
-                        hidden_size=hidden_size,
-                        output_size=hidden_size,
-                        activation=activation)
-        self.query = MLP(input_size=hidden_size,
-                        hidden_size=hidden_size,
-                        output_size=hidden_size,
-                        activation=activation)
-        self.value = MLP(input_size=hidden_size,
-                        hidden_size=hidden_size,
-                        output_size=hidden_size,
-                        activation=activation)
-        self.out_proj = MLP(input_size=hidden_size,
-                            hidden_size=hidden_size,
-                            output_size=hidden_size,
-                            activation=activation)
+        self.spatial_att = MultiHeadAttention(embed_dim=hidden_size,
+                                              qdim=hidden_size,
+                                              kdim=hidden_size,
+                                              vdim=hidden_size,
+                                              heads=n_heads,
+                                              axis='nodes',
+                                              causal=False)
 
-        self.layernorm = LayerNorm(hidden_size)
-        self.att_window = att_window
-        self.att_heads = att_heads
-    
-    def forward(self, x_fwd, edge_index):
-        device = x_fwd.device
-        srcs = edge_index[0]
-        tars = edge_index[1]
+        self.skip_conn = nn.Linear(input_size, hidden_size)
 
-        tar_nodes = x_fwd[:, :, tars]
-        src_nodes = x_fwd[:, :, srcs]
+        self.norm1 = LayerNorm(input_size)
+        self.norm2 = LayerNorm(hidden_size)
 
-        B, T, N, D = x_fwd.shape
-        assert T >= 2 * self.att_window + 1
-        assert D % self.att_heads == 0
-        
-        d_k = D // self.att_heads
+        self.mlp = nn.Sequential(LayerNorm(hidden_size),
+                                 nn.Linear(hidden_size, ff_size),
+                                 utils.get_layer_activation(activation)(),
+                                 nn.Dropout(dropout),
+                                 nn.Linear(ff_size, hidden_size),
+                                 nn.Dropout(dropout))
 
-        # Time encoding
-        tar_nodes = rearrange(tar_nodes, 'b t e d -> t (b e) d')
-        tar_nodes = self.time_emb(tar_nodes, torch.LongTensor(list(range(T))).to(device))
-        tar_fwd = rearrange(tar_nodes, 't (b e) d -> t b e d', b=B, e=len(tars))
+        self.dropout = nn.Dropout(dropout)
 
-        src_nodes = rearrange(src_nodes, 'b t e d -> t (b e) d')
-        src_nodes = self.time_emb(src_nodes, torch.LongTensor(list(range(T))).to(device))
-        src_fwd = rearrange(src_nodes, 't (b e) d -> t b e d', b=B, e=len(srcs))
-
-        # Get the Q, K, V
-        q_mat = self.query(tar_fwd).view(T, B, len(tars), self.att_heads, d_k)
-        k_mat = self.key(src_fwd).view(T, B, len(tars), self.att_heads, d_k) 
-        v_mat = self.value(src_fwd).view(T, B, len(tars), self.att_heads, d_k)
-
-        # Message and attention scores
-        res_atts = (q_mat * k_mat).sum(dim=-1) / math.sqrt(d_k)
-        res_msgs = v_mat
-
-        padded_att = F.pad(res_atts, (0, 0, 0, 0, 0, 0, self.att_window, self.att_window))
-        padded_msg = F.pad(res_msgs, (0, 0, 0, 0, 0, 0, 0, 0, self.att_window, self.att_window))
-        
-        context_att = []
-        context_msg = []
-        for offset in range(-self.att_window, self.att_window + 1):
-            context_att.append(padded_att[self.att_window + offset : self.att_window + offset + T])  # [T, B, E, D]
-            context_msg.append(padded_msg[self.att_window + offset : self.att_window + offset + T])  # [T, B, E, D]
-
-        # [T, B, N*(att_window*2 + 1), D]
-        res_att_og = torch.cat(context_att, dim=2)
-        res_msg = torch.cat(context_msg, dim=2)
-
-        ei_tar = tars.repeat(self.att_window*2 + 1)
-
-        res_att = softmax(res_att_og, ei_tar, dim=2)
-        res = res_msg * res_att.unsqueeze(-1)   
-        res = res.view(T, B, -1, D)
-
-        causal_hat = scatter(res, ei_tar, dim=2, dim_size=N, reduce='add')  # [N,F]
-        causal_hat = rearrange(causal_hat, 't b n d -> b t n d')
-
-        output_invars = self.layernorm(self.out_proj(causal_hat)+x_fwd)
-        return output_invars
+    def forward(self, x, mask = None):
+        """"""
+        # x: [batch, steps, nodes, features]
+        x = self.skip_conn(x) + self.dropout(
+            self.temporal_att(self.norm1(x))[0])
+        x = x + self.dropout(
+            self.spatial_att(self.norm2(x), attn_mask=mask)[0])
+        x = x + self.mlp(x)
+        return x
 
 class GeodeCrossC1(BaseModel):
     def __init__(self,
@@ -280,7 +239,7 @@ class GeodeCrossC1(BaseModel):
 
         edge_index, _ = dense_to_sparse(o_adj)
         x_fwd = self.init_emb(x)
-        output_invars = self.air_trans(x_fwd, (edge_index > 0).to(torch.long))
+        output_invars = self.air_trans(x_fwd, o_adj)
 
         # ========================================
         # Create new adjacency matrix 

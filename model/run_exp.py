@@ -19,6 +19,7 @@ from geodeCrossv12 import GeodeCrossV12
 from geodeCrossv13 import GeodeCrossV13
 from geodeCrossv14 import GeodeCrossV14
 from geodeCrossc1 import GeodeCrossC1
+from geodeCrossc2 import GeodeCrossC2
 from geodeCross_filler import GeodeCrossFiller
 from geodeCross_fillerV4 import GeodeCrossFillerV4
 from geodeCross_fillerV5 import GeodeCrossFillerV5
@@ -36,7 +37,7 @@ from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
 from tsl import logger
 from tsl.data import ImputationDataset
 from tsl.data.preprocessing import StandardScaler
-from tsl.datasets import AirQuality, MetrLA, PeMS04, PeMS07, PvUS
+from tsl.datasets import AirQuality, MetrLA, PeMS04, PeMS07, PvUS, GPVARDatasetAZ
 from tsl.experiment import Experiment
 from tsl.metrics import numpy as numpy_metrics
 from tsl.metrics import torch as torch_metrics
@@ -44,7 +45,7 @@ from tsl.transforms import MaskInput
 from tsl.utils.casting import torch_to_numpy
 from utils import (AirCross, AirQualityAuckland, CrossSpatioTemporalDataset,
                    LargeST, StandardScalerSplit, SpatioTemporalDataModule,
-                   add_missing_sensors, add_missing_sensors_cross, test_wise_eval)
+                   CrossGPVARDataset, add_missing_sensors, add_missing_sensors_cross, test_wise_eval)
 
 
 def get_model_class(model_str):
@@ -82,6 +83,8 @@ def get_model_class(model_str):
         model = GeodeCrossV14
     elif model_str == 'geodeCrossC1':
         model = GeodeCrossC1
+    elif model_str == 'geodeCrossC2':
+        model = GeodeCrossC2
     elif model_str == 'kits':
         model = KITS
     else:
@@ -91,7 +94,7 @@ def get_model_class(model_str):
 def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, connectivity=None, 
                 spatial_shift=False, order=0, node_features='CC', t_range = ['2022-04-01', '2022-12-01'], 
                 agg_func = 'mean', test_months=[5], location='Auckland', 
-                years = [], include_exog=False, exog='traffic'):
+                years = [], include_exog=False, exog='traffic', synth_params=None):
     
     if dataset_name == 'air_auckland' or dataset_name == 'air_invercargill1' or dataset_name == 'air_invercargill2':
         air_data = AirQualityAuckland('data', t_range=t_range, masked_sensors=masked_s, 
@@ -223,6 +226,28 @@ def get_dataset(dataset_name: str, p_fault=0., p_noise=0., masked_s=None, connec
                                   spatial_shift=spatial_shift,
                                   order=order,
                                   node_features=node_features)
+    if dataset_name == 'synthetic':
+        return add_missing_sensors(GPVARDatasetAZ(),
+                                  p_fault=p_fault,
+                                  p_noise=p_noise,
+                                  min_seq=12,
+                                  max_seq=12 * 4,
+                                  masked_sensors=masked_s,
+                                  connect=connectivity,
+                                  spatial_shift=spatial_shift,
+                                  order=order,
+                                  node_features=node_features)
+    if dataset_name == 'syntheticCross':
+        return add_missing_sensors_cross(CrossGPVARDataset(include_exog=include_exog, **synth_params),
+                                  p_fault=p_fault,
+                                  p_noise=p_noise,
+                                  min_seq=12,
+                                  max_seq=12 * 4,
+                                  masked_sensors=masked_s,
+                                  connect=connectivity,
+                                  spatial_shift=spatial_shift,
+                                  order=order,
+                                  node_features=node_features)
     if dataset_name == 'aircross':
         return add_missing_sensors_cross(AirCross(root='data/AirCrossSF', test_months=test_months,
                                                   years=years, include_exog=include_exog, exog=exog),
@@ -299,7 +324,8 @@ def run_imputation(cfg: DictConfig):
                             test_months=cfg.dataset.get('test_months', (3, 6, 9, 12)),
                             years=cfg.dataset.get('years', []),
                             include_exog=cfg.dataset.get('include_exog', False),
-                            exog=cfg.dataset.get('exog', 'traffic'))
+                            exog=cfg.dataset.get('exog', 'traffic'),
+                            synth_params=cfg.dataset.get('synth_params', None))
 
     print(f'Masked sensors: {masked_sensors}')
 
@@ -365,6 +391,8 @@ def run_imputation(cfg: DictConfig):
         or cfg.model.name == 'geodeCrossC1' or cfg.model.name == 'geodeCrossV13' \
         or cfg.model.name == 'geodeCrossV14':
         model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
+    elif cfg.model.name == 'geodeCrossC2':
+        model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window, threshold=cfg.dataset.connectivity.threshold)
 
     model_cls.filter_model_args_(model_kwargs)
     loss_fn = torch_metrics.MaskedMAE()
@@ -501,7 +529,7 @@ def run_imputation(cfg: DictConfig):
                             gradient_clip_algorithm=cfg.grad_clip_alg,
                             known_set = [i for i in range(dataset.air_max_nodes) if i not in masked_sensors],
                             **cfg.model.regs)
-    elif cfg.model.name =='geodeCrossC1':
+    elif cfg.model.name =='geodeCrossC1' or cfg.model.name =='geodeCrossC2':
         imputer = GeodeCrossFillerC1(model_class=model_cls,
                             model_kwargs=model_kwargs,
                             optim_class=getattr(torch.optim, cfg.optimizer.name),
