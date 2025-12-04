@@ -16,13 +16,16 @@ if __name__ == '__main__':
     node_features = res.pop('node_f')
     base_dir = os.path.join("res")
 
-    if shift:
-        filename = f"{res['model']}-trainwise-{node_features}.csv"
-    else:
-        if eval_setting == 'train_wise':
-            filename = f"{res['model']}-trainwise-RND.csv"
+    if eval_setting == 'train_wise':
+        if shift:
+            filename = f"{res['model']}-trainwise-{node_features}.csv"
         else:
-            filename = f"{res['model']}-testwise.csv"
+            filename = f"{res['model']}-trainwise-RND.csv"
+    else:
+        if shift:
+            filename = f"{res['model']}-testwise-{node_features}.csv"
+        else:
+            filename = f"{res['model']}-testwise-RND.csv"
     csv_path = os.path.join(base_dir, filename)
     file_exists = os.path.exists(csv_path)
 
