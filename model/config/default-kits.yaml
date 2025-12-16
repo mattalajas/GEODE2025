@@ -2,17 +2,20 @@ defaults:
   - _self_
   - logger: null
   - dataset: metrla
-  - model: geode
+  - model: kits
 
 #### Experiment params ########################################################
 hydra:
   run:
-    dir: logs/${dataset.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    # dir: logs/kits/air/2025-05-03/12-20-42
+    dir: logs/${model.name}/${dataset.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
   sweep:
     dir: logs/${now:%Y-%m-%d-%H-%M-%S}
-    subdir: ${dataset.name}/${hydra.job.num}
+    subdir: ${model.name}/${dataset.name}/${hydra.job.num}
 
+# seed: 420  # automatically set everywhere the seed
 tags:
+  - ${model.name}
   - ${dataset.name}
 
 # Replace with the last ckpt file to resume training
@@ -34,14 +37,23 @@ grad_clip_val: 1
 grad_clip_alg: 'norm'
 scaler: 'StandardScaler'
 scale_target: True
-device: [2]
+whiten_prob: 0.05
+prediction_loss_weight: 1
+impute_only_missing: False
+warm_up_steps: 0
+device: [1]
 eval_setting: 'train_wise'
 num_groups: 4
+
+detrend: False
+scale: True
+scaling_axis: 'global'  # ['channels', 'global']
+
 
 optimizer:
   name: Adam
   hparams:
-    lr: 0.0001
+    lr: 0.0002
     weight_decay: 0.
 
 lr_scheduler:

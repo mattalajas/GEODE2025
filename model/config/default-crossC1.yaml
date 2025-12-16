@@ -2,7 +2,7 @@ defaults:
   - _self_
   - logger: null
   - dataset: metrla
-  - model: geode
+  - model: geodeCrossC1
 
 #### Experiment params ########################################################
 hydra:
@@ -32,7 +32,7 @@ patience: 50
 batch_size: 64
 grad_clip_val: 1
 grad_clip_alg: 'norm'
-scaler: 'StandardScaler'
+scaler: 'StandardScalerSplit'
 scale_target: True
 device: [2]
 eval_setting: 'train_wise'

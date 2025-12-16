@@ -2,7 +2,7 @@ defaults:
   - _self_
   - logger: null
   - dataset: metrla
-  - model: geode
+  - model: geodeNAall
 
 #### Experiment params ########################################################
 hydra:

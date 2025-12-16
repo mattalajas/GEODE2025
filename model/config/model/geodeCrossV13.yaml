@@ -1,0 +1,15 @@
+name: geodeCrossV13
+hparams:
+  hidden_size: 64
+  gcn_layers: 1
+  psd_layers: 1
+  cro_layers: 2
+  intervention_steps: 5
+  cmd_sample_ratio: 1
+  tra_sample_ratio: 1
+  att_window: 1
+  dropout: 0.1
+  k: 3
+regs:
+  y1: 0.1 # Cross Loss
+  y2: 0.05 # Contastive Loss

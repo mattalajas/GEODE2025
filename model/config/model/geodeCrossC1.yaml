@@ -1,13 +1,13 @@
-name: geode
+name: geodeCrossC1
 hparams:
   hidden_size: 64
   gcn_layers: 1
   psd_layers: 1
   intervention_steps: 5
-  cmd_sample_ratio: 0.8
+  cmd_sample_ratio: 1
   att_window: 1
   nbcd_layers: 1
   k: 3
 regs:
-  y1: 1 # IRM Loss
-  y2: 0.2 # CMD Loss
+  y1: 0.8 # IRM Loss
+  y2: 0.01 # CMD Loss

@@ -17,125 +17,7 @@ from utils import closest_distances_unweighted
 
 EPSILON = 1e-8
 
-class RelTemporalEncoding(nn.Module):
-    '''
-        Implement the Temporal Encoding (Sinusoid) function.
-    '''
-
-    def __init__(self, n_hid, max_len=50):  # original max_len=240
-        super(RelTemporalEncoding, self).__init__()
-        position = torch.arange(0., max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, n_hid, 2) *
-                             -(math.log(10000.0) / n_hid))
-        emb = nn.Embedding(max_len, n_hid)
-        emb.weight.data[:, 0::2] = torch.sin(position * div_term) / math.sqrt(n_hid)
-        emb.weight.data[:, 1::2] = torch.cos(position * div_term) / math.sqrt(n_hid)
-        emb.requires_grad = False
-        self.emb = emb
-        self.lin = nn.Linear(n_hid, n_hid)
-
-    def forward(self, x, t):
-        texp = t[:, None].expand(-1, x.shape[1])
-        temb = self.lin(self.emb(texp))
-        return x + temb
-    
-class GeodeNBCD(nn.Module):
-    def __init__(self,
-                 hidden_size,
-                 att_window,
-                 att_heads,
-                 activation='tanh'):
-        super(GeodeNBCD, self).__init__()
-        self.time_emb = RelTemporalEncoding(hidden_size)
-
-        self.key = MLP(input_size=hidden_size,
-                        hidden_size=hidden_size,
-                        output_size=hidden_size,
-                        activation=activation)
-        self.query = MLP(input_size=hidden_size,
-                        hidden_size=hidden_size,
-                        output_size=hidden_size,
-                        activation=activation)
-        self.value = MLP(input_size=hidden_size,
-                        hidden_size=hidden_size,
-                        output_size=hidden_size,
-                        activation=activation)
-        self.out_proj = MLP(input_size=hidden_size,
-                            hidden_size=hidden_size,
-                            output_size=hidden_size,
-                            activation=activation)
-
-        self.layernorm = LayerNorm(hidden_size)
-        self.att_window = att_window
-        self.att_heads = att_heads
-    
-    def forward(self, x_fwd, edge_index):
-        device = x_fwd.device
-        srcs = edge_index[0]
-        tars = edge_index[1]
-
-        tar_nodes = x_fwd[:, :, tars]
-        src_nodes = x_fwd[:, :, srcs]
-
-        B, T, N, D = x_fwd.shape
-        assert T >= 2 * self.att_window + 1
-        assert D % self.att_heads == 0
-        
-        d_k = D // self.att_heads
-
-        # Time encoding
-        tar_nodes = rearrange(tar_nodes, 'b t e d -> t (b e) d')
-        tar_nodes = self.time_emb(tar_nodes, torch.LongTensor(list(range(T))).to(device))
-        tar_fwd = rearrange(tar_nodes, 't (b e) d -> t b e d', b=B, e=len(tars))
-
-        src_nodes = rearrange(src_nodes, 'b t e d -> t (b e) d')
-        src_nodes = self.time_emb(src_nodes, torch.LongTensor(list(range(T))).to(device))
-        src_fwd = rearrange(src_nodes, 't (b e) d -> t b e d', b=B, e=len(srcs))
-
-        # Get the Q, K, V
-        q_mat = self.query(tar_fwd).view(T, B, len(tars), self.att_heads, d_k)
-        k_mat = self.key(src_fwd).view(T, B, len(tars), self.att_heads, d_k) 
-        v_mat = self.value(src_fwd).view(T, B, len(tars), self.att_heads, d_k)
-
-        # Message and attention scores
-        res_atts = (q_mat * k_mat).sum(dim=-1) / math.sqrt(d_k)
-        res_msgs = v_mat
-
-        padded_att = F.pad(res_atts, (0, 0, 0, 0, 0, 0, self.att_window, self.att_window))
-        padded_msg = F.pad(res_msgs, (0, 0, 0, 0, 0, 0, 0, 0, self.att_window, self.att_window))
-        
-        context_att = []
-        context_msg = []
-        for offset in range(-self.att_window, self.att_window + 1):
-            context_att.append(padded_att[self.att_window + offset : self.att_window + offset + T])  # [T, B, E, D]
-            context_msg.append(padded_msg[self.att_window + offset : self.att_window + offset + T])  # [T, B, E, D]
-
-        # [T, B, N*(att_window*2 + 1), D]
-        res_att_og = torch.cat(context_att, dim=2)
-        res_msg = torch.cat(context_msg, dim=2)
-
-        ei_tar = tars.repeat(self.att_window*2 + 1)
-
-        res_att = softmax(res_att_og, ei_tar, dim=2)
-        res = res_msg * res_att.unsqueeze(-1)   
-        res = res.view(T, B, -1, D)
-
-        spu_att = softmax(-res_att_og, ei_tar, dim=2)
-        spu = res_msg * spu_att.unsqueeze(-1)
-        spu = spu.view(T, B, -1, D)
-
-        causal_hat = scatter(res, ei_tar, dim=2, dim_size=N, reduce='add')  # [N,F]
-        spurious_hat = scatter(spu, ei_tar, dim=2, dim_size=N, reduce='add')  # [N,F]
-
-        causal_hat = rearrange(causal_hat, 't b n d -> b t n d')
-        spurious_hat = rearrange(spurious_hat, 't b n d -> b t n d')
-
-        output_invars = self.layernorm(self.out_proj(causal_hat)+x_fwd)
-        output_vars = self.layernorm(self.out_proj(spurious_hat))
-
-        return output_invars, output_vars
-
-class Geode(BaseModel):
+class GeodeNAall(BaseModel):
     def __init__(self,
                  input_size,
                  hidden_size,
@@ -151,7 +33,7 @@ class Geode(BaseModel):
                  k=5,
                  att_heads=8,
                  nbcd_layers=2):
-        super(Geode, self).__init__()
+        super(GeodeNAall, self).__init__()
 
         self.steps = intervention_steps
         self.horizon = horizon
@@ -161,8 +43,6 @@ class Geode(BaseModel):
         self.att_window = att_window
 
         self.init_emb = nn.Linear(input_size, hidden_size)
-        self.nbcds = nn.ModuleList(GeodeNBCD(hidden_size, att_window,
-                                             att_heads, activation) for _ in range(nbcd_layers))
 
         self.layernorm0 = LayerNorm(hidden_size)
         self.layernorm1 = LayerNorm(hidden_size)
@@ -202,8 +82,6 @@ class Geode(BaseModel):
         #                     activation=activation)
 
         self.readout1 = nn.Linear(hidden_size, output_size)
-        self.readout2 = nn.Linear(hidden_size*2, output_size)
-
         self.adj = adj
 
     def forward(self,
@@ -229,25 +107,14 @@ class Geode(BaseModel):
             o_adj = full_adj[known_set, :]
             o_adj = o_adj[:, known_set]
 
-        # Check if nodes arent connected to anything, 
-        # if so add self loops
-        zero_inds = torch.where((o_adj.sum(0) + o_adj.sum(1)) == 0)[0]
-        o_adj[zero_inds, zero_inds] = 1.
         edge_index, _ = dense_to_sparse(o_adj)
-
         x_fwd = self.init_emb(x)
 
         # ========================================
         # Calculating variant and invariant features using self-attention 
         # across different nodes using their representations
         # ========================================
-        for layer in self.nbcds:
-            x_fwd, output_vars = layer(x_fwd, edge_index) 
-            # x_fwd = self.layernorm0(x_fwd_caus + x_fwd)
         output_invars = x_fwd
-
-        o_adj[zero_inds, zero_inds] = 0.
-        edge_index, _ = dense_to_sparse(o_adj)
 
         # ========================================
         # Create new adjacency matrix 
@@ -299,10 +166,8 @@ class Geode(BaseModel):
             sub_entry = torch.zeros(b, t, add_nodes, d).to(device)
 
             xh_inv = torch.cat([output_invars, sub_entry], dim=2)  # b t n2 d
-            xh_var = torch.cat([output_vars, sub_entry], dim=2)
         else:
             xh_inv = output_invars
-            xh_var = output_vars
 
         # ========================================
         # Curriculum based pseudo-labelling
@@ -324,13 +189,11 @@ class Geode(BaseModel):
         gcn_adj = dense_to_sparse(adj.to(torch.float32))
         
         xh_inv_2 = torch.zeros_like(xh_inv).to(device=device)
-        xh_var_2 = torch.zeros_like(xh_var).to(device=device)
 
         cur_indices_tensor = torch.tensor(grouped[0], dtype=torch.long, device=device)
         cur_ind_exp = cur_indices_tensor[None, None, :, None].expand(b, t, -1, xh_inv.size(-1))
         
         xh_inv_2 = xh_inv_2.scatter(2, cur_ind_exp, xh_inv[:, :, grouped[0], :])
-        xh_var_2 = xh_var_2.scatter(2, cur_ind_exp, xh_var[:, :, grouped[0], :])
 
         for kh in range(1, self.k+1):
             # Pass if there are no k-hop reach nodes
@@ -351,11 +214,9 @@ class Geode(BaseModel):
                 rep_adj = rep_adj[rep_indices, :]
 
                 rep_inv = xh_inv_2[:, :, rep_indices, :]
-                rep_var = xh_var_2[:, :, rep_indices, :]
             else:
                 rep_adj = alt_adj
                 rep_inv = xh_inv_2
-                rep_var = xh_var_2
 
             rep_adj = dense_to_sparse(rep_adj.to(torch.float32))
 
@@ -364,16 +225,10 @@ class Geode(BaseModel):
             # xh_inv_1 = self.gcn3(xh_inv_1, rep_adj[0], rep_adj[1])
             # xh_inv_1 = self.layernorm3(xh_inv_1)
 
-            xh_var_0 = self.gcn1(rep_var, rep_adj[0], rep_adj[1])
-            xh_var_1 = self.layernorm1(xh_var_0)
-            # xh_var_1 = self.gcn3(xh_var_1, rep_adj[0], rep_adj[1])
-            # xh_var_1 = self.layernorm3(xh_var_1)
-
             cur_indices_tensor = torch.tensor(cur_indices, dtype=torch.long, device=device)
             cur_ind_exp = cur_indices_tensor[None, None, :, None].expand(b, t, -1, xh_inv_1.size(-1))
 
             xh_inv_2 = xh_inv_2.scatter(2, cur_ind_exp, xh_inv_1[:, :, -len(cur_indices):, :])
-            xh_var_2 = xh_var_2.scatter(2, cur_ind_exp, xh_var_1[:, :, -len(cur_indices):, :])
 
         # ========================================
         # Final Message Passing
@@ -383,11 +238,6 @@ class Geode(BaseModel):
         # xh_inv_3 = self.gcn3(xh_inv_3, gcn_adj[0], gcn_adj[1]) + xh_inv_3
         # xh_inv_3 = self.layernorm3(xh_inv_3)
 
-        xh_var_3 = self.gcn2(xh_var_2, gcn_adj[0], gcn_adj[1]) + xh_var_2
-        xh_var_3 = self.layernorm2(xh_var_3)
-        # xh_var_3 = self.gcn3(xh_var_3, gcn_adj[0], gcn_adj[1]) + xh_var_3
-        # xh_var_3 = self.layernorm3(xh_var_3)
-
         finpreds = self.readout1(xh_inv_3)
         if not training:
             return finpreds
@@ -396,43 +246,7 @@ class Geode(BaseModel):
         # CMD of embeddings
         # ========================================
         # Get embedding softmax
-        N = xh_inv_3.shape[2]
-        if self.cmd_ratio < 1.0:
-            n_cmd = int(N*self.cmd_ratio)
-            indx = torch.multinomial(torch.ones(N), n_cmd, replacement=False)
-            indx = set(indx.tolist())
-        else:
-            indx = set(list(range(N)))
-            n_cmd = N
-        
         finrecos = []
-
-        det_mask = torch.zeros_like(xh_inv_3).to(dtype=bool, device=device)
-        det_mask[:, :, :len(known_set)] = 1
-        xh_inv_3 = torch.where(det_mask, xh_inv_3.detach(), xh_inv_3) 
-
-        for i in range(1, self.k+1):
-            prev_group = []
-            cur_group = []
-
-            for j in range(i):
-                prev_group.extend(grouped[j])
-            for j in range(i+1):
-                cur_group.extend(grouped[j])
-
-            prev_group = list(set(prev_group) & indx)
-            cur_group = list(set(cur_group) & indx)
-            
-            emb_com_inv = xh_inv_3[:, :, prev_group]
-            emb_tru_inv = xh_inv_3[:, :, cur_group]
-
-            emb_com_inv = rearrange(emb_com_inv, 'b t n d -> t b n d')
-            emb_tru_inv = rearrange(emb_tru_inv, 'b t n d -> t b n d')
-
-            if emb_tru_inv.numel() == 0 or emb_com_inv.numel() == 0:
-                continue
-            else:
-                finrecos.append([emb_com_inv, emb_tru_inv])
 
         # ========================================
         # Disentanglement module
@@ -440,20 +254,6 @@ class Geode(BaseModel):
         # Predict the real nodes by propagating back using both variant and invariant features
         # Get IRM loss
         fin_irm_all = []
-        for _ in range(self.steps):
-            seen_invr = xh_inv_3[:, :, :len(known_set)]
-            seen_vars = xh_var_3[:, :, :len(known_set)]
-            
-            seen_vars_l = rearrange(seen_vars, 'b t n d -> b (t n) d', b=b, t=t)
-            s_rands = torch.randperm(seen_vars_l.shape[1])
-            rand_seen = seen_vars_l[:, s_rands, :].detach()
-
-            rand_seen = rearrange(rand_seen, 'b (t n) d -> b t n d', t=t)
-            fin_vars = torch.cat((seen_invr, rand_seen), dim=-1)
-            fin_irm = self.readout2(fin_vars)
-            fin_irm_all.append(fin_irm)
-
-        fin_irm_all = torch.stack(fin_irm_all)
 
         return finpreds, finrecos, fin_irm_all
 

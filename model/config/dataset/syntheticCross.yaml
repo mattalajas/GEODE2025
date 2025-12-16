@@ -1,0 +1,26 @@
+#### Dataset params ###########################################################
+name: syntheticCross
+
+synth_params:
+  num_steps: 8000
+  o_filter_params: [[5., 2.], [-4., 6.], [1., 0.]]
+  e_filter_params: [[5., 2.], [-4., 6.], [-1., 0.]]
+  name: CrossGPVAR
+
+# spatial shift
+spatial_shift: false
+order: 0
+node_features: CC
+include_exog: True
+
+# Point
+p_fault: 0.
+p_noise: 0.25
+
+splitting:
+  val_len: 0.1
+  test_len: 0.2
+connectivity:
+  method: distance
+  threshold: 0.1
+  include_self: False
