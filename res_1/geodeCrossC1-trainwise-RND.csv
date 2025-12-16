@@ -1,0 +1,2 @@
+test_mae,test_mre,test_mse,test_rmse,val_mae,val_mre,val_mse,val_rmse,model,db,seed
+1.594288,0.855958728264133,3.9824479,1.9956071,1.5107836,0.8186658380563603,3.5581093,1.8862951,geodeCrossC1,syntheticCross,15900376
