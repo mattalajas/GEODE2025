@@ -112,9 +112,11 @@ class GeodeCrossV13(BaseModel):
                  att_window=3,
                  k=5,
                  att_heads=8,
-                 dropout=0.1):
+                 dropout=0.1,
+                 full_cadj=True,):
         super(GeodeCrossV13, self).__init__()
 
+        self.full_cadj = full_cadj
         self.steps = intervention_steps
         self.horizon = horizon
         self.cmd_ratio = cmd_sample_ratio
@@ -298,13 +300,17 @@ class GeodeCrossV13(BaseModel):
         c_adj = c_adj[:, tr_indx]
 
         ar_adj = torch.zeros((o_adj.shape[0], o_adj.shape[0])).to(device)
-        cr_adj = torch.ones((tr_indx.shape[0], o_adj.shape[0])).to(device)
         # cr_adj_z = torch.zeros((o_adj.shape[0], tr_indx.shape[0])).to(device)
         tr_adj = torch.zeros((tr_indx.shape[0], tr_indx.shape[0])).to(device)
+
+        if self.full_cadj:
+            cr_adj = torch.ones((o_adj.shape[0], tr_indx.shape[0])).to(device)
+        else:
+            cr_adj = c_adj.ne(0).to(c_adj.dtype)
         
         rows = [
-            [ar_adj, cr_adj.T],
-            [cr_adj, tr_adj]
+            [ar_adj, cr_adj],
+            [cr_adj.T, tr_adj]
         ]
 
         cross_adj = torch.cat(

@@ -8,6 +8,7 @@ hparams:
   att_window: 1
   nbcd_layers: 1
   k: 3
+  sampling: partition # partition, random, empty
 regs:
   y1: 1 # IRM Loss
   y2: 0.2 # CMD Loss

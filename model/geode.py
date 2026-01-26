@@ -150,7 +150,8 @@ class Geode(BaseModel):
                  att_window=3,
                  k=5,
                  att_heads=8,
-                 nbcd_layers=2):
+                 nbcd_layers=2,
+                 sampling='partition'):
         super(Geode, self).__init__()
 
         self.steps = intervention_steps
@@ -159,6 +160,9 @@ class Geode(BaseModel):
         self.k = k
         self.att_heads = att_heads
         self.att_window = att_window
+        
+        assert sampling in ['partition', 'random', 'empty']
+        self.sampling = sampling
 
         self.init_emb = nn.Linear(input_size, hidden_size)
         self.nbcds = nn.ModuleList(GeodeNBCD(hidden_size, att_window,
@@ -463,11 +467,14 @@ class Geode(BaseModel):
         prev_cur = 0
 
         # Get partitions
-        partitions = np.random.exponential(scale, k)
-        partitions = partitions / partitions.sum() * n_add
-        partitions = np.round(partitions).astype(int)
-        partitions[-1] += n_add - partitions.sum()
-        partitions = np.sort(partitions)[::-1]
+        if self.sampling == 'partition':
+            partitions = np.random.exponential(scale, k)
+            partitions = partitions / partitions.sum() * n_add
+            partitions = np.round(partitions).astype(int)
+            partitions[-1] += n_add - partitions.sum()
+            partitions = np.sort(partitions)[::-1]
+        else:
+            partitions = [n_add]
 
         if partitions[-1] < 0:
             partitions[0] += partitions[-1]

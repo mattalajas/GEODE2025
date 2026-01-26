@@ -28,8 +28,25 @@ from geodeCross_fillerV7 import GeodeCrossFillerV7
 from geodeCross_fillerV8 import GeodeCrossFillerV8
 from geodeCross_fillerC1 import GeodeCrossFillerC1
 from geodeNAall import GeodeNAall
-from KITS import KITS
-from KITS_filler import GCNCycVirtualFiller
+from baselines.KITS import KITS
+from baselines.IGNNK import IGNNK
+from baselines.DIDA import DGNN
+from baselines.LSJSTN import LSJSTN
+from baselines.EAGLE import EAGLE
+from baselines.DYSAT import DySAT
+from baselines.EVOLVEGCN import EvolveGCNModel
+from baselines.DCRNN import DCRNNModel
+from baselines.INCREASE import INCREASE
+from baselines.INCREASE_FS import INCREASE_FS
+from fillers.DIDA_filler import DidaFiller
+from fillers.IGNNK_filler import IGNNKFiller
+from fillers.LSJSTN_filler import LSJSTNFiller
+from fillers.EAGLE_filler import EAGLEfiller
+from fillers.DYSAT_filler import DYSATFiller
+from fillers.Standard_filler import StandardFiller
+from fillers.INCREASE_filler import INCREASEFiller
+from fillers.INCREASE_FS_filler import INCREASE_FS_Filler
+from fillers.KITS_filler import GCNCycVirtualFiller
 from omegaconf import DictConfig
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
@@ -87,6 +104,24 @@ def get_model_class(model_str):
         model = GeodeCrossC2
     elif model_str == 'kits':
         model = KITS
+    elif model_str == 'ignnk':
+        model = IGNNK
+    elif model_str == 'dida':
+        model = DGNN
+    elif model_str == 'lsjstn':
+        model = LSJSTN
+    elif model_str == 'eagle':
+        model = EAGLE
+    elif model_str == 'dysat':
+        model = DySAT
+    elif model_str == 'evolvegcn':
+        model = EvolveGCNModel
+    elif model_str == 'dcrnn':
+        model = DCRNNModel
+    elif model_str == 'increase':
+        model = INCREASE
+    elif model_str == 'increase_fs':
+        model = INCREASE_FS
     else:
         raise NotImplementedError(f'Model "{model_str}" not available.')
     return model
@@ -393,9 +428,33 @@ def run_imputation(cfg: DictConfig):
         model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
     elif cfg.model.name == 'geodeCrossC2':
         model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window, threshold=cfg.dataset.connectivity.threshold)
-
+    elif cfg.model.name == 'ignnk':
+        model_kwargs = dict(h=cfg.window)
+    elif cfg.model.name == 'dida':
+        model_kwargs = dict(nfeat=dm.n_channels, output_size=dm.n_channels, 
+                            num_nodes=adj.shape[0], args=cfg.model.hparams)
+    elif cfg.model.name == 'lsjstn':
+        model_kwargs = dict(in_dim=dm.n_channels)
+    elif cfg.model.name == 'dysat':
+        model_kwargs = dict(num_features=dm.n_channels, time_length=cfg.window)
+    elif cfg.model.name == 'eagle':
+        model_kwargs = dict(nfeat=dm.n_channels, output_size=dm.n_channels, 
+                            num_nodes=adj.shape[0], args=cfg.model.hparams)
+    elif cfg.model.name == "dcrnn" or cfg.model.name == "evolvegcn":
+        model_kwargs = dict(input_size=torch_dataset.n_channels,
+                            output_size=dm.n_channels,
+                            horizon=cfg.window)
+    elif cfg.model.name == 'increase' or cfg.model.name == 'increase_fs':
+        model_kwargs = dict(input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
+    else:
+        model_kwargs = dict(n_nodes=torch_dataset.n_nodes,
+                            input_size=torch_dataset.n_channels)
     model_cls.filter_model_args_(model_kwargs)
-    loss_fn = torch_metrics.MaskedMAE()
+
+    if cfg.model.name in ['ignnk', 'increase']:
+        loss_fn = torch_metrics.MaskedMSE()
+    else:
+        loss_fn = torch_metrics.MaskedMAE()
 
     model_kwargs.update(cfg.model.hparams)
 
@@ -442,6 +501,7 @@ def run_imputation(cfg: DictConfig):
                             gradient_clip_val=cfg.grad_clip_val,
                             gradient_clip_algorithm=cfg.grad_clip_alg,
                             known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
+                            sampling = cfg.model.hparams.sampling,
                             **cfg.model.regs)
     elif cfg.model.name =='geodeCross' or cfg.model.name =='geodeCrossV2' or cfg.model.name =='geodeCrossV3':
         imputer = GeodeCrossFiller(model_class=model_cls,
@@ -543,6 +603,114 @@ def run_imputation(cfg: DictConfig):
                             gradient_clip_algorithm=cfg.grad_clip_alg,
                             known_set = [i for i in range(dataset.air_max_nodes) if i not in masked_sensors],
                             **cfg.model.regs)
+    elif cfg.model.name == "dida":
+        imputer = DidaFiller(model_class=model_cls,
+                            model_kwargs=model_kwargs,
+                            optim_class=getattr(torch.optim, cfg.optimizer.name),
+                            optim_kwargs=dict(cfg.optimizer.hparams),
+                            loss_fn=loss_fn,
+                            scaled_target=cfg.scale_target,
+                            metrics=log_metrics,
+                            scheduler_class=scheduler_class,
+                            scheduler_kwargs=scheduler_kwargs,
+                            gradient_clip_val=cfg.grad_clip_val,
+                            gradient_clip_algorithm=cfg.grad_clip_alg,
+                            known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
+                            adj=adj,
+                            horizon=cfg.window,
+                            **cfg.model.regs)
+    elif cfg.model.name == "eagle":
+        imputer = EAGLEfiller(model_class=model_cls,
+                            model_kwargs=model_kwargs,
+                            optim_class=getattr(torch.optim, cfg.optimizer.name),
+                            optim_kwargs=dict(cfg.optimizer.hparams),
+                            loss_fn=loss_fn,
+                            metrics=log_metrics,
+                            scheduler_class=scheduler_class,
+                            scheduler_kwargs=scheduler_kwargs,
+                            gradient_clip_val=cfg.grad_clip_val,
+                            gradient_clip_algorithm=cfg.grad_clip_alg,
+                            known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
+                            adj=adj,
+                            horizon=cfg.window,
+                            **cfg.model.regs)
+    elif cfg.model.name == "ignnk":
+        imputer = IGNNKFiller(model_class=model_cls,
+                            model_kwargs=model_kwargs,
+                            optim_class=getattr(torch.optim, cfg.optimizer.name),
+                            optim_kwargs=dict(cfg.optimizer.hparams),
+                            loss_fn=loss_fn,
+                            metrics=log_metrics,
+                            scheduler_class=scheduler_class,
+                            scheduler_kwargs=scheduler_kwargs,
+                            gradient_clip_val=cfg.grad_clip_val,
+                            gradient_clip_algorithm=cfg.grad_clip_alg,
+                            known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
+                            adj=adj,
+                            n_o_n_m=cfg.model.n_o_n_m)
+    elif cfg.model.name == "lsjstn":
+        imputer = LSJSTNFiller(model_class=model_cls,
+                            model_kwargs=model_kwargs,
+                            optim_class=getattr(torch.optim, cfg.optimizer.name),
+                            optim_kwargs=dict(cfg.optimizer.hparams),
+                            loss_fn=loss_fn,
+                            metrics=log_metrics,
+                            scheduler_class=scheduler_class,
+                            scheduler_kwargs=scheduler_kwargs,
+                            gradient_clip_val=cfg.grad_clip_val,
+                            gradient_clip_algorithm=cfg.grad_clip_alg,
+                            known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
+                            adj=adj)
+    elif cfg.model.name == "dysat":
+        imputer = DYSATFiller(model_class=model_cls,
+                            model_kwargs=model_kwargs,
+                            optim_class=getattr(torch.optim, cfg.optimizer.name),
+                            optim_kwargs=dict(cfg.optimizer.hparams),
+                            loss_fn=loss_fn,
+                            metrics=log_metrics,
+                            scheduler_class=scheduler_class,
+                            scheduler_kwargs=scheduler_kwargs,
+                            known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
+                            adj=adj,
+                            horizon=cfg.window)
+    elif cfg.model.name == "dcrnn" or cfg.model.name == "evolvegcn":
+        imputer = StandardFiller(model_class=model_cls,
+                                model_kwargs=model_kwargs,
+                                optim_class=getattr(torch.optim, cfg.optimizer.name),
+                                optim_kwargs=dict(cfg.optimizer.hparams),
+                                loss_fn=loss_fn,
+                                metrics=log_metrics,
+                                scheduler_class=scheduler_class,
+                                scheduler_kwargs=scheduler_kwargs,
+                                known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
+                                adj=adj,
+                                horizon=cfg.window)
+    elif cfg.model.name == "increase":
+        imputer = INCREASEFiller(model_class=model_cls,
+                                model_kwargs=model_kwargs,
+                                optim_class=getattr(torch.optim, cfg.optimizer.name),
+                                optim_kwargs=dict(cfg.optimizer.hparams),
+                                loss_fn=loss_fn,
+                                metrics=log_metrics,
+                                scheduler_class=scheduler_class,
+                                scheduler_kwargs=scheduler_kwargs,
+                                known_set = [i for i in range(adj.shape[0]) if i not in masked_sensors],
+                                adj=adj,
+                                horizon=cfg.window,
+                                num_n=cfg.model.hparams.K)
+    elif cfg.model.name == "increase_fs":
+        imputer = INCREASE_FS_Filler(model_class=model_cls,
+                                    model_kwargs=model_kwargs,
+                                    optim_class=getattr(torch.optim, cfg.optimizer.name),
+                                    optim_kwargs=dict(cfg.optimizer.hparams),
+                                    loss_fn=loss_fn,
+                                    metrics=log_metrics,
+                                    scheduler_class=scheduler_class,
+                                    scheduler_kwargs=scheduler_kwargs,
+                                    known_set = [i for i in range(dataset.air_max_nodes) if i not in masked_sensors],
+                                    adj=adj,
+                                    horizon=cfg.window,
+                                    num_n=cfg.model.hparams.K)
     else:
         raise NotImplementedError(f'Model "{cfg.model.name}" not available.')
 

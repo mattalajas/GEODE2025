@@ -1,0 +1,9 @@
+name: 'dysat'
+hparams:
+  structural_head_config: '16,8,8'
+  structural_layer_config: '128'
+  temporal_head_config: '16'
+  temporal_layer_config: '128'
+  spatial_drop: 0.1
+  temporal_drop: 0.5
+  residual: true

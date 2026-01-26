@@ -32,6 +32,7 @@ class GeodeNAall(BaseModel):
                  att_window=3,
                  k=5,
                  att_heads=8,
+                 sampling = 'partition',
                  nbcd_layers=2):
         super(GeodeNAall, self).__init__()
 

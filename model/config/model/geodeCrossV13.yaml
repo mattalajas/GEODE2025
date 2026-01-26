@@ -10,6 +10,7 @@ hparams:
   att_window: 1
   dropout: 0.1
   k: 3
+  full_cadj: true
 regs:
   y1: 0.1 # Cross Loss
   y2: 0.05 # Contastive Loss

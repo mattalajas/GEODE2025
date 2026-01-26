@@ -94,6 +94,11 @@ def cmd(x1, x2, og_batch, coarse_batch, n_moments=2):
     return scms
 
 def test_wise_eval(y_hat, y_true, mask, known_nodes, adj, mode, num_groups=4, alpha = 0.20):
+    try:
+        adj = adj.numpy()
+    except:
+        pass
+
     numpy_graph = nx.from_numpy_array(adj)
     k_nodes = np.array(known_nodes)
     u_nodes = np.array([i for i in range(adj.shape[0]) if i not in known_nodes])
@@ -176,6 +181,11 @@ def test_wise_eval(y_hat, y_true, mask, known_nodes, adj, mode, num_groups=4, al
         for metric, val in results.items():
             res[f'max_{metric}_{key}_{mode}'] = max(val)
             res[f'min_{metric}_{key}_{mode}'] = min(val)
+    
+        if num_groups == 5:
+            res[f'all_mae_{key}_{mode}'] = results['mae']
+            res[f'all_mre_{key}_{mode}'] = results['mre']
+            res[f'all_rmse_{key}_{mode}'] = results['rmse']
     
     return res    
 
@@ -1647,6 +1657,7 @@ class CrossGaussianNoiseSyntheticDataset(TabularDataset):
                  e_model_class: Type = None,
                  e_model_kwargs: Mapping = None,
                  e_sigma_noise: float = .2,
+                 cor_rat: float = 0.5,
                  include_exog: bool = True,
                  name: str = None,
                  seed: int = 42,
@@ -1657,6 +1668,7 @@ class CrossGaussianNoiseSyntheticDataset(TabularDataset):
         self._num_steps = num_steps
         self._min_window = min_window
         self._include_exog = include_exog
+        self.cor = cor_rat
         if seed is not None:
             self.seed = seed
 
@@ -1785,8 +1797,7 @@ class CrossGaussianNoiseSyntheticDataset(TabularDataset):
                                                t=t,
                                                edge_index=o_edge_index,
                                                edge_weight=o_edge_weight)
-                x_t = torch.tanh(o_t + Uf_t)
-                
+                x_t = torch.tanh(((self.cor * o_t) + (1 - self.cor) * Uf_t))
                 y_opt[t - self._min_window:t + 1 - self._min_window, :self._main_num] = x_t[0]
                 # add noise
                 x_t = x_t + torch.zeros_like(x_t).normal_(
@@ -1837,28 +1848,48 @@ class _GPVAR(GraphPolyVAR):
         out = super(_GPVAR, self).forward(x, edge_index, edge_weight)
         return torch.tanh(out)
 
-SIZES_X = [10, 10, 10, 10]
-PROB_X = [[0.30, 0.01, 0.01, 0.01],
+# SMALL DATASET
+SIZES_X_sm = [30, 30, 30, 30]
+PROB_X_sm = [[0.30, 0.01, 0.01, 0.01],
           [0.01, 0.30, 0.01, 0.01],
           [0.01, 0.01, 0.30, 0.01],
           [0.01, 0.01, 0.01, 0.30]]
 
-SIZES_Y = [15, 15, 15]
-PROB_Y = [[0.30, 0.01, 0.01],
+SIZES_Y_sm = [25, 25, 25]
+PROB_Y_sm = [[0.30, 0.01, 0.01],
           [0.01, 0.30, 0.01],
           [0.01, 0.01, 0.30]]
 
 # Cross-layer bipartite SBM
 # Y has 2 blocks, X has 2 blocks
-SIZES_XY = ([15, 15, 15], [10, 10, 10, 10])
-PROB_XY = [[0.25, 0.00, 0.00],
-           [0.10, 0.10, 0.00],
-           [0.00, 0.10, 0.10],
-           [0.00, 0.00, 0.25]]
+SIZES_XY_sm = ([25, 25, 25], [30, 30, 30, 30])
+PROB_XY_sm = [[0.25, 0.00, 0.00],
+            [0.10, 0.10, 0.00],
+            [0.00, 0.10, 0.10],
+            [0.00, 0.00, 0.25]]
 
-DEFAULT_SBM_PARAMS = {'sizes_x': SIZES_X, 'prob_x': PROB_X,
-                      'sizes_y': SIZES_Y, 'prob_y': PROB_Y,
-                      'sizes_xy': SIZES_XY, 'prob_xy': PROB_XY}
+# LARGE DATASET
+SIZES_X_lr = [100, 100, 100, 100, 100]
+PROB_X_lr = [[0.30, 0.01, 0.01, 0.01, 0.01],
+          [0.01, 0.30, 0.01, 0.01, 0.01],
+          [0.01, 0.01, 0.30, 0.01, 0.01],
+          [0.01, 0.01, 0.01, 0.30, 0.01],
+          [0.01, 0.01, 0.01, 0.01, 0.30]]
+
+SIZES_Y_lr = [100, 100, 100, 100]
+PROB_Y_lr = [[0.30, 0.01, 0.01, 0.01],
+          [0.01, 0.30, 0.01, 0.01],
+          [0.01, 0.01, 0.30, 0.01],
+          [0.01, 0.01, 0.01, 0.30]]
+
+# Cross-layer bipartite SBM
+# Y has 2 blocks, X has 2 blocks
+SIZES_XY_lr = ([100, 100, 100, 100], [100, 100, 100, 100, 100])
+PROB_XY_lr = [[0.25, 0.00, 0.00, 0.00],
+           [0.10, 0.25, 0.00, 0.00],
+           [0.00, 0.10, 0.25, 0.00],
+           [0.00, 0.00, 0.10, 0.25],
+           [0.15, 0.00, 0.00, 0.15]]
 
 class CrossGPVARDataset(CrossGaussianNoiseSyntheticDataset):
     """Generator for synthetic datasets from a graph polynomial VAR filter on
@@ -1887,27 +1918,37 @@ class CrossGPVARDataset(CrossGaussianNoiseSyntheticDataset):
                  o_norm: str = 'none',
                  e_sigma_noise: float = .2,
                  e_norm: str = 'none',
-                 sbm_params: dict = DEFAULT_SBM_PARAMS,
+                 cor_rat: float = 0.5,
+                 trim_thresh: float = 0.0,
+                 size: str = 'small',
                  include_exog: bool = True,
+                 seed=42,
                  name: str = None):
+        np.random.seed(seed)
+
         if name is None:
             name = "GP-VAR"
 
-        # TODO: Change the graph generation process 
-        # node_idx, edge_index, _ = build_tri_community_graph(
-        #     num_communities=num_communities)
-        # num_nodes = len(node_idx)
-        # # add self loops
-        # edge_index, _ = add_self_loops(edge_index=torch.tensor(edge_index),
-        #                                num_nodes=num_nodes)
-        # split = 5
+        if size == 'small':
+            sbm_params = {'sizes_x': SIZES_X_sm, 'prob_x': PROB_X_sm,
+                          'sizes_y': SIZES_Y_sm, 'prob_y': PROB_Y_sm,
+                          'sizes_xy': SIZES_XY_sm, 'prob_xy': PROB_XY_sm}
+        elif size == 'large':
+            sbm_params = {'sizes_x': SIZES_X_lr, 'prob_x': PROB_X_lr,
+                          'sizes_y': SIZES_Y_lr, 'prob_y': PROB_Y_lr,
+                          'sizes_xy': SIZES_XY_lr, 'prob_xy': PROB_XY_lr}
 
         Gx, Gy, Gxy, A_aug = generate_multiplex_sbm(
             **sbm_params,
-            seed=42
+            seed=seed
         )
-        num_nodes = A_aug.shape[0]
         self.air_max_nodes = len(Gx.nodes)
+        # Trim edges below threshold
+        A_aug = ((A_aug * np.random.rand(*A_aug.shape)) > trim_thresh).astype(float)
+
+        self.A_aug = A_aug
+        num_nodes = A_aug.shape[0]
+        
 
         edge_index = []
         edge_weight = []
@@ -1945,6 +1986,7 @@ class CrossGPVARDataset(CrossGaussianNoiseSyntheticDataset):
                                            e_model=e_filter,
                                            e_sigma_noise=e_sigma_noise,
                                            include_exog=include_exog,
+                                           cor_rat=cor_rat,
                                            name=name)
         
 
