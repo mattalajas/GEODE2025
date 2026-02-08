@@ -350,6 +350,7 @@ class GeodeCrossFillerV8(Filler):
                  gradient_clip_val=None,
                  gradient_clip_algorithm=None,
                  known_set=None,
+                 sampling ='partition',
                  y1 = 1,
                  y2 = 1):
         super(GeodeCrossFillerV8, self).__init__(model_class=model_class,
@@ -369,6 +370,7 @@ class GeodeCrossFillerV8(Filler):
         self.gradient_clip_algorithm = gradient_clip_algorithm
         self.y1 = y1
         self.y2 = y2
+        self.sampling = sampling
     
     def load_model(self, filename: str):
         """Load model's weights from checkpoint at :attr:`filename`.
@@ -436,6 +438,8 @@ class GeodeCrossFillerV8(Filler):
             known_set = self.known_set
             ratio = float(len(known_set) / mask_sum.shape[0])
             self.ratio = ratio
+        if self.sampling == 'half':
+            self.ratio/=2
 
         batch_data["known_set"] = known_set
 
@@ -444,14 +448,16 @@ class GeodeCrossFillerV8(Filler):
 
         # Create randomised model here
         cur_entry_num = mask.size(2)
-        dynamic_ratio = self.ratio + 0.1 * np.random.random()  # ratio + 0.1
-        aug_entry_num = max(int(cur_entry_num / dynamic_ratio), cur_entry_num + 1)
-        sub_entry_num = aug_entry_num - cur_entry_num  # n2 - n1
+
+        if self.sampling != 'empty':
+            dynamic_ratio = self.ratio + 0.1 * np.random.random()  # ratio + 0.1
+            aug_entry_num = max(int(cur_entry_num / dynamic_ratio), cur_entry_num + 1)
+            sub_entry_num = aug_entry_num - cur_entry_num  # n2 - n1
 
         train_ratio = (1 - self.ratio) + 0.1 * np.random.random() 
         trn_entry_num = min(max(int(train_ratio * cur_entry_num), 1), len(known_set)//2)
 
-        assert sub_entry_num > 0, "The augmented data should have more entries than original data."
+        # assert sub_entry_num > 0, "The augmented data should have more entries than original data."
         self.sub_entry_num = sub_entry_num
 
         arrange = torch.randperm(len(known_set))

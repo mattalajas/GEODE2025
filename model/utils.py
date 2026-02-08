@@ -93,7 +93,58 @@ def cmd(x1, x2, og_batch, coarse_batch, n_moments=2):
         scms = scms + moment_diff(sx1, sx2, i+2, og_batch, coarse_batch)
     return scms
 
-def test_wise_eval(y_hat, y_true, mask, known_nodes, adj, mode, num_groups=4, alpha = 0.20):
+def get_agg_feature_distance_community(adj_matrix,
+                                       feature,
+                                       train_idx,
+                                       test_idx,
+                                       group_num=5):
+    
+    adj_matrix = torch.from_numpy(adj_matrix).to_sparse()
+    num_nodes = adj_matrix.shape[0]
+
+    feature = feature.reshape(feature.shape[0]*feature.shape[1], feature.shape[2]).T
+
+    A = adj_matrix  # torch_sparse.tensor.SparseTensor
+    # print("complete A")
+    A = A + torch.sparse_coo_tensor(
+        [[i for i in range(num_nodes)], [i for i in range(num_nodes)]], [1] * num_nodes)
+    # print("complete A+I")
+    D_diag = list(torch.sparse.sum(A, dim=1))
+    # print("complete D_diag")
+    D_1 = [1 / x for x in D_diag]
+    D_1 = torch.sparse_coo_tensor(
+        [[i for i in range(num_nodes)], [i for i in range(num_nodes)]], D_1)
+    # print("complete D_1")
+
+    agg = torch.sparse.mm(D_1, A)
+    # print("complete mm1")
+    agg = torch.sparse.mm(agg, D_1)
+    # print("complete mm2")
+    agg = torch.sparse.mm(agg, A).to_dense().numpy()
+    # print("complete mm3")
+    agg = np.matmul(agg, feature)
+    # print("complete mm4")
+
+    agg_distance = {}
+    train_idx = list(train_idx)
+    for k in range(len(test_idx)):
+        i = test_idx[k]
+        # if k % 100 == 0:
+        #     print(k)
+        agg_distance[i] = float('inf')
+        for j in train_idx:
+            agg_distance[i] = min(agg_distance[i],
+                                  np.linalg.norm(agg[i] - agg[j]))
+
+    sort_res = list(
+        map(lambda x: x[0], sorted(agg_distance.items(), key=lambda x: x[1])))
+    node_num_group = len(sort_res) // group_num
+    return [
+        sort_res[i:i + node_num_group + 1]
+        for i in range(0, len(sort_res), node_num_group + 1)
+    ]
+
+def test_wise_eval(y_hat, y_true, mask, known_nodes, adj, mode, num_groups=4, alpha = 0.20, features=None):
     try:
         adj = adj.numpy()
     except:
@@ -130,6 +181,9 @@ def test_wise_eval(y_hat, y_true, mask, known_nodes, adj, mode, num_groups=4, al
     if remainder:
         lps_gr[-1].extend(sorted_lps[-remainder:])
 
+    # AGG
+    agg_gr = get_agg_feature_distance_community(adj, features, k_nodes, u_nodes, group_num=num_groups)
+
     # CC
     closeness = nx.closeness_centrality(numpy_graph)
     closeness = {node: score for node, score in closeness.items() if score > 0}
@@ -154,9 +208,16 @@ def test_wise_eval(y_hat, y_true, mask, known_nodes, adj, mode, num_groups=4, al
             khr_gr[num_groups-1].append(key)
 
     # Evaluate
-    group_dict = {'LPS': lps_gr,
-                'CC': cls_gr,
-                'KHR': khr_gr}
+    if features is not None:
+        group_dict = {'LPS': lps_gr,
+                    'CC': cls_gr,
+                    'KHR': khr_gr,
+                    'AGG': agg_gr}
+    else:
+        group_dict = {'LPS': lps_gr,
+                    'CC': cls_gr,
+                    'KHR': khr_gr}
+        
     res = {f'{mode}_mae': numpy_metrics.mae(y_hat, y_true, mask),
                f'{mode}_mre': numpy_metrics.mre(y_hat, y_true, mask),
                f'{mode}_rmse': numpy_metrics.rmse(y_hat, y_true, mask)}
@@ -1885,11 +1946,11 @@ PROB_Y_lr = [[0.30, 0.01, 0.01, 0.01],
 # Cross-layer bipartite SBM
 # Y has 2 blocks, X has 2 blocks
 SIZES_XY_lr = ([100, 100, 100, 100], [100, 100, 100, 100, 100])
-PROB_XY_lr = [[0.25, 0.00, 0.00, 0.00],
-           [0.10, 0.25, 0.00, 0.00],
-           [0.00, 0.10, 0.25, 0.00],
-           [0.00, 0.00, 0.10, 0.25],
-           [0.15, 0.00, 0.00, 0.15]]
+PROB_XY_lr = [[0.05, 0.00, 0.00, 0.00],
+              [0.01, 0.05, 0.00, 0.00],
+              [0.00, 0.01, 0.05, 0.00],
+              [0.00, 0.00, 0.01, 0.05],
+              [0.02, 0.00, 0.00, 0.02]]
 
 class CrossGPVARDataset(CrossGaussianNoiseSyntheticDataset):
     """Generator for synthetic datasets from a graph polynomial VAR filter on
@@ -1919,7 +1980,8 @@ class CrossGPVARDataset(CrossGaussianNoiseSyntheticDataset):
                  e_sigma_noise: float = .2,
                  e_norm: str = 'none',
                  cor_rat: float = 0.5,
-                 trim_thresh: float = 0.0,
+                 o_trim_thresh: float = 0.0,
+                 e_trim_thresh: float = 0.8,
                  size: str = 'small',
                  include_exog: bool = True,
                  seed=42,
@@ -1933,18 +1995,31 @@ class CrossGPVARDataset(CrossGaussianNoiseSyntheticDataset):
             sbm_params = {'sizes_x': SIZES_X_sm, 'prob_x': PROB_X_sm,
                           'sizes_y': SIZES_Y_sm, 'prob_y': PROB_Y_sm,
                           'sizes_xy': SIZES_XY_sm, 'prob_xy': PROB_XY_sm}
+            o_trim_thresh = 0.7
+            e_trim_thresh = 0.4
         elif size == 'large':
             sbm_params = {'sizes_x': SIZES_X_lr, 'prob_x': PROB_X_lr,
                           'sizes_y': SIZES_Y_lr, 'prob_y': PROB_Y_lr,
                           'sizes_xy': SIZES_XY_lr, 'prob_xy': PROB_XY_lr}
+            o_trim_thresh = 0.95
+            e_trim_thresh = 0.85
 
+        print(o_trim_thresh, e_trim_thresh)
         Gx, Gy, Gxy, A_aug = generate_multiplex_sbm(
             **sbm_params,
             seed=seed
         )
         self.air_max_nodes = len(Gx.nodes)
         # Trim edges below threshold
-        A_aug = ((A_aug * np.random.rand(*A_aug.shape)) > trim_thresh).astype(float)
+        A_key = A_aug[:self.air_max_nodes, :self.air_max_nodes].copy()
+        A_exo = A_aug[self.air_max_nodes:, self.air_max_nodes:].copy()
+
+        A_key = ((A_key * np.random.rand(*A_key.shape)) > o_trim_thresh).astype(float)
+        A_exo = ((A_exo * np.random.rand(*A_exo.shape)) > e_trim_thresh).astype(float)
+
+        A_aug[:self.air_max_nodes, :self.air_max_nodes] = A_key
+        A_aug[self.air_max_nodes:, self.air_max_nodes:] = A_exo
+        # A_aug = ((A_aug * np.random.rand(*A_aug.shape)) > trim_thresh).astype(float)
 
         self.A_aug = A_aug
         num_nodes = A_aug.shape[0]
@@ -2150,3 +2225,32 @@ def add_missing_sensors_cross(dataset: AirCross | CrossGPVARDataset,
 
     # Store evaluation mask params in dataset
     return dataset, masked_sensors
+
+
+import time
+import torch
+import pytorch_lightning as pl
+
+
+class EpochTimeCallback(pl.Callback):
+    def __init__(self, warmup_epochs=1):
+        self.warmup_epochs = warmup_epochs
+        self.epoch_times = []
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self.start_time = time.perf_counter()
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        epoch_time = time.perf_counter() - self.start_time
+
+        # skip warm-up epochs
+        if trainer.current_epoch >= self.warmup_epochs:
+            self.epoch_times.append(epoch_time)
+
+    def get_average_epoch_time(self):
+        return sum(self.epoch_times) / len(self.epoch_times)

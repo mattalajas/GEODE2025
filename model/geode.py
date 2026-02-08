@@ -161,7 +161,7 @@ class Geode(BaseModel):
         self.att_heads = att_heads
         self.att_window = att_window
         
-        assert sampling in ['partition', 'random', 'empty']
+        assert sampling in ['partition', 'random', 'empty', 'no_part', 'half']
         self.sampling = sampling
 
         self.init_emb = nn.Linear(input_size, hidden_size)
@@ -467,7 +467,7 @@ class Geode(BaseModel):
         prev_cur = 0
 
         # Get partitions
-        if self.sampling == 'partition':
+        if self.sampling == 'partition' or self.sampling == 'half':
             partitions = np.random.exponential(scale, k)
             partitions = partitions / partitions.sum() * n_add
             partitions = np.round(partitions).astype(int)
@@ -499,7 +499,15 @@ class Geode(BaseModel):
                 expanded[new_node_index, anchor] = 1
 
                 # Optionally connect to anchor's neighbors
-                neighbors = torch.nonzero(current_adj[anchor, :n_current]).squeeze(-1)
+                if self.sampling == 'random':
+                    neighbors = torch.empty(0)
+                    tot_n = int(torch.sum(current_adj[anchor, :n_current]).item())
+
+                    if tot_n > 0:
+                        neighbors = torch.multinomial(torch.ones(n_current), tot_n, replacement=False)
+                        neighbors = neighbors[neighbors != anchor]
+                else:
+                    neighbors = torch.nonzero(current_adj[anchor, :n_current]).squeeze(-1)
                 # print(anchor, neighbors)
                 for neighbor in neighbors:
                     connect_prob = np.random.rand(1)

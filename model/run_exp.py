@@ -17,6 +17,9 @@ from geodeCrossv10 import GeodeCrossV10
 from geodeCrossv11 import GeodeCrossV11
 from geodeCrossv12 import GeodeCrossV12
 from geodeCrossv13 import GeodeCrossV13
+from geodeCrossv13_wSST import GeodeCrossV13wSST
+from geodeCrossv13_wMMP import GeodeCrossV13wMMP
+from geodeCrossv13_wall import GeodeCrossV13wall
 from geodeCrossv14 import GeodeCrossV14
 from geodeCrossc1 import GeodeCrossC1
 from geodeCrossc2 import GeodeCrossC2
@@ -38,6 +41,8 @@ from baselines.EVOLVEGCN import EvolveGCNModel
 from baselines.DCRNN import DCRNNModel
 from baselines.INCREASE import INCREASE
 from baselines.INCREASE_FS import INCREASE_FS
+from baselines.MMGT import MMGT
+from baselines.MGAT import MGAT 
 from fillers.DIDA_filler import DidaFiller
 from fillers.IGNNK_filler import IGNNKFiller
 from fillers.LSJSTN_filler import LSJSTNFiller
@@ -47,6 +52,7 @@ from fillers.Standard_filler import StandardFiller
 from fillers.INCREASE_filler import INCREASEFiller
 from fillers.INCREASE_FS_filler import INCREASE_FS_Filler
 from fillers.KITS_filler import GCNCycVirtualFiller
+from fillers.MULTIMODAL_filler import MULTIMODALFiller
 from omegaconf import DictConfig
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
@@ -61,7 +67,7 @@ from tsl.metrics import torch as torch_metrics
 from tsl.transforms import MaskInput
 from tsl.utils.casting import torch_to_numpy
 from utils import (AirCross, AirQualityAuckland, CrossSpatioTemporalDataset,
-                   LargeST, StandardScalerSplit, SpatioTemporalDataModule,
+                   LargeST, StandardScalerSplit, SpatioTemporalDataModule, EpochTimeCallback,
                    CrossGPVARDataset, add_missing_sensors, add_missing_sensors_cross, test_wise_eval)
 
 
@@ -96,6 +102,12 @@ def get_model_class(model_str):
         model = GeodeCrossV12
     elif model_str == 'geodeCrossV13':
         model = GeodeCrossV13
+    elif model_str == 'geodeCrossV13wSST':
+        model = GeodeCrossV13wSST
+    elif model_str == 'geodeCrossV13wMMP':
+        model = GeodeCrossV13wMMP
+    elif model_str == 'geodeCrossV13wall':
+        model = GeodeCrossV13wall
     elif model_str == 'geodeCrossV14':
         model = GeodeCrossV14
     elif model_str == 'geodeCrossC1':
@@ -122,6 +134,10 @@ def get_model_class(model_str):
         model = INCREASE
     elif model_str == 'increase_fs':
         model = INCREASE_FS
+    elif model_str == 'mmgt':
+        model = MMGT
+    elif model_str == 'mgat':
+        model = MGAT
     else:
         raise NotImplementedError(f'Model "{model_str}" not available.')
     return model
@@ -424,7 +440,8 @@ def run_imputation(cfg: DictConfig):
         or cfg.model.name == 'geodeCrossV9' or cfg.model.name == 'geodeCrossV10' \
         or cfg.model.name == 'geodeCrossV11' or cfg.model.name == 'geodeCrossV12' \
         or cfg.model.name == 'geodeCrossC1' or cfg.model.name == 'geodeCrossV13' \
-        or cfg.model.name == 'geodeCrossV14':
+        or cfg.model.name == 'geodeCrossV14' or cfg.model.name == 'geodeCrossV13wSST' \
+        or cfg.model.name == 'geodeCrossV13wMMP' or cfg.model.name == 'geodeCrossV13wall':
         model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
     elif cfg.model.name == 'geodeCrossC2':
         model_kwargs = dict(adj=adj, input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window, threshold=cfg.dataset.connectivity.threshold)
@@ -446,6 +463,8 @@ def run_imputation(cfg: DictConfig):
                             horizon=cfg.window)
     elif cfg.model.name == 'increase' or cfg.model.name == 'increase_fs':
         model_kwargs = dict(input_size=dm.n_channels, output_size=dm.n_channels, horizon=cfg.window)
+    elif cfg.model.name == 'mmgt' or cfg.model.name == 'mgat':
+        model_kwargs = dict(input_size=dm.n_channels, out_size=dm.n_channels)
     else:
         model_kwargs = dict(n_nodes=torch_dataset.n_nodes,
                             input_size=torch_dataset.n_channels)
@@ -575,7 +594,8 @@ def run_imputation(cfg: DictConfig):
                             known_set = [i for i in range(dataset.air_max_nodes) if i not in masked_sensors],
                             **cfg.model.regs)
     elif cfg.model.name =='geodeCrossV12' or cfg.model.name =='geodeCrossV13' \
-        or cfg.model.name =='geodeCrossV14':
+        or cfg.model.name =='geodeCrossV14' or cfg.model.name =='geodeCrossV13wSST' \
+        or cfg.model.name =='geodeCrossV13wMMP' or cfg.model.name =='geodeCrossV13wall':
         imputer = GeodeCrossFillerV8(model_class=model_cls,
                             model_kwargs=model_kwargs,
                             optim_class=getattr(torch.optim, cfg.optimizer.name),
@@ -588,6 +608,7 @@ def run_imputation(cfg: DictConfig):
                             gradient_clip_val=cfg.grad_clip_val,
                             gradient_clip_algorithm=cfg.grad_clip_alg,
                             known_set = [i for i in range(dataset.air_max_nodes) if i not in masked_sensors],
+                            sampling = cfg.model.hparams.sampling,
                             **cfg.model.regs)
     elif cfg.model.name =='geodeCrossC1' or cfg.model.name =='geodeCrossC2':
         imputer = GeodeCrossFillerC1(model_class=model_cls,
@@ -711,6 +732,18 @@ def run_imputation(cfg: DictConfig):
                                     adj=adj,
                                     horizon=cfg.window,
                                     num_n=cfg.model.hparams.K)
+    elif cfg.model.name == "mmgt" or cfg.model.name == "mgat":
+        imputer = MULTIMODALFiller(model_class=model_cls,
+                                   model_kwargs=model_kwargs,
+                                   optim_class=getattr(torch.optim, cfg.optimizer.name),
+                                   optim_kwargs=dict(cfg.optimizer.hparams),
+                                   loss_fn=loss_fn,
+                                   metrics=log_metrics,
+                                   scheduler_class=scheduler_class,
+                                   scheduler_kwargs=scheduler_kwargs,
+                                   known_set = [i for i in range(dataset.air_max_nodes) if i not in masked_sensors],
+                                   adj=adj,
+                                   horizon=cfg.window)
     else:
         raise NotImplementedError(f'Model "{cfg.model.name}" not available.')
 
@@ -745,15 +778,27 @@ def run_imputation(cfg: DictConfig):
         mode='min',
     )
     checkpoint_callback.CHECKPOINT_NAME_LAST = "{epoch}-last"
+
+    epoch_timer = EpochTimeCallback(warmup_epochs=0)
+
     trainer = Trainer(
         max_epochs=cfg.epochs,
         default_root_dir=cfg.run.dir,
         logger=exp_logger,
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
         devices=cfg.device,
-        callbacks=[early_stop_callback, checkpoint_callback],
+        callbacks=[early_stop_callback, checkpoint_callback, epoch_timer],
         detect_anomaly=False)
     trainer.fit(imputer, datamodule=dm, ckpt_path=cfg.call_path)
+
+    max_bytes = torch.cuda.max_memory_allocated()
+    print(f"Maximum GPU memory allocated: {max_bytes} bytes")
+
+    # Convert to GiB for easier reading
+    max_gib = round(max_bytes / (1024**3), 2)
+    print(f"Maximum GPU memory allocated: {max_gib} GiB")
+
+    print(f"Avg time/epoch: {epoch_timer.get_average_epoch_time():.3f}s")
 
     ########################################
     # testing                              #
@@ -780,7 +825,8 @@ def run_imputation(cfg: DictConfig):
                              known_nodes=[i for i in range(adj.shape[0]) if i not in masked_sensors],
                              adj=adj,
                              mode='test',
-                             num_groups=cfg.num_groups)
+                             num_groups=cfg.num_groups,
+                             features=y_true)
 
     output = trainer.predict(imputer, dataloaders=dm.val_dataloader())
     output = imputer.collate_prediction_outputs(output)
@@ -797,7 +843,8 @@ def run_imputation(cfg: DictConfig):
     elif cfg.eval_setting == 'test_wise':
         res.update(test_wise_eval(y_hat, y_true, mask, 
                     known_nodes=[i for i in range(adj.shape[0]) if i not in masked_sensors],
-                    adj=adj, mode='val', num_groups=cfg.num_groups))
+                    adj=adj, mode='val', num_groups=cfg.num_groups,
+                    features=y_true))
     
     res.update(
         dict(model=cfg.model.name,

@@ -11,6 +11,7 @@ hparams:
   dropout: 0.1
   k: 3
   full_cadj: true
+  sampling: partition # partition, random, empty, half, no_part
 regs:
   y1: 0.1 # Cross Loss
   y2: 0.05 # Contastive Loss

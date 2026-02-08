@@ -113,7 +113,8 @@ class GeodeCrossV13(BaseModel):
                  k=5,
                  att_heads=8,
                  dropout=0.1,
-                 full_cadj=True,):
+                 full_cadj=True,
+                 sampling='partition'):
         super(GeodeCrossV13, self).__init__()
 
         self.full_cadj = full_cadj
@@ -124,6 +125,9 @@ class GeodeCrossV13(BaseModel):
         self.k = k
         self.att_heads = att_heads
         self.att_window = att_window
+
+        assert sampling in ['partition', 'random', 'empty', 'half', 'no_part']
+        self.sampling = sampling
 
         if not cro_layers:
             cro_layers = gcn_layers
@@ -338,7 +342,11 @@ class GeodeCrossV13(BaseModel):
             o_adj = o_adj[:, arrange]
 
             c_adj = full_adj[arrange, split:]
-            c_adj = torch.ones_like(c_adj[:, tr_indx]).to(device)
+
+            if self.full_cadj:
+                c_adj = torch.ones_like(c_adj[:, tr_indx]).to(device)
+            else:
+                c_adj = c_adj[:, tr_indx].ne(0).to(c_adj.dtype)
 
         if training:
             # inductive
@@ -366,8 +374,12 @@ class GeodeCrossV13(BaseModel):
             n_adj = n_adj[:, arrange]
 
             c_adj = full_adj[arrange, split:]
-            c_adj = torch.ones_like(c_adj[:, tr_indx]).to(device)
-            
+
+            if self.full_cadj:
+                c_adj = torch.ones_like(c_adj[:, tr_indx]).to(device)
+            else:
+                c_adj = c_adj[:, tr_indx].ne(0).to(c_adj.dtype)
+
             numpy_graph = nx.from_numpy_array(n_adj.cpu().numpy())
             target_nodes = list(range(n_adj.shape[0]))[:len(known_set)]
             source_nodes = list(range(n_adj.shape[0]))
@@ -495,6 +507,10 @@ class GeodeCrossV13(BaseModel):
         det_mask[:, :, :len(known_set)] = 1
         xh_air_3 = torch.where(det_mask, xh_air_3.detach(), xh_air_3) 
 
+        det_mask = torch.zeros_like(xh_cro_3).to(dtype=bool, device=device)
+        det_mask[:, :, :len(known_set)] = 1
+        xh_cro_3 = torch.where(det_mask, xh_cro_3.detach(), xh_cro_3) 
+
         air_nodes = xh_air_3[:, :, ar_indx]
         air_nodes = rearrange(air_nodes, 'b t n d -> t b n d')
 
@@ -522,6 +538,15 @@ class GeodeCrossV13(BaseModel):
         n_current = current_adj.shape[0]
         prev_cur = 0
 
+        if self.sampling == 'partition' or self.sampling == 'half':
+            partitions = np.random.exponential(scale, k)
+            partitions = partitions / partitions.sum() * n_add
+            partitions = np.round(partitions).astype(int)
+            partitions[-1] += n_add - partitions.sum()
+            partitions = np.sort(partitions)[::-1]
+        else:
+            partitions = [n_add]
+
         # Get partitions
         partitions = np.random.exponential(scale, k)
         partitions = partitions / partitions.sum() * n_add
@@ -542,6 +567,9 @@ class GeodeCrossV13(BaseModel):
                 expanded = torch.zeros(size=(n + 1, n + 1)).to(device=adj.device, dtype=torch.int)
                 expanded[:n, :n] = current_adj
 
+                c_expanded = torch.zeros(size=(n + 1, t_nodes)).to(device=adj.device)
+                c_expanded[:n, :] = current_c_adj
+
                 # Select random anchor
                 anchor = random.randint(prev_cur, n_current - 1)
                 levels[n] = max(levels[anchor] + 1, 1)
@@ -551,7 +579,18 @@ class GeodeCrossV13(BaseModel):
                 expanded[n, anchor] = 1
 
                 # Optionally connect to anchor's neighbors
-                neighbors = torch.nonzero(current_adj[anchor, :n_current]).squeeze(-1)
+                neigh_list = [anchor]
+
+                if self.sampling == 'random':
+                    neighbors = torch.empty(0)
+                    tot_n = int(torch.sum(current_adj[anchor, :n_current]).item())
+
+                    if tot_n > 0:
+                        neighbors = torch.multinomial(torch.ones(n_current), tot_n, replacement=False)
+                        neighbors = neighbors[neighbors != anchor]
+                else:
+                    neighbors = torch.nonzero(current_adj[anchor, :n_current]).squeeze(-1)
+
                 # print(anchor, neighbors)
                 for neighbor in neighbors:
                     connect_prob = np.random.rand(1)
@@ -562,8 +601,13 @@ class GeodeCrossV13(BaseModel):
                         if levels[n] > levels[neighbor.item()]:
                             levels[n] = max(levels[neighbor.item()] + 1, 1)
 
-                # Update current_adj
+                        neigh_list.append(neighbor.item())
+
+                # Update current_adj and current_c_adj
+                c_expanded[n, :] = current_c_adj[neigh_list, :].sum(0).ne(0).float()
+
                 current_adj = expanded
+                current_c_adj = c_expanded
             prev_cur = n_current
             n_current += part
 
@@ -598,6 +642,9 @@ class GeodeCrossV13(BaseModel):
 
         #     current_c_adj = c_expanded
         
-        new_c_adj = torch.ones((adj_aug_n1.shape[0], t_nodes)).to(device=adj.device)
+        if self.full_cadj:
+            new_c_adj = torch.ones((adj_aug_n1.shape[0], t_nodes)).to(device=adj.device)
+        else:
+            new_c_adj = current_c_adj.to(device=adj.device)
 
         return adj_aug_n1, levels, new_c_adj
